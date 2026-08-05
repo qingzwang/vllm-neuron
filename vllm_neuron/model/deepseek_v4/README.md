@@ -141,10 +141,15 @@ output:  " Paris. The capital of Spain is Madrid. The capital of Italy is Rome."
 Measured at TP=32, EP=32, `--max-model-len 128`, `--max-num-seqs 1`, best of 3
 runs per shape:
 
-| Shape (prompt → output) | TTFT   | TPOT    | Decode throughput |
-| ----------------------- | ------ | ------- | ----------------- |
-| 64 → 32 tokens          | 653 ms | 88.3 ms | 11.3 tok/s        |
-| 32 → 64 tokens          | 654 ms | 88.2 ms | 11.3 tok/s        |
+| Path                       | TTFT   | TPOT     | Decode throughput |
+| -------------------------- | ------ | -------- | ----------------- |
+| torch attention + HC       | 653 ms | 88.3 ms  | 11.3 tok/s        |
+| NKI everywhere             | 507 ms | 106.2 ms | 9.4 tok/s         |
+| **NKI prefill, torch decode** | **504 ms** | **88.2 ms** | **11.3 tok/s** |
+
+64-token prompt, 32 output tokens, best of 3. The kernels win on prefill and
+lose on decode, so both ops fall back to torch below 8 tokens — see
+`functional/attention/sparse_latent.py`.
 
 TTFT is flat across prompt lengths because both pad to the single compiled
 128-token prefill bucket. Weight load takes ~2330 s (FP4/FP8 dequantized to
@@ -162,15 +167,20 @@ binding term is the **context length**, not the layer count: a CSA layer's
 compressed stream holds `max_model_len / 4` slots, and the sparse attention
 gathers over `sliding_window + slots` per query.
 
-| Prefill bucket | `max_model_len` | Compile result             |
-| -------------- | --------------- | -------------------------- |
-| 128            | 128             | 32/32 ranks                |
-| 512            | 512             | 30/32 ranks (2 over by 9%) |
-| 512            | 2048            | fails (6.9M instructions)  |
+With the sparse attention and the hyper-connection Sinkhorn both in NKI, the
+instruction count no longer scales with the selection width or the round count:
 
-Raising this needs the sparse attention itself moved into a NKI kernel, so the
-gather and the online softmax cost a fixed number of instructions instead of
-scaling with the selection width.
+| `max_model_len` | torch path                 | with NKI kernels     |
+| --------------- | -------------------------- | -------------------- |
+| 128             | 32/32 ranks                | 32/32 ranks          |
+| 512             | 30/32 (2 over by 9%)       | **32/32 ranks**      |
+| 2048            | fails (6.9M instructions)  | not yet measured     |
+
+At `max_model_len 512` all 128 graphs compile clean, but warmup then exceeds
+the 3600 s barrier timeout: the attention kernel iterates tokens serially, so a
+512-token prefill runs 512 sequential passes. Compilation is no longer the
+limit — kernel throughput is. Batching the token loop (tiling tokens onto the
+partition axis alongside `head_dim`) is the next step.
 
 ## Memory
 
@@ -197,13 +207,14 @@ variant instead halves the expert footprint.
 | Attention DP            | ❌     |                                                |
 | Prefix caching          | ⚠️     | Window only; compressed state rebuilt          |
 | Continuous batching     | ❌     | `--max-num-seqs 1` enforced (see above)        |
-| Long context            | ⚠️     | `--max-model-len 128` compiles; see below      |
+| Long context            | ⚠️     | 512 compiles but warmup is too slow; see below |
 | Segmented prefill       | ❌     | Compressors need the whole prompt              |
 | DSpark spec decode      | ❌     | `mtp.*` weights unused                         |
 | FP8 KV cache            | ❌     | Latent KV is bf16                              |
 | On-device sampling      | ✅     |                                                |
 | MoE blockwise kernel    | ✅     | Prefill via `NF.moe_cte`; decode stays dense   |
-| Sparse-attention kernel | ❌     | Torch gather + chunked online softmax          |
+| Sparse-attention kernel | ✅     | NKI for prefill; torch fallback for decode     |
+| HC Sinkhorn kernel      | ✅     | NKI for prefill; torch fallback for decode     |
 
 ## Serving
 

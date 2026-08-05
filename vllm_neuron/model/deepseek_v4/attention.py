@@ -43,18 +43,31 @@ from vllm_neuron.utils.weight_loader import set_weight_loader
 from .weight_loaders import cast_weight_loader, fp8_dequant_weight_loader
 
 
+# Selected slots processed per attention pass. The gather in
+# sparse_latent_attention materializes [tokens, chunk, head_dim] in fp32; with
+# head_dim=512 and a 640-wide selection, doing it in one pass is a ~640 MiB
+# operator that neuronx-cc expands past its 5M-instruction budget
+# (NCC_ELUR015). Chunking trades a longer graph for a bounded operator size.
+SPARSE_ATTENTION_CHUNK = 128
+
+
 def sparse_latent_attention(
     q: torch.Tensor,
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
     scale: float,
+    chunk_size: int = SPARSE_ATTENTION_CHUNK,
 ) -> torch.Tensor:
     """Gather-based sparse attention over a shared latent KV.
 
     The latent KV acts as both keys and values (MLA), so a slot contributes the
     same vector to the logit and the weighted sum. ``attn_sink`` adds a learned
     per-head logit that carries no value, letting a head attend to "nothing".
+
+    The selection is processed in chunks with an online (FlashAttention-style)
+    softmax, so the gathered KV never exceeds ``[tokens, chunk_size, head_dim]``.
+    Results are identical to a single-pass softmax up to fp32 rounding.
 
     Args:
         q: ``[T, heads, head_dim]`` queries.
@@ -63,33 +76,63 @@ def sparse_latent_attention(
         topk_idxs: ``[T, topk]`` int32 slot indices into ``kv``; ``-1`` marks an
             unused slot and is masked out.
         scale: Softmax scale (``head_dim ** -0.5``).
+        chunk_size: Selected slots per pass.
 
     Returns:
         ``[T, heads, head_dim]`` attention output in ``q``'s dtype.
     """
     tokens, heads, head_dim = q.shape
     topk = topk_idxs.shape[-1]
+    q_f32 = q.float()
 
-    idx = topk_idxs.long()
-    valid = idx >= 0
-    safe_idx = idx.clamp_min(0)
+    # Running online-softmax state: max logit, denominator, weighted sum.
+    lowest = torch.finfo(torch.float32).min
+    running_max = torch.full(
+        (tokens, heads), lowest, device=q.device, dtype=torch.float32
+    )
+    denominator = torch.zeros(
+        tokens, heads, device=q.device, dtype=torch.float32
+    )
+    accumulator = torch.zeros(
+        tokens, heads, head_dim, device=q.device, dtype=torch.float32
+    )
 
-    # [T, topk, head_dim] — gather the selected latent slots per query.
-    gathered = kv.index_select(0, safe_idx.reshape(-1)).view(tokens, topk, head_dim)
+    for start in range(0, topk, chunk_size):
+        stop = min(start + chunk_size, topk)
+        idx = topk_idxs[:, start:stop].long()
+        valid = idx >= 0
+        width = stop - start
 
-    logits = torch.einsum("thd,tkd->thk", q.float(), gathered.float())
-    # Scale and the mask fill value are materialized as fp32 tensors: XLA types
-    # bare Python floats as f64, which neuronx-cc rejects.
-    logits = logits * torch.full_like(logits, scale)
-    neg_inf = torch.full_like(logits, torch.finfo(logits.dtype).min)
-    logits = torch.where(valid.unsqueeze(1), logits, neg_inf)
+        # [T, width, head_dim] — gather this chunk's latent slots per query.
+        gathered = kv.index_select(0, idx.clamp_min(0).reshape(-1)).view(
+            tokens, width, head_dim
+        )
 
-    # Append the sink as an extra softmax column, then drop it from the average.
-    sink = attn_sink.float().view(1, heads, 1).expand(tokens, heads, 1)
-    probs = torch.softmax(torch.cat([logits, sink], dim=-1), dim=-1)[..., :topk]
+        logits = torch.einsum("thd,tkd->thk", q_f32, gathered.float())
+        # Scale and the mask fill value are materialized as fp32 tensors: XLA
+        # types bare Python floats as f64, which neuronx-cc rejects.
+        logits = logits * torch.full_like(logits, scale)
+        logits = torch.where(
+            valid.unsqueeze(1), logits, torch.full_like(logits, lowest)
+        )
 
-    out = torch.einsum("thk,tkd->thd", probs, gathered.float())
-    return out.to(q.dtype)
+        # Rescale the running state to the new max, then fold in this chunk.
+        chunk_max = torch.maximum(running_max, logits.amax(dim=-1))
+        rescale = torch.exp(running_max - chunk_max)
+        weights = torch.exp(logits - chunk_max.unsqueeze(-1))
+
+        accumulator = accumulator * rescale.unsqueeze(-1) + torch.einsum(
+            "thk,tkd->thd", weights, gathered.float()
+        )
+        denominator = denominator * rescale + weights.sum(dim=-1)
+        running_max = chunk_max
+
+    # The sink is a logit with no value: it only enlarges the denominator, which
+    # is how a head attends to "nothing".
+    denominator = denominator + torch.exp(
+        attn_sink.float().view(1, heads) - running_max
+    )
+    return (accumulator / denominator.unsqueeze(-1)).to(q.dtype)
 
 
 class Compressor(nn.Module):
@@ -328,6 +371,9 @@ class Indexer(nn.Module):
         """
         tokens = hidden_states.shape[0]
         num_slots = compressed_kv.shape[0]
+        # Callers pass the addressable slots only — the scratch slot the decode
+        # append path writes to must be excluded, or a stream sized exactly
+        # index_topk would appear one slot too long and take the top-k path.
 
         if num_slots <= self.index_topk:
             # Every slot fits in the top-k budget, so selection is a no-op:
@@ -411,13 +457,33 @@ class DeepseekV4Attention(nn.Module):
         # MLA: one latent KV head, replicated on every rank (not sharded).
         self.num_key_value_heads_per_rank = 1
 
+        # Grouped output projection. Each group covers a contiguous span of
+        # attention output features — heads_per_group = num_heads / o_groups.
         self.num_groups = config.o_groups
-        if self.num_groups % self.world_size and self.world_size % self.num_groups:
+        heads_per_group, remainder = divmod(self.num_attention_heads, self.num_groups)
+        if remainder:
             raise ValueError(
-                f"o_groups ({self.num_groups}) and the TP degree "
-                f"({self.world_size}) must divide one another"
+                f"num_attention_heads ({self.num_attention_heads}) must be "
+                f"divisible by o_groups ({self.num_groups})"
             )
-        self.num_groups_per_rank = max(1, self.num_groups // self.world_size)
+
+        # Two regimes, depending on whether a rank's heads cover whole groups:
+        #
+        # * TP <= o_groups: each rank owns whole groups. wo_a is group-sharded,
+        #   and each group's projection consumes all of that group's features.
+        # * TP > o_groups: a group's heads are split across ranks. Every rank
+        #   then holds all groups it touches, but only the wo_a *input columns*
+        #   for its own heads, producing a partial sum that the all-reduce after
+        #   wo_b completes.
+        if self.num_heads_per_rank >= heads_per_group:
+            self.num_groups_per_rank = self.num_heads_per_rank // heads_per_group
+            self.group_is_split = False
+            self.heads_per_local_group = heads_per_group
+        else:
+            self.num_groups_per_rank = 1
+            self.group_is_split = True
+            self.heads_per_local_group = self.num_heads_per_rank
+        self.heads_per_group = heads_per_group
 
         # ── Parameters ────────────────────────────────────────────────────
         self.attn_sink = nn.Parameter(
@@ -438,12 +504,14 @@ class DeepseekV4Attention(nn.Module):
             torch.empty(self.head_dim, self.hidden_size, dtype=self.dtype)
         )
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, self.eps)
-        # Grouped low-rank output: per group, [o_lora_rank, heads*head_dim/groups].
+        # Grouped low-rank output. Per local group the projection consumes this
+        # rank's slice of that group's attention features
+        # (heads_per_local_group * head_dim) and emits o_lora_rank.
         self.wo_a = nn.Parameter(
             torch.empty(
                 self.num_groups_per_rank,
                 self.o_lora_rank,
-                (self.num_attention_heads * self.head_dim) // self.num_groups,
+                self.heads_per_local_group * self.head_dim,
                 dtype=self.dtype,
             )
         )
@@ -530,27 +598,40 @@ class DeepseekV4Attention(nn.Module):
                 out_dtype=self.dtype,
             ),
         )
-        # wo_a: checkpoint stores [groups * o_lora_rank, heads*head_dim/groups];
-        # shard on the group axis, then reshape to [groups_per_rank, rank, in].
+        # wo_a: checkpoint stores [o_groups * o_lora_rank, group_features],
+        # reshaped to [groups_per_rank, o_lora_rank, local_group_features].
         set_weight_loader(
             self.wo_a,
             _grouped_wo_a_loader(
+                num_groups=self.num_groups,
                 num_groups_per_rank=self.num_groups_per_rank,
                 o_lora_rank=self.o_lora_rank,
-                num_shards=self.world_size,
+                head_dim=self.head_dim,
+                heads_per_group=self.heads_per_group,
+                heads_per_local_group=self.heads_per_local_group,
+                num_heads_per_rank=self.num_heads_per_rank,
+                group_is_split=self.group_is_split,
                 out_dtype=self.dtype,
             ),
         )
-        # wo_b: row-parallel — shard the input (group) axis, all-reduce after.
-        set_weight_loader(
-            self.wo_b,
-            fp8_dequant_weight_loader(
+        # wo_b: row-parallel over the group axis. When a group is split across
+        # ranks every one of them holds the same wo_b columns and contributes a
+        # partial sum, so the all-reduce after wo_b completes the group.
+        if self.group_is_split:
+            wo_b_loader = _split_group_wo_b_loader(
+                o_lora_rank=self.o_lora_rank,
+                heads_per_group=self.heads_per_group,
+                num_heads_per_rank=self.num_heads_per_rank,
+                out_dtype=self.dtype,
+            )
+        else:
+            wo_b_loader = fp8_dequant_weight_loader(
                 shard_dim=1,
                 shard_size=self.num_groups_per_rank * self.o_lora_rank,
                 num_shards=self.world_size,
                 out_dtype=self.dtype,
-            ),
-        )
+            )
+        set_weight_loader(self.wo_b, wo_b_loader)
         # attn_sink stays fp32: it is a softmax logit, not a matmul input.
         set_weight_loader(
             self.attn_sink,
@@ -622,7 +703,11 @@ class DeepseekV4Attention(nn.Module):
         projected = torch.einsum("tgd,grd->tgr", grouped, self.wo_a)
         out = F.linear(projected.flatten(1), self.wo_b)
 
-        # wo_b is row-parallel: each rank holds a partial sum.
+        # wo_b is row-parallel: each rank holds a partial sum, and the
+        # all-reduce completes it. This is exact even when a group is split
+        # across ranks: those ranks share identical wo_b columns but their wo_a
+        # slices are disjoint, so their o_lora_rank vectors sum to the group's
+        # full vector and wo_b's linearity carries that through.
         if self.world_size > 1:
             out = self.tp_group.all_reduce(out)
         return out
@@ -765,7 +850,7 @@ class DeepseekV4Attention(nn.Module):
                 compressed_idxs = self.indexer(
                     hidden_states,
                     q_lora,
-                    self.compressed_index_kv,
+                    self.compressed_index_kv[:capacity],
                     cos,
                     sin,
                     causal_limit,
@@ -776,7 +861,7 @@ class DeepseekV4Attention(nn.Module):
                     causal_limit, capacity, offset
                 )
 
-            kv = torch.cat([latent_kv, self.compressed_kv], dim=0)
+            kv = torch.cat([latent_kv, self.compressed_kv[:capacity]], dim=0)
             topk_idxs = torch.cat([window_idxs, compressed_idxs], dim=-1)
         else:
             kv = latent_kv
@@ -827,7 +912,7 @@ class DeepseekV4Attention(nn.Module):
                 compressed_idxs = self.indexer(
                     hidden_states,
                     q_lora,
-                    self.compressed_index_kv,
+                    self.compressed_index_kv[:capacity],
                     cos,
                     sin,
                     causal_limit,
@@ -837,7 +922,7 @@ class DeepseekV4Attention(nn.Module):
                 compressed_idxs = _hca_indices_prefill(
                     causal_limit, capacity, offset
                 )
-            kv = torch.cat([cached, self.compressed_kv], dim=0)
+            kv = torch.cat([cached, self.compressed_kv[:capacity]], dim=0)
             topk_idxs = torch.cat([window_idxs, compressed_idxs], dim=-1)
         else:
             kv = cached
@@ -1050,24 +1135,77 @@ def _hca_indices_prefill(
     ).to(torch.int32)
 
 
-def _grouped_wo_a_loader(
-    num_groups_per_rank: int,
-    o_lora_rank: int,
-    num_shards: int,
+_FP8_SCALE_BLOCK = 128
+
+
+def _dequant_fp8_rows_cols(
+    weight_slice,
+    scale_slice,
+    row_range: tuple[int, int],
+    col_range: tuple[int, int] | None,
     out_dtype: torch.dtype,
-):
-    """Loader for ``wo_a``: FP8 dequant, shard on groups, reshape to 3-D.
+) -> torch.Tensor:
+    """Dequantize an FP8 sub-block, reading only the slice that is needed.
 
-    The checkpoint stores ``[num_groups * o_lora_rank, heads * head_dim /
-    num_groups]``, with the group axis folded into dim 0. The parameter wants
-    ``[groups_per_rank, o_lora_rank, in_features]`` so the per-group einsum can
-    index it directly.
+    Row and column ranges must be multiples of the 128 scale block; every
+    shipped DeepSeek-V4 config satisfies this (``o_lora_rank`` and ``head_dim``
+    are both multiples of 128), so a misaligned request is a programming error
+    rather than a case to fall back on.
     """
-    from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader
-
     from .weight_loaders import dequant_fp8_blockwise
 
-    shard_size = num_groups_per_rank * o_lora_rank
+    block = _FP8_SCALE_BLOCK
+    row_start, row_stop = row_range
+    if row_start % block or (row_stop - row_start) % block:
+        raise ValueError(
+            f"wo_a/wo_b row range {row_range} is not a multiple of the {block} "
+            "FP8 scale block"
+        )
+
+    if col_range is None:
+        weight = weight_slice[row_start:row_stop]
+        scale = scale_slice[row_start // block : row_stop // block]
+    else:
+        col_start, col_stop = col_range
+        if col_start % block or (col_stop - col_start) % block:
+            raise ValueError(
+                f"wo_a/wo_b column range {col_range} is not a multiple of the "
+                f"{block} FP8 scale block"
+            )
+        weight = weight_slice[row_start:row_stop, col_start:col_stop]
+        scale = scale_slice[
+            row_start // block : row_stop // block,
+            col_start // block : col_stop // block,
+        ]
+    return dequant_fp8_blockwise(weight, scale, out_dtype=out_dtype)
+
+
+def _grouped_wo_a_loader(
+    num_groups: int,
+    num_groups_per_rank: int,
+    o_lora_rank: int,
+    head_dim: int,
+    heads_per_group: int,
+    heads_per_local_group: int,
+    num_heads_per_rank: int,
+    group_is_split: bool,
+    out_dtype: torch.dtype,
+):
+    """Loader for ``wo_a``, producing ``[groups_per_rank, o_lora_rank, in]``.
+
+    The checkpoint stores ``[o_groups * o_lora_rank, group_features]`` — the
+    group axis folded into dim 0, and each row spanning one group's whole slice
+    of the attention output.
+
+    Two sharding regimes, matching ``DeepseekV4Attention.__init__``:
+
+    * **Whole groups per rank** (TP <= o_groups): take this rank's contiguous
+      run of groups, all input columns.
+    * **Split group** (TP > o_groups): every rank takes the single group its
+      heads fall in, but only the input columns for its own heads. The result is
+      a partial sum over the group, completed by the all-reduce after ``wo_b``.
+    """
+    from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader
 
     def transform(slices: list, rank: int) -> torch.Tensor:
         if len(slices) != 2:
@@ -1075,23 +1213,71 @@ def _grouped_wo_a_loader(
                 f"wo_a loader expects [weight, scale] slices, got {len(slices)}"
             )
         weight_slice, scale_slice = slices
-        start = (rank % num_shards) * shard_size
-        stop = start + shard_size
 
-        # The scale grid is 128-blocked; o_lora_rank is a multiple of 128 for
-        # every shipped config, so shard boundaries stay block-aligned.
-        block = 128
-        if start % block or shard_size % block:
-            weight = weight_slice[:][start:stop]
-            scale = scale_slice[:]
-            dequantized = dequant_fp8_blockwise(
-                weight_slice[:], scale, out_dtype=out_dtype
-            )[start:stop]
-        else:
-            weight = weight_slice[start:stop]
-            scale = scale_slice[start // block : stop // block]
-            dequantized = dequant_fp8_blockwise(weight, scale, out_dtype=out_dtype)
+        if not group_is_split:
+            rows = num_groups_per_rank * o_lora_rank
+            row_start = rank * rows
+            dequantized = _dequant_fp8_rows_cols(
+                weight_slice, scale_slice, (row_start, row_start + rows), None, out_dtype
+            )
+            return dequantized.view(
+                num_groups_per_rank, o_lora_rank, -1
+            ).contiguous()
 
-        return dequantized.view(num_groups_per_rank, o_lora_rank, -1).contiguous()
+        # This rank's global head range, and the group those heads live in.
+        first_head = rank * num_heads_per_rank
+        group = first_head // heads_per_group
+        head_within_group = first_head % heads_per_group
+
+        row_start = group * o_lora_rank
+        col_start = head_within_group * head_dim
+        col_stop = col_start + heads_per_local_group * head_dim
+
+        dequantized = _dequant_fp8_rows_cols(
+            weight_slice,
+            scale_slice,
+            (row_start, row_start + o_lora_rank),
+            (col_start, col_stop),
+            out_dtype,
+        )
+        return dequantized.view(1, o_lora_rank, -1).contiguous()
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def _split_group_wo_b_loader(
+    o_lora_rank: int,
+    heads_per_group: int,
+    num_heads_per_rank: int,
+    out_dtype: torch.dtype,
+):
+    """Loader for ``wo_b`` when an output group is split across ranks.
+
+    Every rank sharing a group holds that group's full ``o_lora_rank`` columns
+    of ``wo_b``. Each contributes a partial sum, because its ``wo_a`` covers only
+    some of the group's heads; the all-reduce after ``wo_b`` adds them.
+
+    Replicating the columns is exact rather than double-counting: the per-rank
+    ``o_lora_rank`` vectors sum to the group's full vector, and ``wo_b`` is
+    linear, so applying it before the reduction gives the same result as after.
+    """
+    from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader
+
+    def transform(slices: list, rank: int) -> torch.Tensor:
+        if len(slices) != 2:
+            raise ValueError(
+                f"wo_b loader expects [weight, scale] slices, got {len(slices)}"
+            )
+        weight_slice, scale_slice = slices
+        group = (rank * num_heads_per_rank) // heads_per_group
+        col_start = group * o_lora_rank
+        rows = weight_slice.get_shape()[0]
+        return _dequant_fp8_rows_cols(
+            weight_slice,
+            scale_slice,
+            (0, rows),
+            (col_start, col_start + o_lora_rank),
+            out_dtype,
+        ).contiguous()
 
     return SafetensorsWeightLoader(transform=transform)

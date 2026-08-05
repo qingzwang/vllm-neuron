@@ -434,17 +434,20 @@ class DeepseekV4ForCausalLM(nn.Module):
 
             # Routed experts: one [weight, scale] pair per local expert, in
             # expert order, matching the expert dequant loaders' contract.
-            for param_name, ckpt_name in (
-                ("expert_w1", "w1"),
-                ("expert_w3", "w3"),
-                ("expert_w2", "w2"),
-            ):
+            def expert_keys(ckpt_name: str) -> list[str]:
                 keys: list[str] = []
                 for local in range(moe.num_local_experts):
                     expert_id = moe.expert_start + local
                     base = f"{ffn_ckpt}.experts.{expert_id}.{ckpt_name}"
                     keys.extend([f"{base}.weight", f"{base}.scale"])
-                mappings[f"{ffn_param}.{param_name}"] = keys
+                return keys
+
+            # The MoE kernel wants gate and up fused into one [E, H, 2, I]
+            # tensor, so w1's pairs are followed by w3's in a single mapping.
+            mappings[f"{ffn_param}.gate_up_proj_weight"] = expert_keys(
+                "w1"
+            ) + expert_keys("w3")
+            mappings[f"{ffn_param}.down_proj_weight"] = expert_keys("w2")
 
             # Shared expert.
             for name in ("w1", "w2", "w3"):

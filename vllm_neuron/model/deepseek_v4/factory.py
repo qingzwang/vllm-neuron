@@ -54,8 +54,12 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         config = DeepseekV4Config.from_configs(hf_config, neuron_config)
 
+        # Checkpoint FP8/FP4 weights are dequantized to bf16 during load, so the
+        # only meaningful compute path is bf16. "deepseek_v4_fp8" arrives here
+        # when vLLM resolves it from the checkpoint's quantization_config; it
+        # describes the checkpoint, not a compute mode, so it is accepted.
         quantization = neuron_config.quantization if neuron_config else None
-        if quantization not in (None, "bf16"):
+        if quantization not in (None, "bf16", "deepseek_v4_fp8"):
             raise ValueError(
                 f"quantization={quantization!r} is not supported for DeepSeek-V4. "
                 "Checkpoint FP8/FP4 weights are dequantized to bf16 at load time; "

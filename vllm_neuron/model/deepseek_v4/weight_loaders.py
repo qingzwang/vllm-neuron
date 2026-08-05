@@ -213,6 +213,81 @@ def _finish_fp8(
     return dequantized.contiguous()
 
 
+def _load_fp4_expert_shard(
+    weight_slice,
+    scale_slice,
+    *,
+    shard_dim: int | None,
+    shard_size: int | None,
+    num_shards: int,
+    block_size: int,
+    transpose: bool,
+    out_dtype: torch.dtype,
+    rank: int,
+) -> torch.Tensor:
+    """Read one expert's FP4 shard, dequantizing only this rank's slice.
+
+    Slicing the checkpoint *before* dequantizing matters at scale: an expert
+    weight is 2048x4096, and at TP=64 a rank keeps 1/64 of it. Dequantizing the
+    whole tensor first would materialize 64x more bf16 than needed on every rank
+    simultaneously, which exhausts host memory on a large TP degree.
+
+    The parameter layout is ``[out, in]`` before the optional transpose, matching
+    the checkpoint. ``shard_dim`` indexes that layout:
+
+    * ``shard_dim == 0`` slices the output rows — a plain row range in the
+      packed tensor, and the same row range of the scale grid.
+    * ``shard_dim == 1`` slices the input (reduction) dim, which is the packed
+      one: two FP4 values share a byte, so the byte range is halved and the
+      shard boundary must land on an even element. It also selects a
+      ``block_size``-aligned range of scale columns.
+    """
+    if shard_dim is None:
+        return _finish_fp4(weight_slice[:], scale_slice[:], block_size, transpose, out_dtype)
+
+    start = (rank % num_shards) * shard_size
+    stop = start + shard_size
+
+    if shard_dim == 0:
+        weight = weight_slice[start:stop]
+        scale = scale_slice[start:stop]
+        return _finish_fp4(weight, scale, block_size, transpose, out_dtype)
+
+    if shard_dim != 1:
+        raise ValueError(f"FP4 expert shard_dim must be 0 or 1, got {shard_dim}")
+
+    if start % 2 or shard_size % 2:
+        raise ValueError(
+            f"FP4 packs two values per byte, so an input-dim shard must be "
+            f"even-aligned; got start={start}, shard_size={shard_size}"
+        )
+    if start % block_size or shard_size % block_size:
+        # A shard boundary inside a scale block would need a partial scale
+        # column; fall back to dequantizing the whole expert and slicing.
+        full = _finish_fp4(
+            weight_slice[:], scale_slice[:], block_size, False, out_dtype
+        )
+        shard = full[:, start:stop]
+        return (shard.T if transpose else shard).contiguous()
+
+    weight = weight_slice[:, start // 2 : stop // 2]
+    scale = scale_slice[:, start // block_size : stop // block_size]
+    return _finish_fp4(weight, scale, block_size, transpose, out_dtype)
+
+
+def _finish_fp4(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int,
+    transpose: bool,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    dequantized = dequant_fp4_blockwise(weight, scale, block_size, out_dtype)
+    if transpose:
+        dequantized = dequantized.T
+    return dequantized.contiguous()
+
+
 def fp4_expert_dequant_loader(
     num_local_experts: int,
     shard_dim: int | None = None,
@@ -249,22 +324,24 @@ def fp4_expert_dequant_loader(
                 f"fp4_expert_dequant_loader expects {2 * num_local_experts} slices "
                 f"([weight, scale] per expert), got {len(slices)}"
             )
+        if shard_dim is not None and shard_size is None:
+            raise ValueError("shard_size is required when shard_dim is set")
 
         experts = []
         for i in range(num_local_experts):
-            weight = slices[2 * i][:]
-            scale = slices[2 * i + 1][:]
-            dequantized = dequant_fp4_blockwise(weight, scale, block_size, out_dtype)
-            if transpose:
-                dequantized = dequantized.T
-            if shard_dim is not None:
-                if shard_size is None:
-                    raise ValueError("shard_size is required when shard_dim is set")
-                start = (rank % num_shards) * shard_size
-                key = [slice(None)] * dequantized.ndim
-                key[shard_dim] = slice(start, start + shard_size)
-                dequantized = dequantized[tuple(key)]
-            experts.append(dequantized.contiguous())
+            experts.append(
+                _load_fp4_expert_shard(
+                    slices[2 * i],
+                    slices[2 * i + 1],
+                    shard_dim=shard_dim,
+                    shard_size=shard_size,
+                    num_shards=num_shards,
+                    block_size=block_size,
+                    transpose=transpose,
+                    out_dtype=out_dtype,
+                    rank=rank,
+                )
+            )
 
         return torch.stack(experts, dim=0).contiguous()
 
@@ -292,22 +369,46 @@ def fp8_expert_dequant_loader(
                 f"fp8_expert_dequant_loader expects {2 * num_local_experts} slices "
                 f"([weight, scale] per expert), got {len(slices)}"
             )
+        if shard_dim is not None and shard_size is None:
+            raise ValueError("shard_size is required when shard_dim is set")
 
+        # As in the FP4 path, the checkpoint is sliced before dequantizing so a
+        # rank never materializes bf16 for experts it does not own.
         experts = []
         for i in range(num_local_experts):
-            weight = slices[2 * i][:]
-            scale = slices[2 * i + 1][:]
-            dequantized = dequant_fp8_blockwise(weight, scale, block, out_dtype)
-            if transpose:
-                dequantized = dequantized.T
-            if shard_dim is not None:
-                if shard_size is None:
-                    raise ValueError("shard_size is required when shard_dim is set")
-                start = (rank % num_shards) * shard_size
-                key = [slice(None)] * dequantized.ndim
-                key[shard_dim] = slice(start, start + shard_size)
-                dequantized = dequantized[tuple(key)]
-            experts.append(dequantized.contiguous())
+            weight_slice, scale_slice = slices[2 * i], slices[2 * i + 1]
+            if shard_dim is None:
+                experts.append(
+                    _finish_fp8(weight_slice[:], scale_slice[:], block, transpose, out_dtype)
+                )
+                continue
+
+            start = (rank % num_shards) * shard_size
+            stop = start + shard_size
+            block_size = block[shard_dim]
+            if start % block_size or shard_size % block_size:
+                full = _finish_fp8(
+                    weight_slice[:], scale_slice[:], block, False, out_dtype
+                )
+                key = [slice(None)] * full.ndim
+                key[shard_dim] = slice(start, stop)
+                shard = full[tuple(key)]
+                experts.append((shard.T if transpose else shard).contiguous())
+                continue
+
+            weight_key = [slice(None), slice(None)]
+            weight_key[shard_dim] = slice(start, stop)
+            scale_key = [slice(None), slice(None)]
+            scale_key[shard_dim] = slice(start // block_size, stop // block_size)
+            experts.append(
+                _finish_fp8(
+                    weight_slice[tuple(weight_key)],
+                    scale_slice[tuple(scale_key)],
+                    block,
+                    transpose,
+                    out_dtype,
+                )
+            )
 
         return torch.stack(experts, dim=0).contiguous()
 

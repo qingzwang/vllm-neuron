@@ -129,6 +129,12 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        # DeepSeek-V4 checkpoints declare FP8 (and FP4 experts) in
+        # quantization_config, which vLLM resolves to this method. Neuron has no
+        # FP4 datapath, so the model dequantizes to bf16 during checkpoint load
+        # rather than going through a vLLM quantization backend. Listing it here
+        # tells vLLM the platform accepts such a checkpoint.
+        "deepseek_v4_fp8",
     ]
     device_control_env_var: str = "NEURON_VISIBLE_DEVICES"
     _device_count: int = -1

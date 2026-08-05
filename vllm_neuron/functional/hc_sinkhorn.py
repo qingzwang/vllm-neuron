@@ -64,14 +64,21 @@ def _hc_sinkhorn_nki(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
         t_lo = tile * PMAX
         t_hi = min(t_lo + PMAX, tokens)
 
+        t_len = t_hi - t_lo
         m = nl.load(mixes[t_lo:t_hi])  # [t_len, mix_hc]
+
+        # scale and base arrive with a single partition. Elementwise ops require
+        # operands to match the destination's partition count (the CPU simulator
+        # broadcasts implicitly; the compiler rejects it), so widen them here.
+        scale_b = nl.broadcast_to(scale_sb, (t_len, scale_sb.shape[1]))
+        base_b = nl.broadcast_to(base_sb, (t_len, base_sb.shape[1]))
 
         # ── pre = sigmoid(m[:hc] * scale[0] + base[:hc]) + eps ──
         pre = nl.add(
             nl.sigmoid(
                 nl.add(
-                    nl.multiply(m[:, 0:hc], scale_sb[0, 0]),
-                    base_sb[0, 0:hc],
+                    nl.multiply(m[:, 0:hc], scale_b[:, 0:1]),
+                    base_b[:, 0:hc],
                 )
             ),
             eps,
@@ -82,8 +89,8 @@ def _hc_sinkhorn_nki(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
         post = nl.multiply(
             nl.sigmoid(
                 nl.add(
-                    nl.multiply(m[:, hc : 2 * hc], scale_sb[0, 1]),
-                    base_sb[0, hc : 2 * hc],
+                    nl.multiply(m[:, hc : 2 * hc], scale_b[:, 1:2]),
+                    base_b[:, hc : 2 * hc],
                 )
             ),
             2.0,
@@ -91,12 +98,12 @@ def _hc_sinkhorn_nki(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
         nl.store(post_out[t_lo:t_hi], value=post)
 
         # ── comb: row softmax, then alternating row/column normalization ──
-        comb = nl.ndarray((t_hi - t_lo, comb_width), dtype=nl.float32, buffer=nl.sbuf)
+        comb = nl.ndarray((t_len, comb_width), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(
             comb,
             nl.add(
-                nl.multiply(m[:, 2 * hc :], scale_sb[0, 2]),
-                base_sb[0, 2 * hc :],
+                nl.multiply(m[:, 2 * hc :], scale_b[:, 2:3]),
+                base_b[:, 2 * hc :],
             ),
         )
 

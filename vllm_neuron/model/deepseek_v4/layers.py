@@ -615,7 +615,11 @@ def compute_hash_router_scores(
     scores = F.linear(hidden_states.float(), router_weight.float())
     scores = F.softplus(scores).sqrt()
 
-    indices = tid2eid[input_ids.long()].long()
+    # Clamp into the table: padding and warmup-synthetic token ids are not
+    # guaranteed to be inside the vocabulary, and an out-of-range index faults
+    # the hardware gather. Padding tokens' routing is discarded downstream.
+    token_ids = input_ids.long().clamp(0, tid2eid.shape[0] - 1)
+    indices = tid2eid[token_ids].long()
     selected = torch.zeros_like(scores, dtype=torch.bool)
     selected = selected.scatter(-1, indices, True)
 

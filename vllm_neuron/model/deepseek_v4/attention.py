@@ -97,16 +97,19 @@ def sparse_latent_attention(
         tokens, heads, head_dim, device=q.device, dtype=torch.float32
     )
 
+    num_slots = kv.shape[0]
     for start in range(0, topk, chunk_size):
         stop = min(start + chunk_size, topk)
         idx = topk_idxs[:, start:stop].long()
-        valid = idx >= 0
+        valid = (idx >= 0) & (idx < num_slots)
         width = stop - start
 
         # [T, width, head_dim] — gather this chunk's latent slots per query.
-        gathered = kv.index_select(0, idx.clamp_min(0).reshape(-1)).view(
-            tokens, width, head_dim
-        )
+        # Clamp both ends: an out-of-range index would fault the hardware
+        # gather. Anything clamped is masked out of the softmax below.
+        gathered = kv.index_select(
+            0, idx.clamp(0, num_slots - 1).reshape(-1)
+        ).view(tokens, width, head_dim)
 
         logits = torch.einsum("thd,tkd->thk", q_f32, gathered.float())
         # Scale and the mask fill value are materialized as fp32 tensors: XLA
@@ -757,7 +760,11 @@ class DeepseekV4Attention(nn.Module):
         request's length hold stale data and must be excluded by the caller's
         index mask.
         """
-        blocks = block_table.long().reshape(-1)
+        # The block table is padded for unallocated slots, and during warmup it
+        # is synthetic. Clamp into range: an out-of-range index faults the
+        # hardware gather, and the rows it produces are masked out downstream.
+        num_blocks = self.k_cache.shape[0]
+        blocks = block_table.long().reshape(-1).clamp(0, num_blocks - 1)
         # [num_blocks_sel, block_size, head_dim] — head dim is 1 for MLA.
         gathered = self.k_cache.index_select(0, blocks)[:, 0]
         return gathered.reshape(-1, self.head_dim)

@@ -129,11 +129,48 @@ Three neuronx-cc 2.26 limitations shape the implementation. All are load-bearing
 
 ## Hardware status
 
-Compiles and generates on trn2 (`tensor_parallel_size=1`, synthetic checkpoint)
-for all three attention layer types — sliding-window-only, CSA and HCA — with
-FP4 experts and hash routing. End-to-end serving of the full 43-layer 284B
-checkpoint has not been run; see the memory budget below for the TP degree it
-requires.
+The full 43-layer `DeepSeek-V4-Flash-0731` checkpoint loads, compiles and
+generates correctly on a trn2.48xlarge at `--tensor-parallel-size 32` with
+expert parallelism.
+
+```
+prompt:  "The capital of France is"
+output:  " Paris. The capital of Spain is Madrid. The capital of Italy is Rome."
+```
+
+Measured at TP=32, EP=32, `--max-model-len 128`, `--max-num-seqs 1`, best of 3
+runs per shape:
+
+| Shape (prompt → output) | TTFT   | TPOT    | Decode throughput |
+| ----------------------- | ------ | ------- | ----------------- |
+| 64 → 32 tokens          | 653 ms | 88.3 ms | 11.3 tok/s        |
+| 32 → 64 tokens          | 654 ms | 88.2 ms | 11.3 tok/s        |
+
+TTFT is flat across prompt lengths because both pad to the single compiled
+128-token prefill bucket. Weight load takes ~2330 s (FP4/FP8 dequantized to
+bf16 on 32 ranks).
+
+These are first-working numbers, not a tuned configuration. Decode is where the
+headroom is: it runs the dense MoE path (every local expert evaluated for one
+token) and a torch sparse attention, both bounded by the compiler constraints
+below rather than by hardware throughput.
+
+### Compiler instruction budget bounds the context length
+
+`neuronx-cc` caps a graph at 5M machine instructions (`NCC_ELUR015`). The
+binding term is the **context length**, not the layer count: a CSA layer's
+compressed stream holds `max_model_len / 4` slots, and the sparse attention
+gathers over `sliding_window + slots` per query.
+
+| Prefill bucket | `max_model_len` | Compile result             |
+| -------------- | --------------- | -------------------------- |
+| 128            | 128             | 32/32 ranks                |
+| 512            | 512             | 30/32 ranks (2 over by 9%) |
+| 512            | 2048            | fails (6.9M instructions)  |
+
+Raising this needs the sparse attention itself moved into a NKI kernel, so the
+gather and the online softmax cost a fixed number of instructions instead of
+scaling with the selection width.
 
 ## Memory
 
@@ -160,23 +197,29 @@ variant instead halves the expert footprint.
 | Attention DP            | ❌     |                                                |
 | Prefix caching          | ⚠️     | Window only; compressed state rebuilt          |
 | Continuous batching     | ❌     | `--max-num-seqs 1` enforced (see above)        |
-| Long context on CSA     | ⚠️     | `--max-model-len <= index_topk * 4` = 2048     |
+| Long context            | ⚠️     | `--max-model-len 128` compiles; see below      |
 | Segmented prefill       | ❌     | Compressors need the whole prompt              |
 | DSpark spec decode      | ❌     | `mtp.*` weights unused                         |
 | FP8 KV cache            | ❌     | Latent KV is bf16                              |
 | On-device sampling      | ✅     |                                                |
-| MoE NKI kernels         | ❌     | Dense-masked dispatch; see `moe.py` TODO       |
+| MoE blockwise kernel    | ✅     | Prefill via `NF.moe_cte`; decode stays dense   |
+| Sparse-attention kernel | ❌     | Torch gather + chunked online softmax          |
 
 ## Serving
 
 ```bash
 vllm serve /path/to/DeepSeek-V4-Flash-0731 \
     --tensor-parallel-size 32 \
-    --max-model-len 2048 \
+    --enable-expert-parallel \
+    --max-model-len 128 \
     --max-num-seqs 1 \
-    --additional-config '{"neuron_config": {"ep_degree": 8}}'
+    --additional-config '{"neuron_config": {"ep_degree": 32}}'
 ```
 
-`--max-num-seqs 1` and `--max-model-len <= 2048` are enforced by the factory for
-the reasons given above; both raise a clear error rather than miscompiling or
-returning wrong output.
+`--max-num-seqs 1` is enforced by the factory (the compressed streams are
+per-request buffers) and raises a clear error rather than returning wrong
+output. `--max-model-len` above 128 currently exceeds the compiler's
+instruction budget on some ranks — see the table above.
+
+Note that this host reports `logical-neuroncore-config: 2`, so a trn2.48xlarge
+exposes 32 logical cores rather than 64; TP=32 uses all of them.

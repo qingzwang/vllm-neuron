@@ -179,9 +179,16 @@ def _sparse_latent_attention_nki(kv_t, q_t, idx, valid, sink, scale):
                 )
 
         # ── fold in the sink and normalize ──
-        final_denom = nl.add(
-            denom, nl.exp(nl.subtract(sink_sb, running_max))
+        # Reciprocal-then-multiply rather than nl.divide: the NKI compiler
+        # rejects 'divide' as an activation operator (the CPU simulator accepts
+        # it, so this only shows up on device).
+        final_denom = nl.ndarray((H, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(
+            final_denom,
+            nl.add(denom, nl.exp(nl.subtract(sink_sb, running_max))),
         )
+        inv_denom = nl.ndarray((H, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(inv_denom, nl.reciprocal(final_denom))
         for db in nl.static_range(d_blocks):
             d_lo = db * PMAX
             d_hi = min(d_lo + PMAX, D)
@@ -189,7 +196,7 @@ def _sparse_latent_attention_nki(kv_t, q_t, idx, valid, sink, scale):
             a_lo = db * PMAX
             nl.store(
                 out[t, :, d_lo:d_hi],
-                value=nl.divide(acc[:, a_lo : a_lo + d_len], final_denom),
+                value=nl.multiply(acc[:, a_lo : a_lo + d_len], inv_denom),
             )
 
     return out

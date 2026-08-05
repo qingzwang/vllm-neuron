@@ -8,6 +8,7 @@ from .attention.attention_decode import attention_decode
 from .attention.qkv import qkv_proj
 from .attention.o_proj import o_proj
 from .attention.attention_cte import flash_attention
+from .attention.sparse_latent import sparse_latent_attention
 from .attention.attention_segmented_cte import (
     segmented_attention,
     segmented_attention_cp,
@@ -67,6 +68,7 @@ __all__ = [
     "rmsnorm_router_topk_tkg",
     "router",
     "sample",
+    "sparse_latent_attention",
     "segmented_attention",
     "segmented_attention_cp",
     "topk_reduce",

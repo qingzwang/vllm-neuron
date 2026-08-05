@@ -38,104 +38,12 @@ from vllm_neuron.model.deepseek_v4.layers import (
     hadamard_rotate,
     rms_normalize,
 )
+from vllm_neuron.functional.attention.sparse_latent import (
+    sparse_latent_attention,
+)
 from vllm_neuron.utils.weight_loader import set_weight_loader
 
 from .weight_loaders import cast_weight_loader, fp8_dequant_weight_loader
-
-
-# Selected slots processed per attention pass. The gather in
-# sparse_latent_attention materializes [tokens, chunk, head_dim] in fp32; with
-# head_dim=512 and a 640-wide selection, doing it in one pass is a ~640 MiB
-# operator that neuronx-cc expands past its 5M-instruction budget
-# (NCC_ELUR015). Chunking trades a longer graph for a bounded operator size.
-SPARSE_ATTENTION_CHUNK = 128
-
-
-def sparse_latent_attention(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    attn_sink: torch.Tensor,
-    topk_idxs: torch.Tensor,
-    scale: float,
-    chunk_size: int = SPARSE_ATTENTION_CHUNK,
-) -> torch.Tensor:
-    """Gather-based sparse attention over a shared latent KV.
-
-    The latent KV acts as both keys and values (MLA), so a slot contributes the
-    same vector to the logit and the weighted sum. ``attn_sink`` adds a learned
-    per-head logit that carries no value, letting a head attend to "nothing".
-
-    The selection is processed in chunks with an online (FlashAttention-style)
-    softmax, so the gathered KV never exceeds ``[tokens, chunk_size, head_dim]``.
-    Results are identical to a single-pass softmax up to fp32 rounding.
-
-    Args:
-        q: ``[T, heads, head_dim]`` queries.
-        kv: ``[S, head_dim]`` latent KV slots.
-        attn_sink: ``[heads]`` sink logits (fp32).
-        topk_idxs: ``[T, topk]`` int32 slot indices into ``kv``; ``-1`` marks an
-            unused slot and is masked out.
-        scale: Softmax scale (``head_dim ** -0.5``).
-        chunk_size: Selected slots per pass.
-
-    Returns:
-        ``[T, heads, head_dim]`` attention output in ``q``'s dtype.
-    """
-    tokens, heads, head_dim = q.shape
-    topk = topk_idxs.shape[-1]
-    q_f32 = q.float()
-
-    # Running online-softmax state: max logit, denominator, weighted sum.
-    lowest = torch.finfo(torch.float32).min
-    running_max = torch.full(
-        (tokens, heads), lowest, device=q.device, dtype=torch.float32
-    )
-    denominator = torch.zeros(
-        tokens, heads, device=q.device, dtype=torch.float32
-    )
-    accumulator = torch.zeros(
-        tokens, heads, head_dim, device=q.device, dtype=torch.float32
-    )
-
-    num_slots = kv.shape[0]
-    for start in range(0, topk, chunk_size):
-        stop = min(start + chunk_size, topk)
-        idx = topk_idxs[:, start:stop].long()
-        valid = (idx >= 0) & (idx < num_slots)
-        width = stop - start
-
-        # [T, width, head_dim] — gather this chunk's latent slots per query.
-        # Clamp both ends: an out-of-range index would fault the hardware
-        # gather. Anything clamped is masked out of the softmax below.
-        gathered = kv.index_select(
-            0, idx.clamp(0, num_slots - 1).reshape(-1)
-        ).view(tokens, width, head_dim)
-
-        logits = torch.einsum("thd,tkd->thk", q_f32, gathered.float())
-        # Scale and the mask fill value are materialized as fp32 tensors: XLA
-        # types bare Python floats as f64, which neuronx-cc rejects.
-        logits = logits * torch.full_like(logits, scale)
-        logits = torch.where(
-            valid.unsqueeze(1), logits, torch.full_like(logits, lowest)
-        )
-
-        # Rescale the running state to the new max, then fold in this chunk.
-        chunk_max = torch.maximum(running_max, logits.amax(dim=-1))
-        rescale = torch.exp(running_max - chunk_max)
-        weights = torch.exp(logits - chunk_max.unsqueeze(-1))
-
-        accumulator = accumulator * rescale.unsqueeze(-1) + torch.einsum(
-            "thk,tkd->thd", weights, gathered.float()
-        )
-        denominator = denominator * rescale + weights.sum(dim=-1)
-        running_max = chunk_max
-
-    # The sink is a logit with no value: it only enlarges the denominator, which
-    # is how a head attends to "nothing".
-    denominator = denominator + torch.exp(
-        attn_sink.float().view(1, heads) - running_max
-    )
-    return (accumulator / denominator.unsqueeze(-1)).to(q.dtype)
 
 
 class Compressor(nn.Module):

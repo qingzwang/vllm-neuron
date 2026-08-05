@@ -29,6 +29,11 @@ from vllm_neuron.nki.nki_hop import can_run_kernel, wrap_nki
 # Tokens per kernel tile: SBUF partitions cap at 128.
 PMAX = 128
 
+# Fewest tokens worth dispatching to the kernel, mirroring the sparse-attention
+# op: the win is a bounded instruction count over many tokens, and at one token
+# per sequence the HOP-call overhead dominates. Decode stays in torch.
+MIN_KERNEL_TOKENS = 8
+
 
 @nki.jit
 def _hc_sinkhorn_nki(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
@@ -190,7 +195,7 @@ def hc_split_sinkhorn(
     if mixes.ndim != 2:
         raise ValueError(f"mixes must be 2-D [T, mix_hc], got {tuple(mixes.shape)}")
 
-    if not can_run_kernel(mixes):
+    if mixes.shape[0] < MIN_KERNEL_TOKENS or not can_run_kernel(mixes):
         return _torch_hc_split_sinkhorn(
             mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
         )

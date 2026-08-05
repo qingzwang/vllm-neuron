@@ -32,6 +32,14 @@ PMAX = 128
 # Sentinel driving padding logits below any real one before the exponential.
 _MASK_BIAS = 1.0e30
 
+# Fewest tokens worth dispatching to the kernel. The kernel's win is bounded
+# instruction count over a long selection, which is what prefill needs; at one
+# token per sequence its per-token loop and HOP-call overhead dominate and
+# measured TPOT is ~20% worse than the torch path. Decode therefore stays in
+# torch, which costs nothing at compile time because a single token's gather is
+# small.
+MIN_KERNEL_TOKENS = 8
+
 
 def _transpose(src, rows: int, cols: int):
     """Transpose an SBUF tile into a new SBUF tile.
@@ -203,13 +211,17 @@ def _sparse_latent_attention_nki(kv_t, q_t, idx, valid, sink, scale):
     return out
 
 
-def _can_use_kernel(kv: Tensor, head_dim: int, selection: int) -> bool:
-    """Check the NKI kernel's constraints.
+def _can_use_kernel(
+    kv: Tensor, tokens: int, head_dim: int, selection: int
+) -> bool:
+    """Check whether the NKI kernel applies.
 
-    The kernel tiles freely over both dimensions, so the only hard requirements
-    are hardware availability and fp32 compute.
+    It tiles freely over both dimensions, so the constraints are hardware
+    availability and enough tokens to amortize the per-token loop.
     """
     if not can_run_kernel(kv):
+        return False
+    if tokens < MIN_KERNEL_TOKENS:
         return False
     if head_dim < 1 or selection < 1:
         return False
@@ -249,7 +261,7 @@ def sparse_latent_attention(
         )
     selection = topk_idxs.shape[-1]
 
-    if not _can_use_kernel(kv, head_dim, selection):
+    if not _can_use_kernel(kv, tokens, head_dim, selection):
         return _torch_sparse_latent_attention(
             q, kv, attn_sink, topk_idxs, scale, chunk_size
         )

@@ -16,6 +16,7 @@ from .attention.attention_segmented_cte import (
 from .collectives.all_to_all import all_to_all
 from .collectives.all_to_all_v import all_to_all_v
 from .embedding import embedding
+from .hc_sinkhorn import hc_split_sinkhorn
 from .expert_parallel import (
     calculate_local_expert_indices,
     validate_expert_parallelism_config,
@@ -55,6 +56,7 @@ __all__ = [
     "flash_attention",
     "gen_attention_decode_mask",
     "get_group_slice_indices",
+    "hc_split_sinkhorn",
     "get_local_expert_affinities",
     "merge_prompt_embeds",
     "mlp",

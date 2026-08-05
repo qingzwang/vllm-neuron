@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm_neuron.functional.hc_sinkhorn import hc_split_sinkhorn
+
 
 class DeepseekV4RMSNorm(nn.Module):
     """RMSNorm that normalizes in fp32 and returns the input dtype.
@@ -203,47 +205,6 @@ def apply_interleaved_rope(
 
 
 # ── Manifold-Constrained Hyper-Connections (mHC) ─────────────────────────────
-
-
-def hc_split_sinkhorn(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int,
-    sinkhorn_iters: int,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split the mix projection into pre / post / combination weights.
-
-    The combination matrix is row-softmaxed then alternately row/column
-    normalized (Sinkhorn) so it approaches a doubly-stochastic matrix, which is
-    what keeps the residual stream's scale stable across layers.
-
-    Args:
-        mixes: ``[..., (2 + hc_mult) * hc_mult]`` projection output (fp32).
-        hc_scale: ``[3]`` per-part scale.
-        hc_base: ``[(2 + hc_mult) * hc_mult]`` per-element bias.
-        hc_mult: Number of residual-stream copies.
-        sinkhorn_iters: Total normalization rounds.
-        eps: Stabilizer added after each normalization.
-
-    Returns:
-        ``(pre, post, comb)`` with shapes ``[..., hc]``, ``[..., hc]``,
-        ``[..., hc, hc]``, all fp32.
-    """
-    hc = hc_mult
-    m = mixes.float()
-    pre = torch.sigmoid(m[..., :hc] * hc_scale[0] + hc_base[:hc]) + eps
-    post = 2 * torch.sigmoid(m[..., hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc])
-    comb = m[..., 2 * hc :] * hc_scale[2] + hc_base[2 * hc :]
-    comb = comb.unflatten(-1, (hc, hc))
-
-    comb = torch.softmax(comb, dim=-1) + eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(sinkhorn_iters - 1):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
-    return pre, post, comb
 
 
 class HyperConnection(nn.Module):

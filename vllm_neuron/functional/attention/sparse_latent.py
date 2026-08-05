@@ -54,9 +54,10 @@ def _sparse_latent_attention_nki(kv_t, q_t, idx, valid, sink, scale):
         kv_t:  ``[D, S]`` fp32 — latent KV, transposed so slots sit on the free
                axis, which is the axis ``gather_flattened`` indexes.
         q_t:   ``[T, D, H]`` fp32 — queries per token, transposed to match.
-        idx:   ``[T, D, K]`` int32 — selected slot per token, broadcast down the
-               D axis so every partition gathers the same slots. Values must be
-               in range; the caller clamps.
+        idx:   ``[T, D, K]`` uint32 — selected slot per token, broadcast down
+               the D axis so every partition gathers the same slots. The gather
+               instruction requires unsigned indices, and they must be in range;
+               the caller clamps.
         valid: ``[T, H, K]`` fp32 — 1.0 for a real selection, 0.0 for padding.
                The gather needs in-range indices, so the caller clamps and marks
                the clamped entries here instead.
@@ -255,7 +256,9 @@ def sparse_latent_attention(
 
     idx = topk_idxs.long()
     valid = ((idx >= 0) & (idx < num_slots)).to(torch.float32)
-    safe_idx = idx.clamp(0, num_slots - 1).to(torch.int32)
+    # The gather instruction requires uint32 indices. Clamping above already
+    # made them non-negative, so the conversion is lossless.
+    safe_idx = idx.clamp(0, num_slots - 1).to(torch.uint32)
 
     # The kernel gathers along the free axis, so the KV and queries arrive
     # transposed, and the indices are broadcast down the head_dim axis so every

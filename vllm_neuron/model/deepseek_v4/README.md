@@ -80,8 +80,9 @@ Consequences:
   for the window, but the compressed stream is rebuilt from the prompt on every
   prefill.
 - **No cross-request block sharing** of compressed state.
-- Buffers are sized `max_num_seqs x (max_model_len / compress_ratio)`, allocated
-  at `bind_kv_cache()`.
+- Buffers hold **one request's** stream, so `--max-num-seqs 1` is enforced
+  whenever any layer has compression. Concurrent requests would otherwise read
+  each other's compressed KV.
 
 Folding these into the paged allocator needs `LayerSpec` to express a per-group
 token-to-slot stride, which the current runner contract does not have.
@@ -94,13 +95,45 @@ top-k selection for a small fraction of tokens. Router scoring is therefore done
 in fp32, and **token-exact agreement with the reference is not a valid accuracy
 gate** — use logit cosine similarity and argmax agreement instead.
 
-Measured against the reference on real weights (6 layers, 40 tokens, CPU):
+Measured against the reference implementation on real checkpoint weights
+(6 layers spanning all three attention types, 40 tokens, CPU):
 
 | Metric              | Value    |
 | ------------------- | -------- |
 | hidden-state cosine | 0.99997  |
 | logit cosine        | ~1.0000  |
 | argmax agreement    | 100%     |
+
+Component-level agreement with the reference is exact (maxdiff 0.0) for RMSNorm,
+YaRN frequencies, interleaved RoPE, the hyper-connection pre/post/head mixes,
+both compressor variants, the sparse latent attention, and the FP8/FP4
+fake-quant and Hadamard helpers. The MoE agrees to bf16 accumulation order
+(~5e-3 relative).
+
+## Neuron compiler constraints
+
+Three neuronx-cc 2.26 limitations shape the implementation. All are load-bearing
+— reverting any of them reproduces a compile failure:
+
+* **No `sort`.** XLA lowers a small `torch.topk` to `sort`. The MoE router uses
+  `layers.topk_mask` (iterated max-and-mask) instead, and the indexer skips
+  top-k entirely when every slot fits the budget.
+* **No f64.** A bare Python float in a tensor expression is typed f64. Scales
+  and mask fill values are materialized as same-dtype tensors, and `-inf` is
+  replaced by `finfo.min`.
+* **No conditional in-place buffer updates** (internal error `NCC_ILSA902`).
+  Slice assignment into a preallocated buffer, and `torch.where` feeding an
+  in-place `index_put_` / `index_copy_`, both trip it. Buffers are built whole
+  with `cat` and written with a single flat `copy_`; index steering uses
+  `clamp` or arithmetic blends rather than selects.
+
+## Hardware status
+
+Compiles and generates on trn2 (`tensor_parallel_size=1`, synthetic checkpoint)
+for all three attention layer types — sliding-window-only, CSA and HCA — with
+FP4 experts and hash routing. End-to-end serving of the full 43-layer 284B
+checkpoint has not been run; see the memory budget below for the TP degree it
+requires.
 
 ## Memory
 
@@ -126,6 +159,8 @@ variant instead halves the expert footprint.
 | SP (sequence parallel)  | ❌     | Hyper-connection streams not sharded           |
 | Attention DP            | ❌     |                                                |
 | Prefix caching          | ⚠️     | Window only; compressed state rebuilt          |
+| Continuous batching     | ❌     | `--max-num-seqs 1` enforced (see above)        |
+| Long context on CSA     | ⚠️     | `--max-model-len <= index_topk * 4` = 2048     |
 | Segmented prefill       | ❌     | Compressors need the whole prompt              |
 | DSpark spec decode      | ❌     | `mtp.*` weights unused                         |
 | FP8 KV cache            | ❌     | Latent KV is bf16                              |
@@ -137,7 +172,11 @@ variant instead halves the expert footprint.
 ```bash
 vllm serve /path/to/DeepSeek-V4-Flash-0731 \
     --tensor-parallel-size 32 \
-    --max-model-len 8192 \
-    --max-num-seqs 4 \
+    --max-model-len 2048 \
+    --max-num-seqs 1 \
     --additional-config '{"neuron_config": {"ep_degree": 8}}'
 ```
+
+`--max-num-seqs 1` and `--max-model-len <= 2048` are enforced by the factory for
+the reasons given above; both raise a clear error rather than miscompiling or
+returning wrong output.

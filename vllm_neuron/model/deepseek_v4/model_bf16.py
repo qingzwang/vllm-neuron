@@ -27,7 +27,6 @@ from vllm_neuron.utils.weight_loader import (
 )
 
 from .attention import DeepseekV4Attention
-from .compressed_state import CompressedKVState
 from .config import DeepseekV4Config
 from .layers import DeepseekV4RMSNorm, HyperConnection, HyperConnectionHead
 from .moe import DeepseekV4MoE
@@ -82,15 +81,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         attn_metadata: dict,
         input_ids: torch.Tensor | None,
-        compressed_state: CompressedKVState | None,
     ) -> torch.Tensor:
         """Advance the ``[T, hc_mult, H]`` residual streams through this block."""
         residual = streams
         collapsed, post, comb = self.hc_attn.pre(streams)
         collapsed = self.attn_norm(collapsed)
-        attn_out = self.self_attn(
-            collapsed, positions, attn_metadata, compressed_state
-        )
+        attn_out = self.self_attn(collapsed, positions, attn_metadata)
         streams = self.hc_attn.post(attn_out, residual, post, comb)
 
         residual = streams
@@ -145,10 +141,6 @@ class DeepseekV4Model(nn.Module):
         for param in (self.hc_head.fn, self.hc_head.base, self.hc_head.scale):
             set_weight_loader(param, cast_weight_loader(out_dtype=torch.float32))
 
-        # Compressed KV buffers, allocated lazily once the runner reports the
-        # batch and context budget via bind_kv_cache().
-        self.compressed_states: dict[int, CompressedKVState] = {}
-
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -163,14 +155,8 @@ class DeepseekV4Model(nn.Module):
         # Expand into the hyper-connection residual streams.
         streams = hidden_states.unsqueeze(-2).expand(-1, self.hc_mult, -1)
 
-        for layer_idx, layer in enumerate(self.layers):
-            streams = layer(
-                streams,
-                positions,
-                attn_metadata,
-                input_ids,
-                self.compressed_states.get(layer_idx),
-            )
+        for layer in self.layers:
+            streams = layer(streams, positions, attn_metadata, input_ids)
 
         collapsed = self.hc_head(streams)
         return self.norm(collapsed)
@@ -315,28 +301,45 @@ class DeepseekV4ForCausalLM(nn.Module):
         self._allocate_compressed_states()
 
     def _allocate_compressed_states(self) -> None:
-        """Allocate per-layer compressed KV buffers sized from the vLLM config."""
+        """Allocate the per-layer compressed KV buffers.
+
+        Sized from the vLLM config rather than the paged allocator, since these
+        streams are model-owned — see :mod:`~.compressed_state`.
+        """
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
-        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         max_model_len = vllm_config.model_config.max_model_len
+        dtype = self.config.torch_dtype
 
-        for layer_idx, layer in enumerate(self.model.layers):
+        for layer in self.model.layers:
             attn = layer.self_attn
             if not attn.compress_ratio:
                 continue
-            reference = attn.k_cache
-            max_slots = max(1, max_model_len // attn.compress_ratio)
-            self.model.compressed_states[layer_idx] = CompressedKVState(
-                max_num_seqs=max_num_seqs,
-                max_slots=max_slots,
-                head_dim=attn.head_dim,
-                index_head_dim=(
-                    attn.indexer.head_dim if attn.indexer is not None else None
-                ),
-                dtype=self.config.torch_dtype,
-                device=reference.device,
+            device = attn.k_cache.device
+            # One slot beyond the addressable capacity: decode steps that do not
+            # close a compression window park their write there instead of
+            # branching. See DeepseekV4Attention._append_compressed.
+            max_slots = max(1, max_model_len // attn.compress_ratio) + 1
+
+            attn.compressed_kv = torch.zeros(
+                max_slots, attn.head_dim, dtype=dtype, device=device
+            )
+            if attn.indexer is not None:
+                attn.compressed_index_kv = torch.zeros(
+                    max_slots, attn.indexer.head_dim, dtype=dtype, device=device
+                )
+            attn.compress_window_hidden = torch.zeros(
+                attn.compress_ratio,
+                self.config.hidden_size,
+                dtype=dtype,
+                device=device,
+            )
+            # Shape [1] rather than a 0-d scalar: the FX inplace-to-outofplace
+            # pass rewrites copy_ into slice_scatter, which cannot address a
+            # 0-dimensional tensor.
+            attn.compressed_length = torch.zeros(
+                1, dtype=torch.int32, device=device
             )
 
     # ── Weight loading ───────────────────────────────────────────────────
@@ -461,11 +464,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         # walks named_parameters()) does not cover. Read them directly.
         self._load_hash_tables(checkpoint, device)
 
-        # Rotary tables are computed constants, not checkpoint tensors. The
-        # model is built under torch.device("meta"), so the buffers created in
-        # __init__ have no storage — rebuild them on the real device.
-        self._rebuild_rotary_tables(device)
-
     def _load_hash_tables(
         self, checkpoint: SafetensorsCheckpoint, device: torch.device
     ) -> None:
@@ -483,29 +481,3 @@ class DeepseekV4ForCausalLM(nn.Module):
             table = checkpoint._get_slice(key)[:]
             moe.tid2eid = table.to(torch.int32).to(device)
 
-    def _rebuild_rotary_tables(self, device: torch.device) -> None:
-        """Recompute the RoPE inverse-frequency buffers on ``device``.
-
-        Called after weight loading because these buffers are derived from the
-        config rather than loaded, and would otherwise stay on the meta device.
-        """
-        from .layers import compute_yarn_inv_freq
-
-        rope_scaling = self.config.rope_scaling or {}
-        for layer in self.model.layers:
-            modules = [layer.self_attn.rotary_emb]
-            for rotary in modules:
-                if layer.self_attn.compress_ratio:
-                    inv_freq = compute_yarn_inv_freq(
-                        rotary.rotary_dim,
-                        self.config.compress_rope_theta,
-                        rope_scaling.get("original_max_position_embeddings", 0),
-                        rope_scaling.get("factor", 1.0),
-                        rope_scaling.get("beta_fast", 32),
-                        rope_scaling.get("beta_slow", 1),
-                    )
-                else:
-                    inv_freq = compute_yarn_inv_freq(
-                        rotary.rotary_dim, self.config.rope_theta, 0, 1.0, 32, 1
-                    )
-                rotary.inv_freq = inv_freq.to(device)

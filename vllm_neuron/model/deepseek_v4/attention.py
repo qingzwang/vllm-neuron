@@ -77,8 +77,12 @@ def sparse_latent_attention(
     # [T, topk, head_dim] — gather the selected latent slots per query.
     gathered = kv.index_select(0, safe_idx.reshape(-1)).view(tokens, topk, head_dim)
 
-    logits = torch.einsum("thd,tkd->thk", q.float(), gathered.float()) * scale
-    logits = logits.masked_fill(~valid.unsqueeze(1), float("-inf"))
+    logits = torch.einsum("thd,tkd->thk", q.float(), gathered.float())
+    # Scale and the mask fill value are materialized as fp32 tensors: XLA types
+    # bare Python floats as f64, which neuronx-cc rejects.
+    logits = logits * torch.full_like(logits, scale)
+    neg_inf = torch.full_like(logits, torch.finfo(logits.dtype).min)
+    logits = torch.where(valid.unsqueeze(1), logits, neg_inf)
 
     # Append the sink as an extra softmax column, then drop it from the average.
     sink = attn_sink.float().view(1, heads, 1).expand(tokens, heads, 1)
@@ -147,13 +151,20 @@ class Compressor(nn.Module):
         The second half of each window's features stays in place; the first half
         is shifted one window later, so window ``n`` sees window ``n - 1``'s
         overlap features. Window 0 has no predecessor and is filled.
+
+        Assembled with ``cat`` rather than slice assignment into a preallocated
+        buffer: the FX pass turns slice assignment into ``slice_scatter``, which
+        trips an internal neuronx-cc error (NCC_ILSA902) in this position.
         """
         num_windows, ratio, _ = tensor.shape
         d = self.head_dim
-        out = tensor.new_full((num_windows, 2 * ratio, d), fill)
-        out[:, ratio:] = tensor[:, :, d:]
-        out[1:, :ratio] = tensor[:-1, :, :d]
-        return out
+
+        current = tensor[:, :, d:]  # [N, ratio, d] — this window's features
+        shifted = tensor[:, :, :d]  # [N, ratio, d] — to be shifted one window on
+        first = shifted.new_full((1, ratio, d), fill)
+        previous = torch.cat([first, shifted[:-1]], dim=0)
+
+        return torch.cat([previous, current], dim=1)
 
     def forward(
         self,
@@ -176,8 +187,14 @@ class Compressor(nn.Module):
         ratio = self.compress_ratio
         tokens = hidden_states.shape[0]
         num_windows = tokens // ratio
+
         if num_windows == 0:
-            return hidden_states.new_zeros((0, self.head_dim))
+            # Prompt shorter than one window: pad up to a single window so the
+            # output is one (causally masked) slot rather than a zero-length
+            # tensor, which the Neuron compiler cannot lower.
+            hidden_states = F.pad(hidden_states, (0, 0, 0, ratio - tokens))
+            tokens = ratio
+            num_windows = 1
 
         x = hidden_states.float()
         cutoff = num_windows * ratio
@@ -187,7 +204,10 @@ class Compressor(nn.Module):
 
         if self.overlap:
             kv = self._overlap_transform(kv, 0.0)
-            score = self._overlap_transform(score, float("-inf"))
+            # Padding scores must vanish under the softmax below. finfo.min
+            # rather than -inf: XLA types a bare float literal as f64, which
+            # neuronx-cc rejects, and finfo.min underflows to 0 all the same.
+            score = self._overlap_transform(score, torch.finfo(score.dtype).min)
 
         compressed = (kv * score.softmax(dim=1)).sum(dim=1)
         compressed = self.norm(compressed.to(hidden_states.dtype))
@@ -308,10 +328,13 @@ class Indexer(nn.Module):
         """
         tokens = hidden_states.shape[0]
         num_slots = compressed_kv.shape[0]
-        topk = min(self.index_topk, max(num_slots, 1))
 
-        if num_slots == 0:
-            return hidden_states.new_full((tokens, topk), -1, dtype=torch.int32)
+        if num_slots <= self.index_topk:
+            # Every slot fits in the top-k budget, so selection is a no-op:
+            # return all slots, causally masked. Skipping the top-k here is not
+            # just an optimization — XLA lowers a small top-k to `sort`, which
+            # the Neuron compiler rejects on trn2.
+            return _hca_indices_prefill(causal_slot_limit, num_slots, slot_offset)
 
         q = F.linear(q_lora, self.wq_b)
         q = q.view(tokens, self.num_heads_per_rank, self.head_dim)
@@ -335,11 +358,12 @@ class Indexer(nn.Module):
 
         slot_ids = torch.arange(num_slots, device=scores.device)
         allowed = slot_ids.unsqueeze(0) < causal_slot_limit.unsqueeze(1)
-        scores = scores.masked_fill(~allowed, float("-inf"))
+        neg_inf = torch.full_like(scores, torch.finfo(scores.dtype).min)
+        scores = torch.where(allowed, scores, neg_inf)
 
-        topk_idxs = scores.topk(topk, dim=-1)[1]
-        # A query whose causal limit is below topk gets padding slots back from
-        # topk(); mask those to -1 so the attention drops them.
+        topk_idxs = scores.topk(self.index_topk, dim=-1)[1]
+        # A query whose causal limit is below index_topk gets padding slots back
+        # from topk(); mask those to -1 so the attention drops them.
         selected_allowed = torch.gather(allowed, 1, topk_idxs)
         return torch.where(
             selected_allowed, topk_idxs + slot_offset, torch.full_like(topk_idxs, -1)
@@ -468,6 +492,21 @@ class DeepseekV4Attention(nn.Module):
         # Paged latent KV cache, bound by the runner via bind_kv_cache().
         self.k_cache = None
         self.v_cache = None
+
+        # Compressed KV streams. Allocated alongside the paged cache in
+        # bind_kv_cache() (see compressed_state.py for why they are
+        # model-owned) and, like k_cache/v_cache, set as plain attributes so
+        # they are already real device tensors by the time the graph is traced.
+        self.compressed_kv = None
+        self.compressed_index_kv = None
+        # Rolling window of the most recent hidden states, so decode can close
+        # a compression window without re-reading the prompt. Shaped
+        # [compress_ratio, hidden_size]; slot p % compress_ratio holds position
+        # p. Allocated in bind_kv_cache() alongside the streams.
+        self.compress_window_hidden = None
+        # Number of compressed slots currently valid, as a device scalar so the
+        # append path stays inside the traced graph.
+        self.compressed_length = None
 
         self._setup_weight_loaders()
 
@@ -604,18 +643,18 @@ class DeepseekV4Attention(nn.Module):
         """Write the latent KV into the paged cache at ``slot_mapping``.
 
         MLA has a single KV head whose value doubles as key and value, so the
-        same tensor goes into both halves of the cache. Padding tokens carry
-        ``slot_mapping == -1`` and are redirected to a scratch slot that is
-        never read, avoiding a data-dependent mask.
+        same tensor goes into both halves of the cache.
+
+        Padding tokens carry ``slot_mapping == -1``. Rather than masking them
+        out, the slot index is clamped into range so those writes land on the
+        last slot of the cache, which the block manager never hands out while a
+        request is live. Clamping instead of ``torch.where`` is deliberate: a
+        select feeding an in-place index_put_ trips an internal neuronx-cc
+        error (NCC_ILSA902) during legalization.
         """
         num_blocks = self.k_cache.shape[0]
         max_slot = num_blocks * block_size
-        valid = (slot_mapping >= 0) & (slot_mapping < max_slot)
-        # Park invalid writes on slot 0 of the last block, which the block
-        # manager never hands out while a request is live.
-        safe_slots = torch.where(
-            valid, slot_mapping, torch.full_like(slot_mapping, max_slot - 1)
-        )
+        safe_slots = slot_mapping.clamp(0, max_slot - 1)
         block_idx = (safe_slots // block_size).long()
         pos_idx = (safe_slots % block_size).long()
 
@@ -645,7 +684,6 @@ class DeepseekV4Attention(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         attn_metadata: dict,
-        compressed_state: "CompressedKVState | None" = None,
     ) -> torch.Tensor:
         """Run attention for this layer.
 
@@ -653,8 +691,6 @@ class DeepseekV4Attention(nn.Module):
             hidden_states: ``[T, H]`` post-hyper-connection layer input.
             positions: ``[T]`` int32 absolute positions.
             attn_metadata: Per-layer runner metadata (see the onboarding guide).
-            compressed_state: Per-request compressed KV buffers for this layer,
-                or None on sliding-window-only layers.
 
         Returns:
             ``[T, H]`` attention output.
@@ -664,19 +700,14 @@ class DeepseekV4Attention(nn.Module):
         decode_token_threshold = meta["decode_token_threshold"]
 
         if max_query_len <= decode_token_threshold:
-            return self.forward_decode(
-                hidden_states, positions, meta, compressed_state
-            )
-        return self.forward_prefill(
-            hidden_states, positions, meta, compressed_state
-        )
+            return self.forward_decode(hidden_states, positions, meta)
+        return self.forward_prefill(hidden_states, positions, meta)
 
     def forward_prefill(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         meta: dict,
-        compressed_state: "CompressedKVState | None",
     ) -> torch.Tensor:
         """Whole-sequence prefill for a single request.
 
@@ -702,43 +733,51 @@ class DeepseekV4Attention(nn.Module):
         if self.compress_ratio:
             ratio = self.compress_ratio
             num_slots = tokens // ratio
-            compressed_positions = torch.arange(
-                0, num_slots * ratio, ratio, device=latent_kv.device
-            )
-            c_cos, c_sin = self.rotary_emb(
-                compressed_positions, dtype=hidden_states.dtype
-            )
-            compressed_kv = self.compressor(hidden_states, c_cos, c_sin)
 
+            # Build the compressed streams and write them into the persistent
+            # buffers, then attend over the *buffers* rather than the locals.
+            # The buffers have a fixed, config-derived length, so the attention
+            # shapes stay identical across prefill buckets — including the case
+            # where the prompt is shorter than one compression window and
+            # num_slots is 0, which would otherwise create a zero-length tensor
+            # the compiler cannot lower.
+            compressed_kv = self.compressor(
+                hidden_states,
+                *self._compressed_rope(num_slots, ratio, hidden_states),
+            )
+            index_kv = None
+            if self.indexer is not None:
+                index_kv = self.indexer.compressor(
+                    hidden_states,
+                    *self._compressed_rope(num_slots, ratio, hidden_states),
+                )
+            self._store_compressed(compressed_kv, index_kv, hidden_states, tokens)
+
+            capacity = self.compressed_capacity
+            offset = latent_kv.shape[0]
             # A query at position t may see compressed slot s only once the
             # whole window it summarizes is in the past: s < (t + 1) // ratio.
             causal_limit = (
                 torch.arange(1, tokens + 1, device=latent_kv.device) // ratio
-            )
-            offset = latent_kv.shape[0]
+            ).clamp(max=capacity)
 
             if self.indexer is not None:
-                index_positions = compressed_positions
-                i_cos, i_sin = self.rotary_emb(
-                    index_positions, dtype=hidden_states.dtype
-                )
-                index_kv = self.indexer.compressor(hidden_states, i_cos, i_sin)
                 compressed_idxs = self.indexer(
-                    hidden_states, q_lora, index_kv, cos, sin, causal_limit, offset
+                    hidden_states,
+                    q_lora,
+                    self.compressed_index_kv,
+                    cos,
+                    sin,
+                    causal_limit,
+                    offset,
                 )
             else:
                 compressed_idxs = _hca_indices_prefill(
-                    causal_limit, num_slots, offset
+                    causal_limit, capacity, offset
                 )
 
-            kv = torch.cat([latent_kv, compressed_kv], dim=0)
+            kv = torch.cat([latent_kv, self.compressed_kv], dim=0)
             topk_idxs = torch.cat([window_idxs, compressed_idxs], dim=-1)
-
-            if compressed_state is not None:
-                compressed_state.store(
-                    compressed_kv,
-                    index_kv if self.indexer is not None else None,
-                )
         else:
             kv = latent_kv
             topk_idxs = window_idxs
@@ -753,7 +792,6 @@ class DeepseekV4Attention(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         meta: dict,
-        compressed_state: "CompressedKVState | None",
     ) -> torch.Tensor:
         """Single-token decode, reading the sliding window from the paged cache."""
         tokens = hidden_states.shape[0]
@@ -775,22 +813,31 @@ class DeepseekV4Attention(nn.Module):
             positions, self.sliding_window, slots_per_req, tokens, cached.device
         )
 
-        if self.compress_ratio and compressed_state is not None:
-            compressed_kv, index_kv = compressed_state.load()
-            num_slots = compressed_kv.shape[0]
+        if self.compress_ratio:
+            # Advance the compressed stream when this step closes a window.
+            self._append_compressed(hidden_states, positions)
+
+            capacity = self.compressed_capacity
             offset = cached.shape[0]
-            causal_limit = (positions.long() + 1) // self.compress_ratio
-            causal_limit = causal_limit.clamp(max=num_slots)
+            causal_limit = (
+                (positions.long() + 1) // self.compress_ratio
+            ).clamp(max=capacity)
 
             if self.indexer is not None:
                 compressed_idxs = self.indexer(
-                    hidden_states, q_lora, index_kv, cos, sin, causal_limit, offset
+                    hidden_states,
+                    q_lora,
+                    self.compressed_index_kv,
+                    cos,
+                    sin,
+                    causal_limit,
+                    offset,
                 )
             else:
                 compressed_idxs = _hca_indices_prefill(
-                    causal_limit, num_slots, offset
+                    causal_limit, capacity, offset
                 )
-            kv = torch.cat([cached, compressed_kv], dim=0)
+            kv = torch.cat([cached, self.compressed_kv], dim=0)
             topk_idxs = torch.cat([window_idxs, compressed_idxs], dim=-1)
         else:
             kv = cached
@@ -800,6 +847,156 @@ class DeepseekV4Attention(nn.Module):
             q, kv, self.attn_sink, topk_idxs, self.softmax_scale
         )
         return self.project_output(attn_out, cos, sin)
+
+    # ── Compressed stream maintenance ────────────────────────────────────
+
+    @property
+    def compressed_capacity(self) -> int:
+        """Addressable compressed slots, excluding the trailing scratch slot."""
+        return self.compressed_kv.shape[0] - 1
+
+    def _compressed_rope(
+        self, num_slots: int, ratio: int, reference: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotary tables for the compressed slot positions.
+
+        Slot ``s`` summarizes positions ``[s * ratio, (s + 1) * ratio)`` and is
+        rotated at the window's first position. At least one entry is always
+        produced: a prompt shorter than one window yields no real slots, but a
+        zero-length table would make the compressor emit a zero-length tensor
+        that the Neuron compiler cannot lower. The extra slot is masked out by
+        the causal limit, so it never contributes to attention.
+        """
+        count = max(num_slots, 1)
+        positions = torch.arange(
+            0, count * ratio, ratio, device=reference.device
+        )
+        return self.rotary_emb(positions, dtype=reference.dtype)
+
+    def _store_compressed(
+        self,
+        compressed_kv: torch.Tensor,
+        index_kv: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+        tokens: int,
+    ) -> None:
+        """Seed the persistent buffers from a freshly built prefill stream.
+
+        Also primes the rolling hidden-state window with the prompt's trailing
+        partial window, so the first decode step that closes a window sees the
+        same inputs the reference implementation would.
+        """
+        if self.compressed_kv is None:
+            return
+        ratio = self.compress_ratio
+        capacity = self.compressed_capacity
+        keep = min(compressed_kv.shape[0], capacity)
+
+        # Each buffer is rebuilt whole and written with a single copy_.
+        # Slice assignment would work numerically, but the FX pass turns it into
+        # slice_scatter, and a conditional in-place update of a buffer trips an
+        # internal neuronx-cc error (NCC_ILSA902) during legalization. Building
+        # the full tensor with cat keeps the write a flat copy.
+        self.compressed_kv.copy_(
+            _pad_to_rows(compressed_kv[:keep], self.compressed_kv)
+        )
+        if index_kv is not None and self.compressed_index_kv is not None:
+            self.compressed_index_kv.copy_(
+                _pad_to_rows(index_kv[:keep], self.compressed_index_kv)
+            )
+        self.compressed_length.copy_(
+            torch.full_like(self.compressed_length, keep)
+        )
+
+        # Carry over the tail positions that did not fill a whole window, so the
+        # first decode step that closes a window sees the same inputs as the
+        # reference.
+        remainder = tokens % ratio
+        tail = (
+            hidden_states[tokens - remainder : tokens]
+            if remainder
+            else hidden_states[:0]
+        )
+        self.compress_window_hidden.copy_(
+            _pad_to_rows(tail, self.compress_window_hidden)
+        )
+
+    def _append_compressed(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor
+    ) -> None:
+        """Close a compression window if this decode step completes one.
+
+        Decode advances one position at a time, so the hidden state is stashed in
+        a rolling ``[compress_ratio, hidden_size]`` buffer. Every
+        ``compress_ratio``-th position the buffer holds a full window and is run
+        through the compressors to append one slot to each stream.
+
+        The compressors run on every step regardless — the traced graph must
+        have a single shape-static path. Steps that do not close a window are
+        neutralized by redirecting the write to a scratch slot at the end of the
+        buffer, which the causal index mask never selects. Steering the *index*
+        rather than blending the *value* keeps the write a plain scatter; a
+        conditional read-modify-write of the buffer hits an internal
+        neuronx-cc error (NCC_ILSA902) during legalization.
+        """
+        if self.compressed_kv is None:
+            return
+        ratio = self.compress_ratio
+
+        # Stash this step's hidden state at its slot in the rolling window.
+        # Decode is one token per request; position 0 is this request's token.
+        slot = (positions[0].long() % ratio).clamp(0, ratio - 1)
+        self.compress_window_hidden.index_copy_(
+            0,
+            slot.unsqueeze(0),
+            hidden_states[:1].to(self.compress_window_hidden.dtype),
+        )
+
+        window = self.compress_window_hidden
+        compressed_positions = (positions[0].long() + 1 - ratio).clamp_min(0)
+        c_cos, c_sin = self.rotary_emb(
+            compressed_positions.unsqueeze(0), dtype=window.dtype
+        )
+        new_slot = self.compressor(window, c_cos, c_sin)
+
+        # A window closes when this position is the last of its group. When it
+        # does not, aim the write at the scratch slot (the last one, which
+        # _allocate_compressed_states reserves beyond the addressable capacity).
+        closes = ((positions[0].long() + 1) % ratio) == 0
+        scratch = self.compressed_kv.shape[0] - 1
+        length = self.compressed_length.long().clamp(0, scratch - 1)
+        # Arithmetic blend rather than torch.where: a select feeding an in-place
+        # index_copy_ trips an internal neuronx-cc error (NCC_ILSA902).
+        closes_i = closes.to(length.dtype)
+        write_at = closes_i * length + (1 - closes_i) * scratch
+
+        self.compressed_kv.index_copy_(
+            0, write_at, new_slot[:1].to(self.compressed_kv.dtype)
+        )
+        if self.indexer is not None and self.compressed_index_kv is not None:
+            new_index_slot = self.indexer.compressor(window, c_cos, c_sin)
+            self.compressed_index_kv.index_copy_(
+                0, write_at, new_index_slot[:1].to(self.compressed_index_kv.dtype)
+            )
+
+        advanced = (
+            self.compressed_length + closes.to(self.compressed_length.dtype)
+        ).clamp(max=scratch)
+        self.compressed_length.copy_(advanced)
+
+
+def _pad_to_rows(rows: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """Zero-pad ``rows`` along dim 0 to match ``like``'s row count and dtype.
+
+    Returns a freshly built tensor so callers can write a buffer with a single
+    flat ``copy_`` instead of a slice assignment.
+    """
+    rows = rows.to(like.dtype)
+    missing = like.shape[0] - rows.shape[0]
+    if missing <= 0:
+        return rows[: like.shape[0]]
+    padding = rows.new_zeros((missing, *like.shape[1:]))
+    return torch.cat([rows, padding], dim=0)
 
 
 def _window_indices_prefill(

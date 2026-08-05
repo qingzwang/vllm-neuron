@@ -61,10 +61,14 @@ def _find_correction_range(
     return max(low, 0), min(high, dim - 1)
 
 
-def _linear_ramp(low: float, high: float, dim: int) -> torch.Tensor:
+def _linear_ramp(
+    low: float, high: float, dim: int, device: torch.device | None = None
+) -> torch.Tensor:
     if low == high:
         high += 0.001
-    ramp = (torch.arange(dim, dtype=torch.float32) - low) / (high - low)
+    ramp = (
+        torch.arange(dim, dtype=torch.float32, device=device) - low
+    ) / (high - low)
     return ramp.clamp(0, 1)
 
 
@@ -75,6 +79,7 @@ def compute_yarn_inv_freq(
     factor: float,
     beta_fast: float,
     beta_slow: float,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     """Inverse frequencies with YaRN interpolation.
 
@@ -83,13 +88,17 @@ def compute_yarn_inv_freq(
     for the sliding-window-only stream.
     """
     freqs = 1.0 / (
-        base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+        base
+        ** (
+            torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
+            / rotary_dim
+        )
     )
     if original_max_position_embeddings > 0:
         low, high = _find_correction_range(
             beta_fast, beta_slow, rotary_dim, base, original_max_position_embeddings
         )
-        smooth = 1 - _linear_ramp(low, high, rotary_dim // 2)
+        smooth = 1 - _linear_ramp(low, high, rotary_dim // 2, device=device)
         freqs = freqs / factor * (1 - smooth) + freqs * smooth
     return freqs
 
@@ -119,15 +128,11 @@ class DeepseekV4RotaryEmbedding(nn.Module):
     ):
         super().__init__()
         self.rotary_dim = rotary_dim
-        inv_freq = compute_yarn_inv_freq(
-            rotary_dim,
-            base,
-            original_max_position_embeddings,
-            factor,
-            beta_fast,
-            beta_slow,
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.base = base
+        self.original_max_position_embeddings = original_max_position_embeddings
+        self.factor = factor
+        self.beta_fast = beta_fast
+        self.beta_slow = beta_slow
 
     def forward(
         self, positions: torch.Tensor, dtype: torch.dtype = torch.float32
@@ -136,8 +141,22 @@ class DeepseekV4RotaryEmbedding(nn.Module):
 
         Half-width tables: with interleaved pairs each ``(cos, sin)`` entry is
         applied to one element pair, so no doubling is needed.
+
+        The frequencies are recomputed here rather than cached in a buffer.
+        Models are built on the meta device, so a buffer created in ``__init__``
+        would have no storage; deriving them from ``positions.device`` keeps
+        everything on the traced device.
         """
-        freqs = torch.outer(positions.float(), self.inv_freq.to(positions.device))
+        inv_freq = compute_yarn_inv_freq(
+            self.rotary_dim,
+            self.base,
+            self.original_max_position_embeddings,
+            self.factor,
+            self.beta_fast,
+            self.beta_slow,
+            device=positions.device,
+        )
+        freqs = torch.outer(positions.float(), inv_freq)
         return freqs.cos().to(dtype), freqs.sin().to(dtype)
 
 
@@ -377,15 +396,42 @@ def fake_quant_fp8(
 
 FP4_E2M1_MAX = 6.0
 
-# float4_e2m1 representable magnitudes, ascending.
+# float4_e2m1 representable magnitudes, ascending, and the midpoints between
+# consecutive levels. Kept as Python constants: building them with
+# torch.tensor() inside forward() breaks Dynamo's fake-tensor tracing.
 _FP4_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_FP4_MIDPOINTS = tuple(
+    (_FP4_LEVELS[i] + _FP4_LEVELS[i + 1]) / 2 for i in range(len(_FP4_LEVELS) - 1)
+)
+
+
+def _round_to_e2m1(magnitude: torch.Tensor) -> torch.Tensor:
+    """Round non-negative magnitudes to the nearest e2m1 level.
+
+    Built as a sum of thresholded increments — ``level_0 + sum_i step_i *
+    (level_i - level_{i-1})`` — rather than a chain of selects or a gather.
+    Both alternatives are worse here: a lookup table needs a device-side
+    constant tensor (which breaks Dynamo's fake-tensor tracing), and a
+    ``torch.where`` chain feeding downstream indexing trips an internal
+    neuronx-cc error (NCC_ILSA902) during legalization.
+
+    The threshold is strict (``>``) so exact midpoints round down, matching
+    ``torch.bucketize``'s right-open interval and hence the reference kernel.
+    """
+    result = torch.full_like(magnitude, _FP4_LEVELS[0])
+    previous = _FP4_LEVELS[0]
+    for level, midpoint in zip(_FP4_LEVELS[1:], _FP4_MIDPOINTS):
+        step = (magnitude > torch.full_like(magnitude, midpoint)).to(magnitude.dtype)
+        result = result + step * (level - previous)
+        previous = level
+    return result
 
 
 def fake_quant_fp4(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
     """Quantize to FP4 (e2m1) per block along the last dim, then dequantize.
 
-    Used on the indexer's compressed stream, which the reference implementation
-    keeps on an FP4 grid with power-of-two block scales.
+    Used on the indexer's compressed stream and query, which the reference
+    implementation keeps on an FP4 grid with power-of-two block scales.
 
     Args:
         x: Tensor whose last dim is a multiple of ``block_size``.
@@ -405,13 +451,7 @@ def fake_quant_fp4(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
     amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(FP4_E2M1_MAX * 2.0**-126)
     scale = torch.pow(2.0, torch.ceil(torch.log2(amax / FP4_E2M1_MAX)))
     scaled = (blocks / scale).clamp(-FP4_E2M1_MAX, FP4_E2M1_MAX)
-
-    # Round to the nearest representable e2m1 magnitude.
-    levels = torch.tensor(_FP4_LEVELS, device=x.device, dtype=torch.float32)
-    midpoints = (levels[1:] + levels[:-1]) / 2
-    magnitude = levels[torch.bucketize(scaled.abs(), midpoints)]
-    quantized = torch.sign(scaled) * magnitude
-
+    quantized = torch.sign(scaled) * _round_to_e2m1(scaled.abs())
     return (quantized * scale).flatten(-2).to(dtype)
 
 
@@ -462,6 +502,45 @@ def swiglu(
     return F.silu(gate) * up
 
 
+def topk_mask(scores: torch.Tensor, top_k: int) -> torch.Tensor:
+    """Boolean mask marking the ``top_k`` largest entries of each row.
+
+    Avoids ``torch.topk``: XLA lowers top-k over a small trailing dim to
+    ``sort``, which neuronx-cc rejects on Trainium. Instead the k-th largest
+    value is found by iterated max-and-mask, which is ``top_k`` elementwise
+    passes — cheap for the k=6 that DeepSeek-V4 uses, and fully traceable.
+
+    Ties are broken by position (lower index wins), so exactly ``top_k``
+    entries are selected even when scores are equal — which matters here,
+    because DeepSeek-V4's expert scores are near-degenerate.
+
+    Args:
+        scores: ``[T, E]`` scores.
+        top_k: Number of entries to select per row.
+
+    Returns:
+        ``[T, E]`` boolean mask with exactly ``top_k`` True entries per row.
+    """
+    num_experts = scores.shape[-1]
+    if top_k >= num_experts:
+        return torch.ones_like(scores, dtype=torch.bool)
+
+    # Break ties by index so the running max picks a unique winner each round.
+    rank_bias = torch.arange(
+        num_experts, device=scores.device, dtype=scores.dtype
+    ) * -1e-6
+    keyed = scores + rank_bias
+
+    remaining = keyed
+    selected = torch.zeros_like(scores, dtype=torch.bool)
+    neg_inf = torch.finfo(keyed.dtype).min
+    for _ in range(top_k):
+        winner = remaining.argmax(dim=-1, keepdim=True)
+        selected = selected.scatter(-1, winner, True)
+        remaining = remaining.scatter(-1, winner, neg_inf)
+    return selected
+
+
 def compute_router_scores(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
@@ -472,8 +551,8 @@ def compute_router_scores(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score-based MoE routing with the sqrt-softplus activation.
 
-    The bias shifts scores for *selection* only; the returned weights come from
-    the unbiased scores (``topk_method="noaux_tc"``).
+    The bias shifts scores for *selection* only; the returned affinities come
+    from the unbiased scores (``topk_method="noaux_tc"``).
 
     Args:
         hidden_states: ``[T, H]``.
@@ -484,18 +563,20 @@ def compute_router_scores(
         normalize: L1-normalize the selected weights before scaling.
 
     Returns:
-        ``(weights, indices)`` of shape ``[T, top_k]``; weights are fp32.
+        ``(affinities, selected)``: ``[T, E]`` fp32 affinities, zero for
+        unselected experts, and the ``[T, E]`` bool selection mask.
     """
     scores = F.linear(hidden_states.float(), router_weight.float())
     scores = F.softplus(scores).sqrt()
     unbiased = scores
     if router_bias is not None:
         scores = scores + router_bias.float()
-    indices = scores.topk(top_k, dim=-1)[1]
-    weights = unbiased.gather(-1, indices)
+
+    selected = topk_mask(scores, top_k)
+    affinities = torch.where(selected, unbiased, torch.zeros_like(unbiased))
     if normalize:
-        weights = weights / weights.sum(dim=-1, keepdim=True)
-    return weights * routed_scaling_factor, indices
+        affinities = affinities / affinities.sum(dim=-1, keepdim=True)
+    return affinities * routed_scaling_factor, selected
 
 
 def compute_hash_router_scores(
@@ -506,11 +587,12 @@ def compute_hash_router_scores(
     routed_scaling_factor: float,
     normalize: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Hash routing: expert indices come from a fixed token-id table.
+    """Hash routing: expert selection comes from a fixed token-id table.
 
-    The first ``num_hash_layers`` layers use this. Scores are still computed
-    from the router weight to produce the mixing weights, but selection is a
-    table lookup on the token id.
+    The first ``num_hash_layers`` layers use this. Scores still come from the
+    router weight and provide the mixing affinities, but *which* experts a token
+    uses is a table lookup on its id — so routing is independent of the hidden
+    state.
 
     Args:
         hidden_states: ``[T, H]``.
@@ -521,12 +603,23 @@ def compute_hash_router_scores(
         normalize: L1-normalize the selected weights before scaling.
 
     Returns:
-        ``(weights, indices)`` of shape ``[T, top_k]``; weights are fp32.
+        ``(affinities, selected)``: ``[T, E]`` fp32 affinities, zero for
+        unselected experts, and the ``[T, E]`` bool selection mask.
+
+    Note:
+        A token id may appear more than once in its ``tid2eid`` row. The
+        reference implementation then adds that expert's contribution twice; the
+        mask-based form here counts it once. The shipped checkpoints have no
+        duplicate rows, so the two agree.
     """
     scores = F.linear(hidden_states.float(), router_weight.float())
     scores = F.softplus(scores).sqrt()
-    indices = tid2eid[input_ids.long()]
-    weights = scores.gather(-1, indices.long())
+
+    indices = tid2eid[input_ids.long()].long()
+    selected = torch.zeros_like(scores, dtype=torch.bool)
+    selected = selected.scatter(-1, indices, True)
+
+    affinities = torch.where(selected, scores, torch.zeros_like(scores))
     if normalize:
-        weights = weights / weights.sum(dim=-1, keepdim=True)
-    return weights * routed_scaling_factor, indices.long()
+        affinities = affinities / affinities.sum(dim=-1, keepdim=True)
+    return affinities * routed_scaling_factor, selected

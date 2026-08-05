@@ -243,7 +243,7 @@ class DeepseekV4MoE(nn.Module):
     def route(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute ``(weights, indices)`` of shape ``[T, top_k]``."""
+        """Compute ``(affinities, selected)``, both ``[T, num_experts]``."""
         if self.is_hash_layer:
             if input_ids is None:
                 raise ValueError(
@@ -270,8 +270,8 @@ class DeepseekV4MoE(nn.Module):
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Run routed + shared experts over ``[T, H]`` and return ``[T, H]``."""
-        weights, indices = self.route(hidden_states, input_ids)
-        routed = self._run_routed_experts(hidden_states, weights, indices)
+        affinities, _ = self.route(hidden_states, input_ids)
+        routed = self._run_routed_experts(hidden_states, affinities)
 
         # Both paths produce TP-partial sums, so a single all-reduce covers the
         # routed experts, the shared expert, and (under EP) the expert split.
@@ -281,37 +281,31 @@ class DeepseekV4MoE(nn.Module):
         return output.to(hidden_states.dtype)
 
     def _run_routed_experts(
-        self,
-        hidden_states: torch.Tensor,
-        weights: torch.Tensor,
-        indices: torch.Tensor,
+        self, hidden_states: torch.Tensor, affinities: torch.Tensor
     ) -> torch.Tensor:
         """Dense-masked expert dispatch.
 
-        Every local expert is evaluated over all tokens and masked by its
-        routing weight. This keeps the traced graph shape-static (no
-        data-dependent gather sizes), which is what the Neuron compiler needs;
-        the cost is that a token pays for every local expert rather than just
-        its top-k.
+        Every local expert is evaluated over all tokens and scaled by its
+        routing affinity, which is zero for the experts a token did not select.
+        This keeps the traced graph shape-static — no data-dependent gather
+        sizes — which is what the Neuron compiler needs; the cost is that a
+        token pays for every local expert rather than just its top-k.
+
+        Args:
+            hidden_states: ``[T, H]``.
+            affinities: ``[T, num_experts]`` global affinities; this rank slices
+                out the experts it owns.
 
         TODO: Replace with the plugin's blockwise MoE kernels
         (``NF.moe_cte`` / ``NF.moe_block_tkg``) once the FP4-dequantized
         stacked-weight layout is wired up to them. The kernels want
-        ``[E, H, 2, I]`` fused gate/up weights and an affinity-scatter, so this
+        ``[E, H, 2, I]`` fused gate/up weights and an affinity scatter, so this
         is a layout change rather than a math change.
         """
-        tokens = hidden_states.shape[0]
-
-        # [T, E_local] affinity: routing weight where selected, else zero.
-        affinity = hidden_states.new_zeros(
-            (tokens, self.num_local_experts), dtype=torch.float32
-        )
-        local_index = indices - self.expert_start
-        in_range = (local_index >= 0) & (local_index < self.num_local_experts)
-        safe_index = local_index.clamp(0, self.num_local_experts - 1)
-        affinity.scatter_(
-            1, safe_index, torch.where(in_range, weights.float(), 0.0)
-        )
+        # Slice this rank's expert range out of the global affinity matrix.
+        local_affinity = affinities[
+            :, self.expert_start : self.expert_start + self.num_local_experts
+        ]
 
         # Evaluate each local expert over all tokens: [E, T, I].
         gate = torch.einsum("th,eih->eti", hidden_states, self.expert_w1)
@@ -319,6 +313,7 @@ class DeepseekV4MoE(nn.Module):
         activated = swiglu(gate, up, self.swiglu_limit)
         # Scale by the per-(token, expert) affinity before the down projection,
         # so unselected experts contribute exactly zero.
-        activated = activated * affinity.T.unsqueeze(-1)
-        down = torch.einsum("eti,ehi->th", activated.to(hidden_states.dtype), self.expert_w2)
-        return down
+        activated = activated * local_affinity.T.unsqueeze(-1)
+        return torch.einsum(
+            "eti,ehi->th", activated.to(hidden_states.dtype), self.expert_w2
+        )

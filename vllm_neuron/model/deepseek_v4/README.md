@@ -58,8 +58,11 @@ tilelang). This port differs as follows:
   reproduce it exactly.
 - **Hadamard rotation is written in torch** (`layers.hadamard_rotate`) rather
   than `fast_hadamard_transform`, so it traces on Neuron.
-- **Attention is a gather-based sparse kernel in torch.** The NKI flash-attention
-  kernel caps `head_dim` at 128; MLA needs 512.
+- **Attention and the hyper-connection Sinkhorn are purpose-built NKI kernels.**
+  The plugin's flash-attention kernel caps `head_dim` at 128 and MLA needs 512,
+  so `functional/attention/sparse_latent.py` and `functional/hc_sinkhorn.py`
+  implement them directly. Both fall back to torch for decode — see the
+  hardware-status section.
 - **DSpark speculative decoding is not implemented.** The `-0731` revision
   replaces the single MTP block with 3 DSpark stages plus Markov and confidence
   heads (`mtp.*` in the checkpoint, `dspark_*` in `config.json`). The backbone is
@@ -112,8 +115,12 @@ fake-quant and Hadamard helpers. The MoE agrees to bf16 accumulation order
 
 ## Neuron compiler constraints
 
-Three neuronx-cc 2.26 limitations shape the implementation. All are load-bearing
-— reverting any of them reproduces a compile failure:
+Six neuronx-cc 2.26 behaviours shape the implementation. All are load-bearing —
+reverting any of them reproduces a compile failure or wrong numbers. Note that
+the NKI CPU simulator accepts every one of the kernel-side three, so they only
+surface when tracing on device.
+
+### In the traced torch graph
 
 * **No `sort`.** XLA lowers a small `torch.topk` to `sort`. The MoE router uses
   `layers.topk_mask` (iterated max-and-mask) instead, and the indexer skips
@@ -126,6 +133,51 @@ Three neuronx-cc 2.26 limitations shape the implementation. All are load-bearing
   in-place `index_put_` / `index_copy_`, both trip it. Buffers are built whole
   with `cat` and written with a single flat `copy_`; index steering uses
   `clamp` or arithmetic blends rather than selects.
+
+### Inside the NKI kernels
+
+* **`nl.*` expressions are lazy.** An online-softmax rescale left as an
+  expression over `running_max` is re-evaluated after the writeback and
+  collapses to `exp(0) = 1`, silently dropping the correction. Intermediates are
+  materialized with `tensor_copy`.
+* **Broadcasting a `[H, 1]` tile against a partition slice of a 3-D SBUF tile
+  misaligns the partition axis.** Accumulators are laid out 2-D as
+  `[H, blocks * 128]` instead. A scalar operand also has to be widened with
+  `nl.broadcast_to` to the destination's partition count.
+* **`nl.divide` is not a supported activation operator, and gather indices must
+  be `uint32`.** Normalization takes a reciprocal and multiplies; indices are
+  clamped (making them non-negative) and cast.
+
+Tensor Engine mechanics add two more shapes to work around rather than
+constraints to avoid: transpose writes PSUM (the Vector Engine path caps at
+32x32) and matmul operands must be SBUF, so each transpose routes through PSUM
+and copies back.
+
+## Parallelism layout
+
+`TP=32` and `EP=32` describe two different partitions of the *same* 32 ranks,
+not 32x32 of anything:
+
+| Degree  | Partitions                                       | Per rank            |
+| ------- | ------------------------------------------------ | ------------------- |
+| `TP=32` | Q heads, embedding, LM head, attention projections | 64 / 32 = 2 Q heads |
+| `EP=32` | The 256 routed experts                           | 256 / 32 = 8 experts |
+
+Every rank runs attention for its 2 heads and the FFN for its 8 experts. The
+latent KV is a single head shared by all Q heads, so it is replicated rather
+than sharded.
+
+The two interact through `tp_degree = world_size / ep_degree` (see `moe.py`):
+`EP=32` leaves `tp_degree = 1`, so each rank holds 8 *whole* experts with an
+unsharded intermediate dim. `EP=8` would instead give every rank 32 experts at a
+quarter of the intermediate width each. `EP=32` is used because the decode path
+evaluates every local expert densely, so fewer local experts is faster.
+
+Why 32 and not 64: this host reports `logical-neuroncore-config: 2`, pairing
+physical cores into logical ones. A trn2.48xlarge has 16 devices x 4 physical
+cores = 64 physical, but exposes **32 logical** cores, and TP addresses logical
+cores. Weights divide accordingly — 530 GiB bf16 / 32 = 16.6 GiB per rank
+against 48 GiB of HBM per logical core.
 
 ## Hardware status
 
@@ -229,8 +281,9 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
 
 `--max-num-seqs 1` is enforced by the factory (the compressed streams are
 per-request buffers) and raises a clear error rather than returning wrong
-output. `--max-model-len` above 128 currently exceeds the compiler's
-instruction budget on some ranks — see the table above.
+output. `--max-model-len 512` compiles on all ranks but does not finish warmup
+within the barrier timeout, so 128 is the length that currently serves — see the
+compile-envelope table above.
 
-Note that this host reports `logical-neuroncore-config: 2`, so a trn2.48xlarge
-exposes 32 logical cores rather than 64; TP=32 uses all of them.
+See the parallelism-layout section for why TP and EP are both 32 and why that is
+all 32 of this host's logical cores.

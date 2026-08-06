@@ -230,8 +230,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             input_ids, positions, attn_metadata=attn_metadata, rank=rank
         )
 
+        # Clamp into range: an out-of-range index faults the hardware gather
+        # rather than returning garbage, and the runner's padding contract
+        # (padding entries repeat the last real index) is not worth trusting
+        # blind at this cost.
         hidden_states_for_logits = torch.index_select(
-            hidden_states, dim=0, index=sampling_positions
+            hidden_states,
+            dim=0,
+            index=sampling_positions.clamp(0, hidden_states.shape[0] - 1),
         )
         logits = self.lm_head(hidden_states_for_logits)
 

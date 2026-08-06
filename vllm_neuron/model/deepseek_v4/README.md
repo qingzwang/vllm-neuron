@@ -248,17 +248,61 @@ instruction count no longer scales with the selection width or the round count:
 | `max_model_len` | torch path                 | with NKI kernels     |
 | --------------- | -------------------------- | -------------------- |
 | 128             | all ranks                  | all ranks (32 and 64) |
-| 512             | 30/32 (2 over by 9%)       | **32/32 ranks**      |
+| 512             | 30/32 (2 over by 9%)       | **all ranks; decode faults (above)** |
 | 2048            | fails (6.9M instructions)  | not yet measured     |
 
 The instruction count is per-rank and driven by the context length, not the rank
 count, so widening TP does not change this envelope.
 
-At `max_model_len 512` all 128 graphs compile clean, but warmup then exceeds
-the 3600 s barrier timeout: the attention kernel iterates tokens serially, so a
-512-token prefill runs 512 sequential passes. Compilation is no longer the
-limit — kernel throughput is. Batching the token loop (tiling tokens onto the
-partition axis alongside `head_dim`) is the next step.
+Beyond `max_model_len 2048` the indexer's selection also has to engage: a CSA
+layer's compressed stream then holds more than `index_topk = 512` slots, so the
+top-k is no longer a no-op. `torch.topk` lowers to `sort`, which neuronx-cc
+rejects, so `layers.large_topk_mask` selects by bisecting the k-th largest
+*value* instead — a fixed ~24 compare-and-count passes regardless of `top_k`,
+versus the `top_k` passes `topk_mask` costs (fine for the MoE router's k=6,
+hopeless for k=512). `_compact_mask_to_indices` then turns the mask into
+fixed-width indices with a cumsum scatter, also sort-free.
+
+Verified against `scores.topk` on CPU: identical selection (100% agreement,
+exactly `top_k` entries per row) for streams from 513 up to 131072 slots, and
+the lowered HLO contains no `sort`, `topk`, or `f64`. Two subtleties were
+load-bearing — the bisection must bracket over *finite* scores only, because
+callers mask disallowed slots to `finfo.min` and a 3e38-wide bracket never
+converges; and the index tie-break must scale as `1 / num_slots`, or at 32k
+slots it reorders genuinely distinct scores. **Not yet exercised on device**:
+the 512 decode fault blocks reaching a context where the top-k engages.
+
+At `max_model_len 512` all graphs compile and warmup completes. Two environment
+variables are needed, and neither is the value its name suggests:
+
+* `VLLM_NEURON_BARRIER_TIMEOUT` (default 3600) is what bounds warmup — *not*
+  `--distributed-timeout-seconds`. Rank 0 compiles every graph serially while
+  the other ranks sit in `tp_barrier`, so the barrier must outlast the whole
+  compile. 512 needs ~2 h; an earlier report that "512 warmup is too slow" was
+  this timeout, not kernel throughput.
+* `VLLM_NEURON_PARALLEL_COMPILE_WORKERS` (default 8) caps compile concurrency.
+  This host has 192 cores, so 24 is a better default.
+
+### Known bug: gather out-of-bounds at 512 decode
+
+`max_model_len 512` compiles and warms up, then the first real decode step
+reports
+
+```
+TDRV: scatter/gather (indirect memory copy via scalar DGE) out-of-bound access
+RuntimeError: nrta status=5
+```
+
+on all 64 ranks. It does not reproduce at 128. Two real defects were found and
+fixed while chasing it (see below), but neither is the cause, and every
+`index_select`/`gather` in the traced decode graph has been checked against its
+operand extent — the clamps are all correct. At decode `T=1`, so no NKI kernel
+runs (all three fall back to torch below their token thresholds), which narrows
+it to a torch-lowered gather.
+
+Setting `NEURON_RT_DBG_INDIRECT_MEMCPY_BOUND_CHECK=0` silences the
+notification; whether the offending read is harmless (a masked row) or actually
+corrupts output was not established. **Do not treat that flag as a fix.**
 
 ## Memory
 
@@ -286,7 +330,7 @@ variant instead halves the expert footprint.
 | Attention DP            | ❌     |                                                |
 | Prefix caching          | ⚠️     | Window only; compressed state rebuilt          |
 | Continuous batching     | ❌     | `--max-num-seqs 1` enforced (see above)        |
-| Long context            | ⚠️     | 512 compiles but warmup is too slow; see below |
+| Long context            | ❌     | 128 serves; 512 faults at decode (see above)   |
 | Segmented prefill       | ❌     | Compressors need the whole prompt              |
 | DSpark spec decode      | ❌     | `mtp.*` weights unused                         |
 | FP8 KV cache            | ❌     | Latent KV is bf16                              |
@@ -310,10 +354,49 @@ vllm serve /path/to/DeepSeek-V4-Flash-0731 \
 
 `--max-num-seqs 1` is enforced by the factory (the compressed streams are
 per-request buffers) and raises a clear error rather than returning wrong
-output. `--max-model-len 512` compiles on all ranks but does not finish warmup
-within the barrier timeout, so 128 is the length that currently serves — see the
-compile-envelope table above.
+output. **128 is the only length that serves correctly today** — 512 compiles
+and warms up but faults on the first decode step; see the known-bug section.
 
 TP=64 / EP=64 uses the whole machine and is the fastest measured configuration;
 TP=32 / EP=32 also works and halves the core count. See the parallelism-layout
 section for what each degree partitions.
+
+Longer contexts additionally need the barrier and compile-worker environment
+variables from the compile-envelope section, or warmup times out waiting on
+rank 0's serial compile.
+
+## TODO
+
+Ordered by what blocks what.
+
+1. **Find the 512 decode gather out-of-bounds.** Blocks every context above
+   128, and therefore blocks all quantitative accuracy work. Ruled out so far:
+   every `index_select`/`gather` clamp in the traced decode graph (all correct
+   against their operand extents), the NKI kernels (none run at `T=1`), the
+   sharded embedding (its shard mask is sound), and `tid2eid`. Next: bisect by
+   disabling layer groups, or dump the runtime's faulting DMA descriptor rather
+   than reasoning from the graph. Do not ship
+   `NEURON_RT_DBG_INDIRECT_MEMCPY_BOUND_CHECK=0` as a workaround without first
+   proving the read is harmless.
+2. **Benchmark accuracy on GSM8K.** The harness is written and the dataset is
+   local, but GSM8K needs ~200 tokens median (only 14/150 problems fit in 128),
+   so it cannot run until (1) is fixed. A prior NxD run of the same checkpoint
+   scored 97.3% (146/150) at TPOT 93 ms — directly comparable once this runs.
+   Current accuracy evidence is qualitative only: 6 prompts correct, and
+   identical tokens across 5 configurations (torch / NKI / hybrid / TP=32 /
+   TP=64).
+3. **Exercise `large_topk_mask` on device.** Verified exact against
+   `scores.topk` on CPU up to 131072 slots and confirmed sort-free in the
+   lowered HLO, but no context above 2048 has run on hardware, so its
+   instruction cost and numerics there are unmeasured.
+4. **Batch the NKI attention kernel's token loop.** It walks tokens with
+   `nl.sequential_range`, so a long prefill is that many serial passes. Tiling
+   tokens onto the partition axis alongside `head_dim` is the fix. This is a
+   throughput item, not a correctness one.
+5. **Widen the CPU reference comparison.** The 0.99997 hidden-state cosine
+   covers 6 of 43 layers and 8 of 256 experts. A full-depth, full-expert
+   comparison has never run.
+6. Fold the compressed streams into the paged allocator (needs `LayerSpec` to
+   express a per-group token-to-slot stride), which would lift
+   `--max-num-seqs 1`; and implement DSpark speculative decoding (`mtp.*`
+   weights are loaded but unused).

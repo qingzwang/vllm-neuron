@@ -463,6 +463,85 @@ def swiglu(
     return F.silu(gate) * up
 
 
+def large_topk_mask(
+    scores: torch.Tensor, top_k: int, rounds: int = 24
+) -> torch.Tensor:
+    """Boolean mask marking approximately the ``top_k`` largest entries per row.
+
+    A companion to :func:`topk_mask` for large ``top_k``. ``topk_mask`` costs
+    ``top_k`` elementwise passes, which is fine for the k=6 MoE router but not
+    for the indexer's k=512. This instead binary-searches the k-th largest
+    *value* per row: ``rounds`` passes regardless of ``top_k``, each one a
+    compare-and-count over the row.
+
+    The selection is exact whenever the k-th and (k+1)-th values are separated
+    by more than the search's final resolution. Where they are not, the count
+    can land slightly off ``top_k``; the caller must therefore treat the mask as
+    a *candidate set* and stay correct for any count. That is why this returns a
+    mask rather than indices — a fixed-width index tensor would need padding
+    decisions this function cannot make safely.
+
+    Ties are broken by position via a tiny index bias, matching ``topk_mask``.
+
+    Args:
+        scores: ``[T, S]`` scores. Masked-out entries should already be at
+            ``finfo.min``.
+        top_k: Target number of entries per row.
+        rounds: Bisection steps. 24 resolves fp32 scores to ~1e-7 of their
+            range, well below the gap between distinct indexer scores.
+
+    Returns:
+        ``[T, S]`` boolean mask, approximately ``top_k`` True entries per row.
+    """
+    num_slots = scores.shape[-1]
+    if top_k >= num_slots:
+        return torch.ones_like(scores, dtype=torch.bool)
+
+    # Tie-break by index, scaled by 1 / num_slots so the total perturbation
+    # stays ~1e-6 of the score range however long the stream is. A fixed
+    # per-index step (as topk_mask uses for 256 experts) reaches 3e-2 at 32k
+    # slots and would reorder genuinely distinct scores.
+    rank_bias = torch.arange(
+        num_slots, device=scores.device, dtype=scores.dtype
+    ) * (-1e-6 / num_slots)
+    keyed = scores + rank_bias
+
+    # Bisect on the threshold: count entries above the midpoint and move the
+    # bound that keeps at least top_k candidates alive. amin/amax rather than
+    # a global reduction so each row gets its own bracket.
+    #
+    # The lower bound must bracket the *selectable* scores only. Callers mask
+    # disallowed slots to finfo.min, and using that as `low` stretches the
+    # bracket over 3e38, so a fixed number of halvings never reaches the real
+    # score range and the selection degenerates. Derive the floor from the row
+    # maximum instead, widened by the observed spread of finite entries.
+    high = keyed.amax(dim=-1, keepdim=True)
+    # Same-dtype tensors throughout: a bare Python float in a tensor expression
+    # is typed f64, which neuronx-cc rejects.
+    lowest = torch.full_like(keyed, torch.finfo(keyed.dtype).min)
+    finite = keyed > lowest
+    largest = torch.full_like(keyed, torch.finfo(keyed.dtype).max)
+    real_min = torch.where(finite, keyed, largest).amin(dim=-1, keepdim=True)
+    # A row with no finite entry yields inf; fall back to `high` so the bracket
+    # stays degenerate-but-finite and the row simply selects nothing.
+    low = torch.where(real_min > high, high, real_min)
+    target = torch.full_like(low, float(top_k))
+    half = torch.full_like(low, 0.5)
+    for _ in range(rounds):
+        mid = (low + high) * half
+        count = (keyed > mid).sum(dim=-1, keepdim=True).to(keyed.dtype)
+        # Keep `low` as the highest threshold still admitting >= top_k entries
+        # and `high` as the lowest admitting < top_k, so the bracket converges
+        # onto the k-th largest value from both sides.
+        at_least = count >= target
+        low = torch.where(at_least, mid, low)
+        high = torch.where(at_least, high, mid)
+    # `low` converges to the k-th largest value itself, so a strict compare
+    # would drop it. Use `high` as the cut: it sits just below `low` and
+    # admits exactly the top_k entries.
+    return keyed >= low
+
+
 def topk_mask(scores: torch.Tensor, top_k: int) -> torch.Tensor:
     """Boolean mask marking the ``top_k`` largest entries of each row.
 

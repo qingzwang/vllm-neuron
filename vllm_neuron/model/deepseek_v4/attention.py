@@ -36,6 +36,7 @@ from vllm_neuron.model.deepseek_v4.layers import (
     fake_quant_fp4,
     fake_quant_fp8,
     hadamard_rotate,
+    large_topk_mask,
     rms_normalize,
 )
 from vllm_neuron.functional.attention.sparse_latent import (
@@ -318,13 +319,15 @@ class Indexer(nn.Module):
         neg_inf = torch.full_like(scores, torch.finfo(scores.dtype).min)
         scores = torch.where(allowed, scores, neg_inf)
 
-        topk_idxs = scores.topk(self.index_topk, dim=-1)[1]
-        # A query whose causal limit is below index_topk gets padding slots back
-        # from topk(); mask those to -1 so the attention drops them.
-        selected_allowed = torch.gather(allowed, 1, topk_idxs)
-        return torch.where(
-            selected_allowed, topk_idxs + slot_offset, torch.full_like(topk_idxs, -1)
-        ).to(torch.int32)
+        # `scores.topk` would lower to `sort`, which neuronx-cc rejects. Select
+        # by threshold instead (a fixed number of compare-and-count passes,
+        # independent of index_topk), then compact the mask into fixed-width
+        # indices with a cumsum scatter — also sort-free.
+        selected = large_topk_mask(scores, self.index_topk)
+        selected = selected & allowed
+        return _compact_mask_to_indices(
+            selected, self.index_topk, slot_offset
+        )
 
 
 class DeepseekV4Attention(nn.Module):
@@ -810,7 +813,12 @@ class DeepseekV4Attention(nn.Module):
         cached = self.read_latent_kv(block_table, block_size)
         slots_per_req = block_table.shape[1] * block_size
         window_idxs = _window_indices_decode(
-            positions, self.sliding_window, slots_per_req, tokens, cached.device
+            positions,
+            self.sliding_window,
+            slots_per_req,
+            tokens,
+            cached.device,
+            meta.get("swa_kv_pos_offset"),
         )
 
         if self.compress_ratio:
@@ -1019,20 +1027,75 @@ def _window_indices_decode(
     slots_per_req: int,
     tokens: int,
     device: torch.device,
+    kv_pos_offset: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sliding-window indices into the gathered paged cache for decode.
 
     The gathered cache is ``[num_reqs * slots_per_req, head_dim]`` laid out in
-    block-table order, so request ``r``'s absolute position ``p`` lives at flat
-    index ``r * slots_per_req + p``.
+    block-table order, so request ``r``'s trimmed-frame position ``p`` lives at
+    flat index ``r * slots_per_req + p``.
+
+    For a ``SlidingWindowSpec`` layer the runner trims the block table to the
+    window-relevant blocks and reports the per-request start in
+    ``swa_kv_pos_offset`` (= ``start_block * block_size``). Absolute positions
+    must be rebased into that trimmed frame: once the context exceeds the
+    trimmed width, an absolute index both addresses the wrong row and runs off
+    the end of the gathered cache, which faults the hardware gather.
     """
     request_ids = torch.arange(tokens, device=device).unsqueeze(1)
     pos = positions.long().unsqueeze(1)
+    if kv_pos_offset is not None:
+        pos = pos - kv_pos_offset.long().reshape(-1, 1)[:tokens]
     offsets = torch.arange(window, device=device).unsqueeze(0)
-    absolute = pos - window + 1 + offsets
-    flat = request_ids * slots_per_req + absolute
-    valid = (absolute >= 0) & (absolute < slots_per_req)
+    local = pos - window + 1 + offsets
+    flat = request_ids * slots_per_req + local
+    valid = (local >= 0) & (local < slots_per_req)
     return torch.where(valid, flat, torch.full_like(flat, -1)).to(torch.int32)
+
+
+def _compact_mask_to_indices(
+    selected: torch.Tensor, width: int, offset: int
+) -> torch.Tensor:
+    """Compact a selection mask into ``[T, width]`` slot indices.
+
+    The attention kernel wants a fixed-width index list, but the threshold
+    selection produces a mask. Converting one to the other is a stable
+    compaction: a row's j-th selected slot goes to output column j, where j is
+    the exclusive prefix sum of the mask. That is a scatter, not a sort, so it
+    avoids the operator neuronx-cc rejects.
+
+    Rows with fewer than ``width`` selections keep ``-1`` in the tail, which the
+    attention masks out.
+
+    Args:
+        selected: ``[T, S]`` bool mask.
+        width: Output column count (``index_topk``).
+        offset: Added to every real index so it addresses the caller's
+            concatenated ``[window | compressed]`` buffer.
+
+    Returns:
+        ``[T, width]`` int32 indices, ``-1`` where unused.
+    """
+    tokens, num_slots = selected.shape
+    device = selected.device
+    slot_ids = torch.arange(num_slots, device=device).unsqueeze(0)
+
+    # Destination column for each selected slot; unselected rows are steered to
+    # a scratch column that is dropped below.
+    rank = selected.long().cumsum(dim=-1) - 1
+    rank = torch.where(selected, rank, torch.full_like(rank, width))
+    rank = rank.clamp(0, width)
+
+    out = torch.full((tokens, width + 1), -1, dtype=torch.long, device=device)
+    out = out.scatter(1, rank, slot_ids.expand(tokens, num_slots) + offset)
+    # Column `width` collected the unselected slots; drop it. A row that
+    # selected nothing leaves its real columns at -1.
+    out = out[:, :width]
+    # scatter wrote `offset + slot` unconditionally, so re-mask the columns that
+    # no selected slot claimed.
+    counts = selected.long().sum(dim=-1, keepdim=True)
+    live = torch.arange(width, device=device).unsqueeze(0) < counts
+    return torch.where(live, out, torch.full_like(out, -1)).to(torch.int32)
 
 
 def _hca_indices_prefill(

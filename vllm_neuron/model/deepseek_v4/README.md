@@ -155,62 +155,85 @@ and copies back.
 
 ## Parallelism layout
 
-`TP=32` and `EP=32` describe two different partitions of the *same* 32 ranks,
-not 32x32 of anything:
+`TP=N` and `EP=N` describe two different partitions of the *same* N ranks, not
+N x N of anything:
 
-| Degree  | Partitions                                       | Per rank            |
-| ------- | ------------------------------------------------ | ------------------- |
-| `TP=32` | Q heads, embedding, LM head, attention projections | 64 / 32 = 2 Q heads |
-| `EP=32` | The 256 routed experts                           | 256 / 32 = 8 experts |
+| Degree  | Partitions                                         | Per rank at N=64    |
+| ------- | -------------------------------------------------- | ------------------- |
+| `TP=N`  | Q heads, embedding, LM head, attention projections | 64 / 64 = 1 Q head  |
+| `EP=N`  | The 256 routed experts                             | 256 / 64 = 4 experts |
 
-Every rank runs attention for its 2 heads and the FFN for its 8 experts. The
+Every rank runs attention for its own heads and the FFN for its own experts. The
 latent KV is a single head shared by all Q heads, so it is replicated rather
 than sharded.
 
 The two interact through `tp_degree = world_size / ep_degree` (see `moe.py`):
-`EP=32` leaves `tp_degree = 1`, so each rank holds 8 *whole* experts with an
-unsharded intermediate dim. `EP=8` would instead give every rank 32 experts at a
-quarter of the intermediate width each. `EP=32` is used because the decode path
-evaluates every local expert densely, so fewer local experts is faster.
+`EP == world_size` leaves `tp_degree = 1`, so each rank holds *whole* experts
+with an unsharded intermediate dim. `EP=8` at world size 64 would instead give
+every rank 32 experts at an eighth of the intermediate width each. Setting
+`EP == TP` is preferred because the decode path evaluates every local expert
+densely, so fewer local experts is faster.
 
-Why 32 and not 64: this host reports `logical-neuroncore-config: 2`, pairing
-physical cores into logical ones. A trn2.48xlarge has 16 devices x 4 physical
-cores = 64 physical, but exposes **32 logical** cores, and TP addresses logical
-cores. Weights divide accordingly — 530 GiB bf16 / 32 = 16.6 GiB per rank
-against 48 GiB of HBM per logical core.
+TP=64 is the full machine and the configuration to use. A trn2.48xlarge reports
+`logical-neuroncore-config: 2`, pairing physical cores into logical ones: 16
+devices x 8 physical cores = 128 physical, exposed as **64 logical** cores, and
+TP addresses logical cores. At TP=64 the weight share is 574 GiB bf16 / 64 = 9.0
+GiB per rank against 48 GiB of HBM per logical core, and the attention sharding
+reaches its limit at 1 Q head per rank (64 heads / 64 ranks). Going wider would
+need `num_attention_heads` to divide further.
+
+Setting `NEURON_LOGICAL_NC_CONFIG=1` unpairs the cores and exposes 128 logical
+cores, but TP is capped at 64 by the Q-head count regardless.
 
 ## Hardware status
 
 The full 43-layer `DeepSeek-V4-Flash-0731` checkpoint loads, compiles and
-generates correctly on a trn2.48xlarge at `--tensor-parallel-size 32` with
-expert parallelism.
+generates correctly on a trn2.48xlarge at `--tensor-parallel-size 64` with
+expert parallelism, and identically at TP=32.
 
 ```
 prompt:  "The capital of France is"
 output:  " Paris. The capital of Spain is Madrid. The capital of Italy is Rome."
 ```
 
-Measured at TP=32, EP=32, `--max-model-len 128`, `--max-num-seqs 1`, best of 3
-runs per shape:
+64-token prompt, 32 output tokens, `--max-model-len 128`, `--max-num-seqs 1`,
+best of 3 runs per shape.
 
-| Path                       | TTFT   | TPOT     | Decode throughput |
-| -------------------------- | ------ | -------- | ----------------- |
-| torch attention + HC       | 653 ms | 88.3 ms  | 11.3 tok/s        |
-| NKI everywhere             | 507 ms | 106.2 ms | 9.4 tok/s         |
-| **NKI prefill, torch decode** | **504 ms** | **88.2 ms** | **11.3 tok/s** |
+Scaling across the machine (both with the NKI-prefill / torch-decode path):
 
-64-token prompt, 32 output tokens, best of 3. The kernels win on prefill and
-lose on decode, so both ops fall back to torch below 8 tokens — see
-`functional/attention/sparse_latent.py`.
+| Config          | TTFT       | TPOT       | Decode throughput |
+| --------------- | ---------- | ---------- | ----------------- |
+| TP=32, EP=32    | 504 ms     | 88.2 ms    | 11.3 tok/s        |
+| **TP=64, EP=64** | **467 ms** | **69.4 ms** | **14.4 tok/s** |
+
+TP=64 uses all 64 logical cores and is the configuration to prefer: 27% better
+TPOT and 7% better TTFT. TPOT gains more than TTFT because decode runs the dense
+MoE path, and doubling EP halves the local experts each rank evaluates (8 -> 4).
+
+Kernel-path comparison at TP=32:
+
+| Path                          | TTFT       | TPOT        | Decode throughput |
+| ----------------------------- | ---------- | ----------- | ----------------- |
+| torch attention + HC          | 653 ms     | 88.3 ms     | 11.3 tok/s        |
+| NKI everywhere                | 507 ms     | 106.2 ms    | 9.4 tok/s         |
+| **NKI prefill, torch decode** | **504 ms** | **88.2 ms** | **11.3 tok/s**    |
+
+The kernels win on prefill and lose on decode, so both ops fall back to torch
+below 8 tokens — see `functional/attention/sparse_latent.py`.
 
 TTFT is flat across prompt lengths because both pad to the single compiled
-128-token prefill bucket. Weight load takes ~2330 s (FP4/FP8 dequantized to
-bf16 on 32 ranks).
+128-token prefill bucket. Weight load takes ~1980 s at TP=64 and ~2330 s at
+TP=32 (FP4/FP8 dequantized to bf16 on every rank); compilation adds ~1800 s.
 
 These are first-working numbers, not a tuned configuration. Decode is where the
 headroom is: it runs the dense MoE path (every local expert evaluated for one
 token) and a torch sparse attention, both bounded by the compiler constraints
 below rather than by hardware throughput.
+
+Two environment variables are required on a host without EFA (this instance has
+none): `NEURON_SKIP_EFA_AFFINITY=1`, since EFA affinity is a CPU optimization
+rather than a correctness requirement, and `neuronx-cc` on `PATH` — the venv
+ships it in `bin/` but the worker resolves it by name.
 
 ### Compiler instruction budget bounds the context length
 
@@ -224,9 +247,12 @@ instruction count no longer scales with the selection width or the round count:
 
 | `max_model_len` | torch path                 | with NKI kernels     |
 | --------------- | -------------------------- | -------------------- |
-| 128             | 32/32 ranks                | 32/32 ranks          |
+| 128             | all ranks                  | all ranks (32 and 64) |
 | 512             | 30/32 (2 over by 9%)       | **32/32 ranks**      |
 | 2048            | fails (6.9M instructions)  | not yet measured     |
+
+The instruction count is per-rank and driven by the context length, not the rank
+count, so widening TP does not change this envelope.
 
 At `max_model_len 512` all 128 graphs compile clean, but warmup then exceeds
 the 3600 s barrier timeout: the attention kernel iterates tokens serially, so a
@@ -245,7 +271,8 @@ Dequantizing to bf16 inflates the checkpoint's on-device footprint:
 | **Total**            | ~155 GiB   | **~574 GiB**   |
 
 A trn2.48xlarge has 1536 GiB of HBM (16 devices x 96 GiB), so the model fits at
-TP=32 or above with room for KV cache — but expert parallelism is strongly
+TP=32 or above with room for KV cache — 17.9 GiB per rank at TP=32 and 9.0 GiB at
+TP=64, against 48 GiB per logical core. Expert parallelism is strongly
 recommended to keep the per-rank weight share reasonable. Serving the FP8 `-Base`
 variant instead halves the expert footprint.
 
@@ -271,12 +298,14 @@ variant instead halves the expert footprint.
 ## Serving
 
 ```bash
+export NEURON_SKIP_EFA_AFFINITY=1   # only on hosts without EFA
+
 vllm serve /path/to/DeepSeek-V4-Flash-0731 \
-    --tensor-parallel-size 32 \
+    --tensor-parallel-size 64 \
     --enable-expert-parallel \
     --max-model-len 128 \
     --max-num-seqs 1 \
-    --additional-config '{"neuron_config": {"ep_degree": 32}}'
+    --additional-config '{"neuron_config": {"ep_degree": 64}}'
 ```
 
 `--max-num-seqs 1` is enforced by the factory (the compressed streams are
@@ -285,5 +314,6 @@ output. `--max-model-len 512` compiles on all ranks but does not finish warmup
 within the barrier timeout, so 128 is the length that currently serves — see the
 compile-envelope table above.
 
-See the parallelism-layout section for why TP and EP are both 32 and why that is
-all 32 of this host's logical cores.
+TP=64 / EP=64 uses the whole machine and is the fastest measured configuration;
+TP=32 / EP=32 also works and halves the core count. See the parallelism-layout
+section for what each degree partitions.

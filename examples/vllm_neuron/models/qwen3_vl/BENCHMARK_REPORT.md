@@ -22,8 +22,10 @@
    同长度纯文本对照同样复现，所以问题在通用解码路径，不在多模态路径（§5.1）。
 5. **其他调优项全部无效或更差**：`decode_context_length_buckets` 慢 1.87 倍、
    `enable_chunked_prefill=False` 无差别、`attention_dp_size>1` 单节点不可用（§5.2）。
-6. 过程中发现 **2 个会影响生产的问题**：连续不同视频会让引擎崩溃（§6.1），
-   多 `num_seqs_buckets` 配置会挂死（§6.2）。
+6. 过程中发现 **3 个工具链/框架问题**：连续不同视频会让引擎崩溃（§6.1）、
+   多 `num_seqs_buckets` 配置会挂死（§6.2）、**TP=1 编不出来**（neuronx-cc 段错误，§6.3）。
+   后者否掉了「TP=1 × 4 副本」的方案；顺带发现默认 8 路编译并行在 12 vCPU 上有争抢，
+   串行化能让单图编译快 4.4 倍。
 7. 基准方法上有个坑：**用同一个视频重复压测会让视觉编码器被缓存跳过**，TTFT 会虚低 42%
    （171 ms vs 294 ms）。本报告所有数字均为每请求独立视频（§4.2）。
 
@@ -304,6 +306,44 @@ encoder_cache_num_blocks = ceil(encoder_cache_size / 每视频embed数) * 每视
 栈，信息量有限）。**影响**：想在一个服务里同时支持多种解码 batch，目前这条路不通。
 
 ---
+
+### 6.3 TP=1 编不出来（neuronx-cc 段错误）
+
+为评估「TP=1 × 4 副本」替代「TP=4 × 1 副本」的可行性，试了 TP=1，**两次都在
+neuronx-cc 内部段错误**：
+
+```
+Fatal Python error: Segmentation fault
+  File ".../concurrent/futures/process.py", line 263 in _process_worker
+  File ".../multiprocessing/popen_fork.py", line 71 in _launch
+  File ".../bin/neuronx-cc", line 8 in <module>
+RuntimeError: neuronx-cc compilation failed with 70
+```
+
+| 尝试 | 编译并行度 | 结果 |
+|---|---|---|
+| 1 | 默认（`VLLM_NEURON_PARALLEL_COMPILE_WORKERS=8`） | 第 34.5 分钟段错误 |
+| 2 | `PARALLEL_COMPILE_WORKERS=1` + `PARALLEL_TRACE_WORKERS=1` | 第 35 分钟段错误 |
+
+**不是资源问题**：主机 124 GB RAM、崩溃前后都空着 100 GB 左右、`dmesg` 无 OOM-killer 记录。
+**也不是插件的编译并行度**：串行化后照样崩，而且崩点在 **neuronx-cc 自己内部的
+`ProcessPoolExecutor` fork**，那是编译器自带的多进程，插件的 knob 管不到。
+看起来是编译器在未分片的 Qwen3-VL-8B 图上的 bug。
+
+**副产物（对所有编译都有用）**：串行化让单个 HLO 的编译从 **125.1 s 降到 28.3 s（4.4×）**。
+默认 8 个 worker 在这台 12 vCPU 的机器上存在明显争抢。
+`envs.py` 里的注释也标了这个 TODO：*"Determine the optimal value automatically based on
+CPU/RAM headroom"*。
+
+**另一个独立的否决理由是显存**：
+
+```
+TP=4:  Neuron HBM: 5.64 GiB used, 18.36 GiB free   → KV cache 192,928 token（94× 余量）
+TP=1:  Neuron HBM: 17.08 GiB used, 6.92 GiB free
+```
+
+每核预算约 24 GiB，TP=1 要用 17.08 GiB 放完整权重，只剩 6.92 GiB 给 KV + 编码器缓存。
+而 DP 方案的全部价值就在于「每副本还能跑大 batch 来摊薄权重读」—— 这个前提被显存掐掉了。
 
 ## 7. 对「每秒 1 次推理」目标的容量分析
 

@@ -494,7 +494,15 @@ def parse_args() -> argparse.Namespace:
         "to ceil(encoder_cache_size / embed_tokens_per_video) * blocks_per_video "
         "+ 1 (see the printed cache-headroom line).",
     )
-    p.add_argument("--max-model-len", type=int, default=4096)
+    p.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help="Default: smallest power of two that fits prompt + max_tokens. "
+        "Oversizing this is the most expensive mistake available here — decode "
+        "attends over the whole window, per sequence, so the waste scales with "
+        "batch size.",
+    )
     p.add_argument(
         "--max-num-batched-tokens",
         type=int,
@@ -530,6 +538,21 @@ async def benchmark(args: argparse.Namespace) -> int:
     vision_bucket = args.vision_bucket or derived_bucket
     raw_patches = grid_thw[0] * grid_thw[1] * grid_thw[2]
 
+    # Size max_model_len to the workload unless told otherwise. Decode computes
+    # attention over the whole max_model_len window (decode_context_length_buckets
+    # defaults to unset) and that cost is per sequence, so an oversized window is
+    # the single most expensive misconfiguration here — 4096 vs 2048 was 3.1x TPOT
+    # at batch 8. Rounding to a power of two keeps max_num_batched_tokens and the
+    # token bucket on the sizes the plugin expects.
+    needed_len = num_prompt_tokens + args.max_tokens
+    auto_model_len = args.max_model_len is None
+    if auto_model_len:
+        args.max_model_len = max(256, 1 << (needed_len - 1).bit_length())
+    # A batched-token budget above max_model_len is meaningless and would leave
+    # num_batched_tokens_buckets inconsistent with the value vLLM ends up using.
+    if args.max_num_batched_tokens > args.max_model_len:
+        args.max_num_batched_tokens = args.max_model_len
+
     print("--- input ---")
     print(f"frames            : {num_frames} @ {args.resolution}x{args.resolution}")
     print(f"fps / duration    : {args.fps} / {num_frames / args.fps:.2f}s")
@@ -559,6 +582,22 @@ async def benchmark(args: argparse.Namespace) -> int:
         raise ValueError(
             f"prompt ({num_prompt_tokens}) + max_tokens ({args.max_tokens}) "
             f"exceeds --max-model-len ({args.max_model_len})"
+        )
+    headroom = args.max_model_len / needed_len
+    print(
+        f"max_model_len     : {args.max_model_len} "
+        f"({'auto' if auto_model_len else 'explicit'}), "
+        f"need {needed_len} -> {headroom:.2f}x headroom"
+    )
+    if headroom > 1.5:
+        print(
+            f"WARNING: --max-model-len ({args.max_model_len}) is {headroom:.1f}x the "
+            f"{needed_len} tokens this workload needs. With "
+            f"decode_context_length_buckets unset (the default), decode computes "
+            f"attention over the whole max_model_len window, and that cost is "
+            f"PER SEQUENCE — so the waste scales with batch size. Measured on this "
+            f"workload, 4096 vs 2048 cost 3.1x TPOT at batch 8 (75.16 vs 23.96 ms). "
+            f"Shrink --max-model-len or set decode_context_length_buckets."
         )
 
     additional_config = {

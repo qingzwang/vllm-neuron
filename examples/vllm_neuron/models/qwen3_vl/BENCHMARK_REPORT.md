@@ -61,6 +61,7 @@ TP=4（本机 4 核上限；官方 recipe 的 TP=16 需要 trn2.48xlarge）。
 
 ```python
 max_model_len            = 2048        # 贴合负载 1907；4096 会让解码性能崩塌，见 §5
+                                       # 脚本默认自动取 >= prompt+输出 的最小 2 的幂
 max_num_batched_tokens   = 2048        # >= prompt 1651，保证 prefill 单趟完成
 max_num_seqs             = <batch size>
 tensor_parallel_size     = 4
@@ -107,7 +108,10 @@ batch = 同时发起的并发请求数（一次全部提交）。单位 ms。
 |---|---|---|---|---|---|---|---|
 | 1 | 10 | **316** | **11.23** | **3180** | 80.4 | 0.31 | 11.23 |
 | 4 | 40 | 551 | 18.72 | 5341 | 188.4 | 0.74 | 4.68 |
-| 8 | 80 | 817 | **23.96** | **6905** | **284.1** | **1.11** | 3.00 |
+| 8 | 80 | 817 | **23.96** | **6905** | **284.1** | **1.11** | **3.00** |
+| 16 | 160 | 1471 | 138.20 | 36484 | 110.0 | 0.43 | 8.64 |
+
+**batch 8 是最优点，batch 16 是断崖式退化**（TPOT 5.8×、吞吐掉到 0.39 倍），见 §5.1。
 
 **未调优（`max_model_len=4096`）—— 保留作对照，说明这个参数的影响**：
 
@@ -193,6 +197,24 @@ batch 1 几乎不变、batch 越大提升越多 —— 与「浪费 ∝ batch」
 `enable_chunked_prefill=False`（当前引擎日志是 `True`，而 README 标注该特性不支持）、
 `attention_dp_size>1`（*decode-only Q/O sharding across DP*）、同长度纯文本对照。
 
+### 5.1 batch 16 的悬崖（未定位）
+
+每序列解码成本随 batch 的曲线：**11.23 → 4.68 → 3.00 → 8.64 ms**（BS 1/4/8/16）。
+8 到 16 之间有一个明确的断崖，TPOT 从 23.96 跳到 138.20 ms（**5.8×**，而 batch 只翻 2 倍），
+吞吐从 284 掉到 110 tok/s。
+
+已排除的平凡原因：
+
+- **不是 KV cache 不足**：`GPU KV cache size: 192,928 tokens`，
+  `Maximum concurrency for 2,048 tokens per request: 94.20x`，16 个请求只占 32768，
+  日志中无任何 preemption。
+- **不是编码器缓存缓冲的副作用**：做了控制实验，`encoder_cache_num_blocks` 48 与 72 结果
+  **完全一致**（138.20 vs 138.24 ms，吞吐都是 110.0 tok/s）。
+- **不是不稳定**：10 次迭代全部完成，每请求恰好 256 token，TPOT p50 138.20 / p90 139.58。
+
+推测是 `num_seqs=16` 在 TP=4 下触发了某个编译图或 kernel 的回退路径，**未定位根因**。
+实用结论：**这台机器上 batch 8 就是最优点，不要再往上加。**
+
 ---
 
 ## 6. 发现的两个问题
@@ -267,11 +289,11 @@ encoder_cache_num_blocks = ceil(encoder_cache_size / 每视频embed数) * 每视
 | 方案 | 效果 | 代价 |
 |---|---|---|
 | **砍输出长度** | 需求正比下降，例如 128 token 只需 128 tok/s，余量翻倍 | 输出变短 |
-| 试 batch 16 | §5 的每序列成本还在降（3.00 ms @ BS=8），可能还有空间 | 未测；KV cache 和编码器缓存需重新核算 |
+| ~~加大 batch~~ | **已测，走不通** —— batch 16 反而掉到 110 tok/s / 0.43 req/s（§5.1） | — |
 | 显式配 `decode_context_length_buckets` | 可能在 2048 之外再挤一些 | 未测 |
 | 换 trn2.48xlarge（TP=16） | 4 倍核数 | 成本 |
 
-> 注：batch 16 及以上、以及更短输出长度都**没有实测**，上表中标注为「未测」的行是推断。
+> 注：更短输出长度**没有实测**，是按实测 TPOT 线性外推。batch 16 已实测且更差。
 
 ---
 
@@ -331,6 +353,6 @@ done
 
 - §5 剩余项：显式 `decode_context_length_buckets`、`enable_chunked_prefill=False`、`attention_dp_size>1`、纯文本对照
 - 更短输出长度（64 / 128 token）的实测验证
-- batch 16 及以上
+- §5.1 batch 16 悬崖的根因（已排除 KV cache、编码器缓存缓冲）
 - 自定义视频文件输入（脚本目前只支持 demo asset 和合成噪声，可加 `--video-path`）
 - 在线 serving（HTTP）路径的延时，需要先解决服务端重采样帧数的问题

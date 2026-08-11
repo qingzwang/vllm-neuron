@@ -472,6 +472,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--tensor-parallel-size", type=int, default=4)
     p.add_argument(
+        "--data-parallel-size",
+        type=int,
+        default=1,
+        help="Request-level DP replicas. tp * dp must fit the core count. "
+        "--batch-sizes stays the TOTAL concurrent request count; max_num_seqs and "
+        "num_seqs_buckets are per-replica, so they are divided by dp.",
+    )
+    p.add_argument(
         "--vision-block-size",
         type=int,
         default=2048,
@@ -667,10 +675,22 @@ async def benchmark(args: argparse.Namespace) -> int:
             f"Shrink --max-model-len or set decode_context_length_buckets."
         )
 
+    # max_num_seqs and num_seqs_buckets are per-DP-replica; --batch-sizes is the
+    # total concurrent request count the client submits, which vLLM spreads
+    # across replicas.
+    dp = args.data_parallel_size
+    per_rank_seqs = sorted({math.ceil(b / dp) for b in batch_sizes})
+    if dp > 1:
+        print(
+            f"parallel layout   : TP={args.tensor_parallel_size} x DP={dp} = "
+            f"{args.tensor_parallel_size * dp} cores; "
+            f"num_seqs_buckets (per replica) = {per_rank_seqs}"
+        )
+
     neuron_config: dict[str, Any] = {
         "quantization": "bf16",
         "num_batched_tokens_buckets": [args.max_num_batched_tokens],
-        "num_seqs_buckets": sorted(set(batch_sizes)),
+        "num_seqs_buckets": per_rank_seqs,
         "on_device_sampling_config": {"all_greedy": True},
     }
     if args.decode_context_length_buckets:
@@ -721,8 +741,9 @@ async def benchmark(args: argparse.Namespace) -> int:
         model=args.model_checkpoint,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
-        max_num_seqs=max(batch_sizes),
+        max_num_seqs=max(per_rank_seqs),
         tensor_parallel_size=args.tensor_parallel_size,
+        data_parallel_size=args.data_parallel_size,
         # Prefix caching hard-requires segmented prefill on Neuron and would
         # also make repeated identical prompts hit cache, hiding real prefill cost.
         enable_prefix_caching=False,

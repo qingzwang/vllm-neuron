@@ -309,6 +309,8 @@ encoder_cache_num_blocks = ceil(encoder_cache_size / 每视频embed数) * 每视
 
 ### 6.3 TP=1 编不出来（neuronx-cc 段错误）
 
+> 完整现场、最小复现命令、已排除原因清单见 **[`TP1_COMPILE_FAILURE.md`](TP1_COMPILE_FAILURE.md)**。
+
 为评估「TP=1 × 4 副本」替代「TP=4 × 1 副本」的可行性，试了 TP=1，**两次都在
 neuronx-cc 内部段错误**：
 

@@ -16,10 +16,15 @@
 2. **调优后的数字**（`max_model_len=2048`）: batch 1 TTFT 316 ms / TPOT 11.23 ms / E2E 3.18 s；
    batch 8 TTFT 817 ms / TPOT 23.96 ms / E2E 6.91 s / **284.1 tok/s / 1.11 req/s**。
 3. **「每秒 1 次 × 256 token」的目标可以达到**：batch 8 实测 1.11 req/s（需要 1.0），
-   单请求延时 6.9 s。调优前的结论「缺口 2.5 倍」是错的，那是 `max_model_len` 配置问题（§7）。
-4. 过程中发现 **2 个会影响生产的问题**：连续不同视频会让引擎崩溃（§6.1），
+   单请求延时 6.9 s。调优前的结论「缺口 2.5 倍」是错的，那是 `max_model_len` 配置问题。
+   **更推荐 batch 8 + 128 token：1.79 req/s，延时降到 4.2 s**（§7.1 有全部实测工作点）。
+4. **batch 8 是最优点，batch 16 断崖式退化**（TPOT 138 ms，吞吐掉到 110 tok/s）。
+   同长度纯文本对照同样复现，所以问题在通用解码路径，不在多模态路径（§5.1）。
+5. **其他调优项全部无效或更差**：`decode_context_length_buckets` 慢 1.87 倍、
+   `enable_chunked_prefill=False` 无差别、`attention_dp_size>1` 单节点不可用（§5.2）。
+6. 过程中发现 **2 个会影响生产的问题**：连续不同视频会让引擎崩溃（§6.1），
    多 `num_seqs_buckets` 配置会挂死（§6.2）。
-5. 基准方法上有个坑：**用同一个视频重复压测会让视觉编码器被缓存跳过**，TTFT 会虚低 42%
+7. 基准方法上有个坑：**用同一个视频重复压测会让视觉编码器被缓存跳过**，TTFT 会虚低 42%
    （171 ms vs 294 ms）。本报告所有数字均为每请求独立视频（§4.2）。
 
 ---
@@ -187,15 +192,12 @@ batch 1 几乎不变、batch 越大提升越多 —— 与「浪费 ∝ batch」
 每序列解码成本从 11.23 降到 3.00 ms（**3.7×**），批处理恢复正常。
 
 注意 batch 8 的提升（3.14×）大于窗口缩小的倍数（2×），说明 4096 窗口下可能还额外触发了
-更差的 kernel 路径或分块策略，不只是线性地多算。这一点没有进一步确认。
+更差的 kernel 路径或分块策略，不只是线性地多算。§5.2 里 `decode_context_length_buckets=[1920]`
+（非 2 的幂）反而比 2048 慢 1.87 倍，也指向「context 长度的对齐方式本身影响 kernel 效率」。
 
-**生产建议**：把 `max_model_len` 设成贴合实际负载的最小值；或显式配
-`decode_context_length_buckets`（须升序、小于 `max_model_len`、能被 128 整除），
-后者可在保留大 `max_model_len` 的同时让常见 context 走小 NEFF。
-
-**仍未验证的项**（按预期收益排序）：显式配 `decode_context_length_buckets`、
-`enable_chunked_prefill=False`（当前引擎日志是 `True`，而 README 标注该特性不支持）、
-`attention_dp_size>1`（*decode-only Q/O sharding across DP*）、同长度纯文本对照。
+**生产建议**：把 `max_model_len` 取成**贴合实际负载的最小 2 的幂**。
+不要用 `decode_context_length_buckets` —— 实测反而慢 1.87 倍（§5.2）。
+脚本现在默认自动这么取，显式给超过 1.5 倍余量的值会警告。
 
 ### 5.1 batch 16 的悬崖（未定位）
 
@@ -212,8 +214,42 @@ batch 1 几乎不变、batch 越大提升越多 —— 与「浪费 ∝ batch」
   **完全一致**（138.20 vs 138.24 ms，吞吐都是 110.0 tok/s）。
 - **不是不稳定**：10 次迭代全部完成，每请求恰好 256 token，TPOT p50 138.20 / p90 139.58。
 
+**纯文本对照：悬崖同样出现，所以问题在通用解码路径，不在多模态路径。**
+用同长度（1651 token）的纯文本 prompt、无视觉输入：
+
+| 负载 | BS 8 TPOT | BS 16 TPOT | 倍数 |
+|---|---|---|---|
+| 视频 | 23.96 ms | 138.20 ms | 5.77× |
+| 纯文本 | 23.01 ms | 135.80 ms | 5.90× |
+
+排除了 mrope、vision embedding 注入、编码器缓存等所有多模态相关嫌疑。
 推测是 `num_seqs=16` 在 TP=4 下触发了某个编译图或 kernel 的回退路径，**未定位根因**。
+
+顺带一个有用的量：**解码成本几乎全在文本骨干上**，视觉通路只让 BS=8 的 TPOT 多 4%
+（23.96 vs 23.01）。视觉只影响 TTFT（817 vs 577 ms，差 240 ms）。
+
 实用结论：**这台机器上 batch 8 就是最优点，不要再往上加。**
+
+### 5.2 其他调优项：全部无效或更差（已实测）
+
+| 调优项 | 结果 | TPOT | 吞吐 |
+|---|---|---|---|
+| 基线（`max_model_len=2048`, BS=8） | — | 23.96 ms | 284.1 tok/s |
+| `decode_context_length_buckets=[1920]` | **更差 1.87×** | 44.76 ms | 163.8 tok/s |
+| `enable_chunked_prefill=False` | **无差别** | 23.99 ms | 284.1 tok/s |
+| `attention_dp_size=2` | **不可用** | — | — |
+
+- **`decode_context_length_buckets` 反而更差**，推翻了本报告早期版本「显式配它可以在保留大
+  `max_model_len` 的同时拿到同样收益」的猜测。1920 = 15×128 满足文档约束（升序、
+  < `max_model_len`、能被 128 整除），但比 2048 慢 1.87 倍。推测是**非 2 的幂**的 context
+  长度让解码注意力 kernel 的分块效率变差。**建议：把 `max_model_len` 取成贴合负载的
+  2 的幂，不要用这个参数。**
+- **`enable_chunked_prefill=False` 完全没有影响**（23.99 vs 23.96）。原因是 prompt 1651
+  本来就 ≤ `max_num_batched_tokens=2048`，从来没触发过分块。README 标注该特性不支持，
+  但打开与否在这个负载上无差别。
+- **`attention_dp_size=2` 被配置校验拒绝**：
+  `Component DP requires disaggregated inference (--kv-transfer-config). Single-node
+  serving without DI is not supported with component DP.` 单节点部署用不了这个 knob。
 
 ---
 
@@ -273,7 +309,32 @@ encoder_cache_num_blocks = ceil(encoder_cache_size / 每视频embed数) * 每视
 
 目标：到达率 1 req/s，每请求 1 秒视频 + 最多 256 输出 token。
 
-**结论：能达到 —— 前提是 `max_model_len` 配对（§5）并且用 batch 8。**
+### 7.1 输出长度 × batch 的可选工作点（全部实测）
+
+| BS | 输出 token | TTFT p50 | TPOT p50 | **E2E p50** | tok/s | **req/s** | 达到 1 req/s |
+|---|---|---|---|---|---|---|---|
+| 1 | 256 | 316 | 11.23 | 3180 | 80.4 | 0.31 | ✗ |
+| 1 | 128 | 293 | 11.25 | 1722 | 74.0 | 0.58 | ✗ |
+| 1 | 64 | 304 | 11.23 | **1011** | 62.5 | 0.98 | 差一点 |
+| 8 | 256 | 817 | 23.96 | 6905 | 284.1 | **1.11** | ✓ 余量 11% |
+| 8 | 128 | 806 | 26.66 | 4197 | 228.8 | **1.79** | ✓ 余量 79% |
+| 8 | 64 | 804 | 32.11 | **2845** | 164.1 | **2.56** | ✓ 余量 156% |
+
+两个推荐工作点：
+
+- **吞吐优先**：BS=8 + 256 token → 1.11 req/s，单请求 6.9 s。满足需求但余量薄。
+- **均衡**（建议）：BS=8 + 128 token → **1.79 req/s，单请求 4.2 s**。余量 79%，
+  延时还降了 39%。
+- **延时优先**：BS=1 + 64 token → 单请求 **1.01 s**，但只有 0.98 req/s，**刚好差一点**
+  撑不住 1 req/s 的到达率。要低延时又要吞吐得用 BS=8 + 64 token（2.85 s / 2.56 req/s）。
+
+注意 BS=8 下 TPOT 随输出变短而上升（23.96 → 26.66 → 32.11），BS=1 下则完全不变
+（11.23 / 11.25 / 11.23）。原因是 BS=8 有 8 次串行 prefill（约 800 ms）与解码争抢，
+输出越短这部分固定开销摊到的 token 越少。
+
+### 7.2 结论
+
+**能达到 —— 前提是 `max_model_len` 配对（§5）并且用 batch 8。**
 
 - 需要的输出吞吐 = 1 req/s × 256 token = **256 tok/s**
 - 实测（`max_model_len=2048`, batch 8）= **284.1 tok/s / 1.11 req/s** → 有约 11% 余量
@@ -288,12 +349,14 @@ encoder_cache_num_blocks = ceil(encoder_cache_size / 每视频embed数) * 每视
 
 | 方案 | 效果 | 代价 |
 |---|---|---|
-| **砍输出长度** | 需求正比下降，例如 128 token 只需 128 tok/s，余量翻倍 | 输出变短 |
-| ~~加大 batch~~ | **已测，走不通** —— batch 16 反而掉到 110 tok/s / 0.43 req/s（§5.1） | — |
-| 显式配 `decode_context_length_buckets` | 可能在 2048 之外再挤一些 | 未测 |
+| **砍输出到 128 token** | **已测**：1.79 req/s，E2E 降到 4.2 s | 输出变短 |
+| ~~加大 batch~~ | **已测，走不通** —— batch 16 掉到 110 tok/s / 0.43 req/s（§5.1） | — |
+| ~~`decode_context_length_buckets`~~ | **已测，更差 1.87 倍**（§5.2） | — |
+| ~~`enable_chunked_prefill=False`~~ | **已测，无差别**（§5.2） | — |
+| ~~`attention_dp_size>1`~~ | **不可用**，需要 disaggregated inference（§5.2） | — |
 | 换 trn2.48xlarge（TP=16） | 4 倍核数 | 成本 |
 
-> 注：更短输出长度**没有实测**，是按实测 TPOT 线性外推。batch 16 已实测且更差。
+> 全部工作点见 §7.1，均为实测，无外推。
 
 ---
 
@@ -351,8 +414,7 @@ done
 
 ## 10. 未做的事
 
-- §5 剩余项：显式 `decode_context_length_buckets`、`enable_chunked_prefill=False`、`attention_dp_size>1`、纯文本对照
-- 更短输出长度（64 / 128 token）的实测验证
-- §5.1 batch 16 悬崖的根因（已排除 KV cache、编码器缓存缓冲）
+- §5.1 batch 16 悬崖的根因（已排除 KV cache、编码器缓存缓冲、多模态路径；纯文本同样复现）
+- `vision_attention_block_size` / vision TP-DP 切分的调优（TTFT 方向，未动过）
 - 自定义视频文件输入（脚本目前只支持 demo asset 和合成噪声，可加 `--video-path`）
 - 在线 serving（HTTP）路径的延时，需要先解决服务端重采样帧数的问题

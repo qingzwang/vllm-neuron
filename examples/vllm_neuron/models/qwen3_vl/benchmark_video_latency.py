@@ -509,6 +509,39 @@ def parse_args() -> argparse.Namespace:
         default=2048,
         help="Must be >= prompt length for a single-pass prefill",
     )
+    p.add_argument(
+        "--text-only",
+        action="store_true",
+        help="Replace the video with a text prompt of --text-tokens tokens. "
+        "Control for isolating decode-path behaviour from the multimodal path.",
+    )
+    p.add_argument(
+        "--text-tokens",
+        type=int,
+        default=1651,
+        help="Prompt length for --text-only; the default matches the 16-frame "
+        "video prompt so decode-side numbers are comparable",
+    )
+    p.add_argument(
+        "--decode-context-length-buckets",
+        default=None,
+        help="Comma-separated second decode bucketing dimension. Ascending, each "
+        "< max_model_len and divisible by 128. Lets decode use a NEFF sized to "
+        "the real context instead of the whole max_model_len window.",
+    )
+    p.add_argument(
+        "--disable-chunked-prefill",
+        action="store_true",
+        help="Pass enable_chunked_prefill=False. vLLM defaults it on, but the "
+        "README lists chunked prefill as unsupported on Neuron.",
+    )
+    p.add_argument(
+        "--attention-dp-size",
+        type=int,
+        default=None,
+        help="neuron_config.attention_dp_size — decode-only Q/O sharding across "
+        "DP ranks. Must divide the TP degree.",
+    )
     p.add_argument("--output-json", default=None, help="Write full results here")
     p.add_argument(
         "--dry-run",
@@ -516,6 +549,23 @@ def parse_args() -> argparse.Namespace:
         help="Print the resolved shapes and config, then exit",
     )
     return p.parse_args()
+
+
+def build_text_prompt(model: str, target_tokens: int) -> tuple[str, int]:
+    """Filler prompt of about ``target_tokens`` tokens, for the text-only control."""
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model)
+    unit = (
+        "The quick brown fox jumps over the lazy dog while the engineer measures "
+        "decode latency across batch sizes on a Trainium accelerator. "
+    )
+    text = unit
+    while len(tok.encode(text)) < target_tokens:
+        text += unit
+    ids = tok.encode(text)[:target_tokens]
+    text = tok.decode(ids)
+    return text, len(tok.encode(text))
 
 
 async def benchmark(args: argparse.Namespace) -> int:
@@ -528,15 +578,23 @@ async def benchmark(args: argparse.Namespace) -> int:
             f"num_frames must be even (temporal patch size 2), got {num_frames}"
         )
 
-    frames = build_frames(num_frames, args.resolution, args.video_source)
-    metadata = build_metadata(num_frames, args.fps, args.resolution)
-    prompt_text, grid_thw, num_prompt_tokens = probe_shapes(
-        args.model_checkpoint, frames, metadata, QUESTION
-    )
-
-    derived_bucket, num_blocks = vision_bucket_for(grid_thw, args.vision_block_size)
-    vision_bucket = args.vision_bucket or derived_bucket
-    raw_patches = grid_thw[0] * grid_thw[1] * grid_thw[2]
+    if args.text_only:
+        frames = metadata = grid_thw = None
+        vision_bucket = num_blocks = raw_patches = 0
+        prompt_text, num_prompt_tokens = build_text_prompt(
+            args.model_checkpoint, args.text_tokens
+        )
+    else:
+        frames = build_frames(num_frames, args.resolution, args.video_source)
+        metadata = build_metadata(num_frames, args.fps, args.resolution)
+        prompt_text, grid_thw, num_prompt_tokens = probe_shapes(
+            args.model_checkpoint, frames, metadata, QUESTION
+        )
+        derived_bucket, num_blocks = vision_bucket_for(
+            grid_thw, args.vision_block_size
+        )
+        vision_bucket = args.vision_bucket or derived_bucket
+        raw_patches = grid_thw[0] * grid_thw[1] * grid_thw[2]
 
     # Size max_model_len to the workload unless told otherwise. Decode computes
     # attention over the whole max_model_len window (decode_context_length_buckets
@@ -554,23 +612,32 @@ async def benchmark(args: argparse.Namespace) -> int:
         args.max_num_batched_tokens = args.max_model_len
 
     print("--- input ---")
-    print(f"frames            : {num_frames} @ {args.resolution}x{args.resolution}")
-    print(f"fps / duration    : {args.fps} / {num_frames / args.fps:.2f}s")
-    print(f"video_grid_thw    : {grid_thw}")
-    print(f"vision patches    : {raw_patches} raw -> {raw_patches // 4} embed tokens")
-    print(f"prompt tokens     : {num_prompt_tokens}")
-    print(
-        f"vision bucket     : {vision_bucket} "
-        f"({num_blocks} x {args.vision_block_size})"
-    )
+    if args.text_only:
+        print("mode              : TEXT-ONLY control (no vision)")
+        print(f"prompt tokens     : {num_prompt_tokens}")
+    else:
+        print(
+            f"frames            : {num_frames} @ {args.resolution}x{args.resolution}"
+        )
+        print(f"fps / duration    : {args.fps} / {num_frames / args.fps:.2f}s")
+        print(f"video_grid_thw    : {grid_thw}")
+        print(
+            f"vision patches    : {raw_patches} raw -> "
+            f"{raw_patches // 4} embed tokens"
+        )
+        print(f"prompt tokens     : {num_prompt_tokens}")
+        print(
+            f"vision bucket     : {vision_bucket} "
+            f"({num_blocks} x {args.vision_block_size})"
+        )
+        video_mode = (
+            "reused (encoder cache hits, vision encode excluded)"
+            if args.reuse_video
+            else "unique (encoder cache miss every request)"
+        )
+        print(f"per-request video : {video_mode}")
     print(f"batch sizes       : {batch_sizes}")
     print(f"max output tokens : {args.max_tokens} (ignore_eos={args.ignore_eos})")
-    video_mode = (
-        "reused (encoder cache hits, vision encode excluded)"
-        if args.reuse_video
-        else "unique (encoder cache miss every request)"
-    )
-    print(f"per-request video : {video_mode}")
 
     if num_prompt_tokens > args.max_num_batched_tokens:
         print(
@@ -600,38 +667,45 @@ async def benchmark(args: argparse.Namespace) -> int:
             f"Shrink --max-model-len or set decode_context_length_buckets."
         )
 
-    additional_config = {
-        "neuron_config": {
-            "quantization": "bf16",
-            "num_batched_tokens_buckets": [args.max_num_batched_tokens],
-            "num_seqs_buckets": sorted(set(batch_sizes)),
-            "on_device_sampling_config": {"all_greedy": True},
-        },
-        "vision_neuron_config": {
+    neuron_config: dict[str, Any] = {
+        "quantization": "bf16",
+        "num_batched_tokens_buckets": [args.max_num_batched_tokens],
+        "num_seqs_buckets": sorted(set(batch_sizes)),
+        "on_device_sampling_config": {"all_greedy": True},
+    }
+    if args.decode_context_length_buckets:
+        neuron_config["decode_context_length_buckets"] = [
+            int(v) for v in args.decode_context_length_buckets.split(",") if v.strip()
+        ]
+    if args.attention_dp_size is not None:
+        neuron_config["attention_dp_size"] = args.attention_dp_size
+
+    additional_config: dict[str, Any] = {"neuron_config": neuron_config}
+    if not args.text_only:
+        additional_config["vision_neuron_config"] = {
             "num_vision_tokens_buckets": [vision_bucket],
             "vision_attention_block_size": args.vision_block_size,
-        },
-    }
-    if args.encoder_cache_num_blocks is not None:
-        additional_config["vision_neuron_config"]["encoder_cache_num_blocks"] = (
-            args.encoder_cache_num_blocks
-        )
+        }
+        if args.encoder_cache_num_blocks is not None:
+            additional_config["vision_neuron_config"]["encoder_cache_num_blocks"] = (
+                args.encoder_cache_num_blocks
+            )
 
-    # The on-device encoder cache allocates whole blocks per item while the
-    # scheduler admits items against a token budget, so the allocator needs
-    # headroom proportional to the padding waste or it runs dry mid-stream.
-    embed_per_video = raw_patches // 4
-    cache_block_size = args.vision_block_size // 4
-    blocks_per_video = math.ceil(embed_per_video / cache_block_size)
-    print(
-        f"cache headroom    : video = {embed_per_video} embeds -> "
-        f"{blocks_per_video} x {cache_block_size} = "
-        f"{blocks_per_video * cache_block_size} slots "
-        f"({blocks_per_video * cache_block_size / embed_per_video:.2f}x padding). "
-        f"Needs blocks_per_video * (scheduler encoder_cache_size / "
-        f"{embed_per_video}) + 1; encoder_cache_num_blocks="
-        f"{args.encoder_cache_num_blocks or 'auto'}"
-    )
+        # The on-device encoder cache allocates whole blocks per item while the
+        # scheduler admits items against a token budget, so the allocator needs
+        # headroom proportional to the padding waste or it runs dry mid-stream.
+        embed_per_video = raw_patches // 4
+        cache_block_size = args.vision_block_size // 4
+        blocks_per_video = math.ceil(embed_per_video / cache_block_size)
+        print(
+            f"cache headroom    : video = {embed_per_video} embeds -> "
+            f"{blocks_per_video} x {cache_block_size} = "
+            f"{blocks_per_video * cache_block_size} slots "
+            f"({blocks_per_video * cache_block_size / embed_per_video:.2f}x "
+            f"padding). Needs blocks_per_video * (scheduler encoder_cache_size / "
+            f"{embed_per_video}) + 1; encoder_cache_num_blocks="
+            f"{args.encoder_cache_num_blocks or 'auto'}"
+        )
     print("--- config ---")
     print(json.dumps(additional_config, indent=2))
 
@@ -643,7 +717,7 @@ async def benchmark(args: argparse.Namespace) -> int:
     from vllm.sampling_params import RequestOutputKind, SamplingParams
     from vllm.v1.engine.async_llm import AsyncLLM
 
-    engine_args = AsyncEngineArgs(
+    engine_kwargs: dict[str, Any] = dict(
         model=args.model_checkpoint,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
@@ -652,10 +726,14 @@ async def benchmark(args: argparse.Namespace) -> int:
         # Prefix caching hard-requires segmented prefill on Neuron and would
         # also make repeated identical prompts hit cache, hiding real prefill cost.
         enable_prefix_caching=False,
-        limit_mm_per_prompt={"video": 1},
         additional_config=additional_config,
         disable_log_stats=True,
     )
+    if not args.text_only:
+        engine_kwargs["limit_mm_per_prompt"] = {"video": 1}
+    if args.disable_chunked_prefill:
+        engine_kwargs["enable_chunked_prefill"] = False
+    engine_args = AsyncEngineArgs(**engine_kwargs)
 
     load_start = time.perf_counter()
     engine = AsyncLLM.from_engine_args(engine_args)
@@ -667,7 +745,12 @@ async def benchmark(args: argparse.Namespace) -> int:
         ignore_eos=args.ignore_eos,
         output_kind=RequestOutputKind.DELTA,
     )
-    make_prompt = PromptFactory(prompt_text, frames, metadata, args.reuse_video)
+    if args.text_only:
+
+        def make_prompt() -> dict[str, Any]:
+            return {"prompt": prompt_text}
+    else:
+        make_prompt = PromptFactory(prompt_text, frames, metadata, args.reuse_video)
 
     all_results: list[RequestResult] = []
     summaries: list[dict[str, Any]] = []

@@ -18,49 +18,48 @@ Branch `model/InternVL3-8B`, cut from `release-0.21.0.1.0.0`. No overlap with
 Validator: `examples/vllm_neuron/models/internvl/validate_vision_encoder.py`
 (CPU, float32, real checkpoint). Run with `VLLM_NEURON_CPU_MODE=1`; takes seconds.
 
-## Remaining: the request path stalls after a successful engine init
+## Remaining: EngineCore never signals ready
 
-**Where it stands.** `examples/vllm_neuron/models/internvl/smoke_test.py` gets the
-engine fully up — weights load, all graphs compile, `init engine ... took 80.01 s`
-— and then the single request never completes. No output, no error, no further log
-line for 10+ minutes.
+**Corrected diagnosis.** An earlier note in this file said the *request* hangs.
+A `faulthandler` stack dump of the parent process shows otherwise: it is still
+inside `LLM.__init__`, blocked in `zmq.poll` under
+`vllm/v1/engine/utils.py::wait_for_engine_startup`. No request has been submitted
+at all.
 
-**What the process state says.** Not a compile (no `neuronx-cc` processes, no
-`Compiled HLO` lines) and not a spin:
+    smoke_test.py:50 in main            <- still constructing LLM(...)
+    vllm/entrypoints/llm.py:381
+    vllm/v1/engine/llm_engine.py:170 / 104
+    vllm/v1/engine/core_client.py:723 / 535
+    vllm/v1/engine/utils.py:1128 launch_core_engines
+    vllm/v1/engine/utils.py:1169 wait_for_engine_startup
+    zmq/sugar/poll.py                   <- waiting for the ready handshake
 
-    main process    2.7% CPU
-    EngineCore      0.3% CPU   <- blocked, not spinning
-    4x Worker_TP    ~11% each  <- steady poll, waiting for work
+Meanwhile EngineCore **is alive** (0.3% CPU) and has already logged
+`init engine (profile, create kv cache, warmup model) took 46.92 s`, followed by
+the `NeuronAsyncScheduler` warning — and then nothing. So weights, compilation and
+warmup all succeeded; what never happens is the ready message back to the parent.
 
-Everyone is waiting. The last log line is the scheduler-class warning, i.e.
-EngineCore blocks before anything about this request is logged.
+The four workers poll at ~11% waiting for work, which is consistent: they are
+fine, nobody has asked them to do anything.
 
-**Ruled out.** `num_vision_tokens_buckets` was the first suspect, since
-`max_vision_blocks_per_request = ceil(bucket / merge_factor / cache_block_size)`
-gates schedulability and an unschedulable request produces exactly this silence.
-Raising the bucket from 1024 to 13312 (13 tiles) lifted
-`max_vision_blocks_per_request` from 1 to 13 with 64 cache blocks — the stall is
-unchanged, so this is not it.
+**Next step.** Instrument EngineCore between scheduler construction and the ready
+handshake, since that is the only remaining window:
 
-**How to attack it next.** The model's own trace points printed nothing, which
-means neither `forward` nor `embed_multimodal` is ever reached — so the problem
-is upstream of the model, in the frontend's multimodal input processing or in the
-scheduler admitting the request. Instrument in that order:
+1. `faulthandler.dump_traceback_later` inside the EngineCore process (the parent's
+   dump does not cover it) to see what it is blocked on after the scheduler
+   warning.
+2. Suspect anything the ready payload needs from the model — `get_kv_spec()` and
+   the KV-cache config exchange are the obvious candidates, and both are
+   model-supplied code paths that are still unexecuted elsewhere.
+3. Compare against a Qwen3-VL run: in that log the scheduler warning is
+   immediately followed by request activity, so a side-by-side of the two
+   EngineCore processes at that point should isolate the difference quickly.
 
-1. Print around `llm.generate` in the frontend to see whether vLLM's InternVL
-   processor returns at all (it runs `trust_remote_code`; the checkpoint's own
-   modeling file imports `timm`, which is absent from the DLAMI venv — worth
-   checking whether that path is reached and how it fails).
-2. If the processor returns, log in `NeuronScheduler.schedule()` to see whether
-   the request is being repeatedly skipped and why.
-3. Only then look at `_gather_mm_embeddings` / `embed_multimodal`.
+**This is a much tighter target than "the request hangs"** — the failure is in
+engine bring-up, after warmup, before the first request.
 
-A stack sampler would answer this in seconds; `py-spy` is not installed in the
-venv and installing into it is off-limits, so `faulthandler.dump_traceback_later`
-in the worker and EngineCore entry points is the cheap substitute.
-
-**Everything below still holds** and the eight fixes above are real — they were
-each found by this same run failing earlier and louder.
+**Everything else in this file still holds**, and the eight fixes above are real:
+each was found by this same run failing earlier and louder.
 
 ### Original plan for this step
 

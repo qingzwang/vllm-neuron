@@ -18,11 +18,55 @@ Branch `model/InternVL3-8B`, cut from `release-0.21.0.1.0.0`. No overlap with
 Validator: `examples/vllm_neuron/models/internvl/validate_vision_encoder.py`
 (CPU, float32, real checkpoint). Run with `VLLM_NEURON_CPU_MODE=1`; takes seconds.
 
-## Remaining
+## Remaining: the request path stalls after a successful engine init
 
-**On-device TP=4 smoke test** is the only step left, and it is what validates
-everything not yet executed: `text_model.py`, `model.py`, the encoder-cache write
-path, and the vision encoder's TP sharding.
+**Where it stands.** `examples/vllm_neuron/models/internvl/smoke_test.py` gets the
+engine fully up — weights load, all graphs compile, `init engine ... took 80.01 s`
+— and then the single request never completes. No output, no error, no further log
+line for 10+ minutes.
+
+**What the process state says.** Not a compile (no `neuronx-cc` processes, no
+`Compiled HLO` lines) and not a spin:
+
+    main process    2.7% CPU
+    EngineCore      0.3% CPU   <- blocked, not spinning
+    4x Worker_TP    ~11% each  <- steady poll, waiting for work
+
+Everyone is waiting. The last log line is the scheduler-class warning, i.e.
+EngineCore blocks before anything about this request is logged.
+
+**Ruled out.** `num_vision_tokens_buckets` was the first suspect, since
+`max_vision_blocks_per_request = ceil(bucket / merge_factor / cache_block_size)`
+gates schedulability and an unschedulable request produces exactly this silence.
+Raising the bucket from 1024 to 13312 (13 tiles) lifted
+`max_vision_blocks_per_request` from 1 to 13 with 64 cache blocks — the stall is
+unchanged, so this is not it.
+
+**How to attack it next.** The model's own trace points printed nothing, which
+means neither `forward` nor `embed_multimodal` is ever reached — so the problem
+is upstream of the model, in the frontend's multimodal input processing or in the
+scheduler admitting the request. Instrument in that order:
+
+1. Print around `llm.generate` in the frontend to see whether vLLM's InternVL
+   processor returns at all (it runs `trust_remote_code`; the checkpoint's own
+   modeling file imports `timm`, which is absent from the DLAMI venv — worth
+   checking whether that path is reached and how it fails).
+2. If the processor returns, log in `NeuronScheduler.schedule()` to see whether
+   the request is being repeatedly skipped and why.
+3. Only then look at `_gather_mm_embeddings` / `embed_multimodal`.
+
+A stack sampler would answer this in seconds; `py-spy` is not installed in the
+venv and installing into it is off-limits, so `faulthandler.dump_traceback_later`
+in the worker and EngineCore entry points is the cheap substitute.
+
+**Everything below still holds** and the eight fixes above are real — they were
+each found by this same run failing earlier and louder.
+
+### Original plan for this step
+
+**On-device TP=4 smoke test** validates everything not yet executed:
+`text_model.py`, `model.py`, the encoder-cache write path, and the vision
+encoder's TP sharding.
 
     llm = LLM(model="/mnt/nvme/models/InternVL3-8B-Instruct",
               tensor_parallel_size=4, max_model_len=4096,

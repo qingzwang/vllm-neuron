@@ -18,60 +18,74 @@ Branch `model/InternVL3-8B`, cut from `release-0.21.0.1.0.0`. No overlap with
 Validator: `examples/vllm_neuron/models/internvl/validate_vision_encoder.py`
 (CPU, float32, real checkpoint). Run with `VLLM_NEURON_CPU_MODE=1`; takes seconds.
 
-## Remaining: the vision side does not use the plugin's designed pipeline
+## Vision integration: done, matches the reference design
 
-This is the finding from diffing against `qwen3_vl`, and it supersedes the
-signal-chasing in the git history. The public surface differs by exactly two
-methods:
+Restructured after `Qwen3VLVisionModel` and it now compiles and warms up on
+device:
 
-    qwen3_vl has, InternVL lacks:  build_vision_synthetic_inputs, get_mrope_input_positions
-    bases:  qwen3_vl = (Module, SupportsVisionWarmup, SupportsMRoPE)
-            InternVL = (Module,)
+    Vision warmup [1/1]: bucket=13312
+    Successfully warmed up vision bucket 13312
+    init engine (profile, create kv cache, warmup model) took 192.38 s
 
-`get_mrope_input_positions` is genuinely not needed (no M-RoPE). The other one is
-the problem, and it is not just a missing method — it marks a different design:
+What changed:
 
-| | qwen3_vl (works) | this implementation |
-|---|---|---|
-| `visual.forward` args | `pixel_values, pos_emb_*, cos, sin, bound_*` **plus `encoder_cache_buffer`** | `pixel_values` only |
-| where embeddings land in the cache | **scatter-written inside the compiled graph** | Python index assignment outside the graph |
-| projector / merger | **inside `visual`**, compiled with it | separate module, runs eagerly |
-| `build_vision_synthetic_inputs` | present, so the runner pre-compiles the vision graph per bucket | absent, so the vision graph never takes part in warmup |
+1. `InternVLProjector` moved **inside** `InternVisionModel`, so one compiled
+   module spans pixels -> `[tiles, 256, llm_hidden]`. `tower()` and
+   `encode_tiles()` are kept as staged helpers purely so the CPU validator can
+   still compare each stage against HF — it still reports 8.0e-6 / 2.5e-6.
+2. `forward(pixel_values, encoder_cache_buffer, write_block_ids)` scatter-writes
+   with `index_put_` **inside** the graph.
+3. `build_vision_synthetic_inputs` added and `SupportsVisionWarmup` declared, so
+   the runner pre-compiles per bucket instead of the graph appearing on the first
+   request.
+4. `embed_multimodal` reduced to: allocate blocks, pad the batch to the bucket,
+   route padding blocks to `scratch_block_id`, call `visual` once.
 
-`encoder_cache_buffer` is injected by the runner in
-`neuron_worker.py::_build_vision_trace_jobs`, which is what tells you
-`visual.forward` is meant to accept it and do the write itself.
+Two traps worth keeping in mind here:
 
-Consequences of the current shape:
+- **The runner overwrites `write_block_ids`.** It builds its own as
+  `zeros(ceil(bucket / vision_attention_block_size))` padded up to `dp_size`, so
+  `build_vision_synthetic_inputs` only has to agree on the *length*. Getting that
+  length wrong (13 vs the runner's dp-padded 16) surfaces as an XLA lowering
+  failure on `index_put_` — "Input dimension should be either 1 or equal to the
+  output dimension it is broadcasting into" — because the value tensor then has
+  fewer rows than the index.
+- **The compiled vision graph has a static tile count**, so a real request has to
+  pad `pixel_values` up to the bucket and send the padding writes to the scratch
+  block. That is what the scratch block is for.
 
-- All three `build_vision_synthetic_inputs` call sites are guarded by
-  `if unwrapped is None: return`, so vision warmup is skipped silently — the
-  vision graph is never compiled at startup even though
-  `self.vision_capture_backend = torch.compile(inner_model.visual, ...)` was built.
-- The projector and the buffer write run eagerly. On Neuron, eager ops compile
-  per-op, which is why the first request appeared to hang rather than merely be
-  slow.
+Sizing for InternVL is unusually tidy: one 448x448 tile is 1024 raw patches, i.e.
+one VE block at the default `vision_attention_block_size`, and produces exactly
+256 merged tokens, i.e. exactly one cache block. Tiles, VE blocks and cache blocks
+are all the same count.
 
-### The fix
+## Remaining: EngineCore still never signals ready
 
-Restructure the vision side to match the reference, rather than patching around it:
+**This is independent of the vision work above and survives it.** With vision
+warmup succeeding and engine init logging completion at 192.38 s, EngineCore still
+goes quiet right after the `NeuronAsyncScheduler` warning and never sends the ready
+message. The parent stays blocked in `zmq.poll` under `wait_for_engine_startup`,
+the four workers poll at ~8% with nothing to do, and EngineCore itself sits at
+0.2% CPU — alive, blocked, not spinning.
 
-1. Fold `InternVLProjector` into `InternVisionModel.forward` so one compiled
-   module goes pixels -> `[tiles, 256, llm_hidden]`.
-2. Give that forward the cache arguments (`encoder_cache_buffer` plus the block
-   ids / write offsets) and do the scatter-write with `index_put_` **inside** the
-   graph, as `qwen3_vl/model_bf16.py::embed_multimodal` does.
-3. Implement `build_vision_synthetic_inputs(bucket, vision_neuron_config, device)`
-   returning zero tensors matching that signature, and declare
-   `SupportsVisionWarmup` on the model class so the runner pre-compiles per bucket.
-   For InternVL the shapes are simple: `bucket / 1024` tiles of
-   `[3, 448, 448]`, since every tile is fixed size.
-4. Reduce `embed_multimodal` to allocating blocks and calling `visual` once with
-   the buffer — no per-block Python loop.
+So the ordering is now clear: weights load, all graphs (text **and** vision)
+compile, warmup completes, and then the bring-up handshake does not finish. No
+request is ever submitted.
 
-The CPU-mode validator keeps working through all of this: point it at the folded
-`visual` and it still compares against HF `extract_feature`, which is the cheap
-regression check while restructuring.
+**Next step, and the only one that will answer it:** get a stack out of the
+EngineCore *process*. The parent's `faulthandler` dump does not cover it, and
+`kill -ABRT` on it produced the parent's stack rather than EngineCore's. Options:
+
+- `faulthandler.dump_traceback_later` installed from inside code that runs in
+  EngineCore — `vllm_neuron/vllm/platform.py` class methods do, and are a cheap
+  injection point for a temporary probe.
+- Or set `VLLM_ENABLE_V1_MULTIPROCESSING=0` if this vLLM honours it, which
+  collapses EngineCore into the parent and makes one stack dump cover everything.
+  That is the fastest experiment left to try.
+
+Compare against a Qwen3-VL run at the same point: there the scheduler warning is
+followed immediately by request activity, so whatever EngineCore does between
+scheduler construction and the ready message is the whole search space.
 
 ## Earlier (superseded) diagnosis: EngineCore never signals ready
 

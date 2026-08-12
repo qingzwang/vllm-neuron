@@ -34,7 +34,7 @@ import torch.nn as nn
 from vllm_neuron.parallel.neuron_parallel_state import get_neuron_vision_tp_group
 from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
 
-from .config import InternVLVisionConfig
+from .config import InternVLConfig, InternVLVisionConfig
 from .weight_loaders import (
     patch_embed_weight_loader,
     vis_qkv_bias_loader,
@@ -291,37 +291,96 @@ class InternVisionEncoderLayer(nn.Module):
 
 
 class InternVisionModel(nn.Module):
-    """Full InternViT tower.
+    """InternViT tower **plus** the projector, with the encoder-cache write.
 
-    forward: ``[num_tiles, 3, 448, 448]`` -> ``[num_tiles, 1024, 1024]``
-    (CLS token dropped, matching HF ``extract_feature``'s ``vit_embeds[:, 1:, :]``).
+    Structured after ``Qwen3VLVisionModel``: the whole pixels-to-LLM-space path
+    lives in one module so ``torch.compile`` covers it, and ``forward`` ends by
+    scatter-writing into the on-device encoder cache from **inside** the graph.
+    Keeping the projector outside and writing the buffer with Python indexing
+    leaves those ops eager, and eager ops on Neuron compile one at a time.
+
+    Two staged helpers are kept so the CPU validator can compare each stage
+    against HF: ``tower()`` matches ``InternVisionModel`` output after the CLS
+    drop, ``encode_tiles()`` matches ``extract_feature``.
     """
 
     def __init__(
-        self, config: InternVLVisionConfig, dtype: torch.dtype = torch.bfloat16
+        self, config: InternVLConfig, dtype: torch.dtype = torch.bfloat16
     ) -> None:
         super().__init__()
-        self.config = config
+        from .projector import InternVLProjector
+
+        self.full_config = config
+        self.config = config.vision_config
         self.dtype = dtype
-        self.embeddings = InternVisionPatchEmbed(config, dtype)
+        self.embeddings = InternVisionPatchEmbed(self.config, dtype)
         self.layers = nn.ModuleList(
             [
-                InternVisionEncoderLayer(config, dtype)
-                for _ in range(config.num_hidden_layers)
+                InternVisionEncoderLayer(self.config, dtype)
+                for _ in range(self.config.num_hidden_layers)
             ]
         )
+        self.projector = InternVLProjector(config, dtype=dtype)
 
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def tower(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """``[tiles, 3, H, W]`` -> ``[tiles, num_patches, vit_hidden]``, CLS dropped."""
         hidden_states = self.embeddings(pixel_values)
         for layer in self.layers:
             hidden_states = layer(hidden_states)
         # Drop the CLS token; only patch tokens feed the projector.
         return hidden_states[:, 1:, :]
 
+    def encode_tiles(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """``[tiles, 3, H, W]`` -> ``[tiles, embed_per_tile, llm_hidden]``."""
+        return self.projector(self.tower(pixel_values))
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        encoder_cache_buffer: torch.Tensor,
+        write_block_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode tiles and scatter them into the encoder cache in-graph.
+
+        Args:
+            pixel_values: ``[num_tiles, 3, image_size, image_size]``. Static shape,
+                set by the vision bucket: ``num_tiles = bucket / patches_per_tile``.
+            encoder_cache_buffer: ``[num_cache_blocks, cache_block_size, fat_dim]``,
+                written in place (input-output alias).
+            write_block_ids: ``[num_write_blocks]`` int64, cache block index for
+                each block of this call's output.
+
+        Returns:
+            The cache buffer, aliased.
+        """
+        embeds = self.encode_tiles(pixel_values)
+        tiles, per_tile, fat_dim = embeds.shape
+        cache_block_size = encoder_cache_buffer.shape[1]
+
+        # Regroup [tiles, per_tile, fat] into cache-block layout. With the default
+        # vision_attention_block_size (== patches_per_tile) these coincide: one
+        # tile is exactly one cache block.
+        total = tiles * per_tile
+        if total % cache_block_size != 0:
+            raise ValueError(
+                f"{tiles} tiles x {per_tile} tokens = {total} does not divide the "
+                f"cache block size {cache_block_size}"
+            )
+        # index_put_ needs a freshly laid-out value tensor: feeding it a view with
+        # the strides left over from pixel_shuffle's permutes makes the XLA lowering
+        # fail with "Input dimension should be either 1 or equal to the output
+        # dimension it is broadcasting into". qwen3_vl gets this for free because
+        # its fat tensor comes out of torch.cat.
+        blocks = embeds.to(encoder_cache_buffer.dtype).reshape(
+            total // cache_block_size, cache_block_size, fat_dim
+        ).contiguous()
+        encoder_cache_buffer.index_put_((write_block_ids,), blocks)
+        return encoder_cache_buffer
+
     def build_weight_mappings(
-        self, prefix: str = "vision_model"
+        self, prefix: str = "vision_model", projector_prefix: str = "mlp1"
     ) -> dict[str, str | list[str]]:
-        """Parameter name -> checkpoint key(s).
+        """Parameter name -> checkpoint key(s), tower and projector together.
 
         The fused qkv weight/bias take a single checkpoint tensor each and are
         re-sharded by the loaders in weight_loaders.py.
@@ -352,6 +411,8 @@ class InternVisionModel(nn.Module):
                     f"layers.{i}.mlp.fc2_bias": f"{p}.mlp.fc2.bias",
                 }
             )
+        for name, key in self.projector.build_weight_mappings(projector_prefix).items():
+            m[f"projector.{name}"] = key
         return m
 
     def load_weights(

@@ -29,6 +29,7 @@ from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.nn as neuron_nn
+from vllm_neuron.model.interfaces import SupportsVisionWarmup
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
 from vllm_neuron.model.qwen3_vl.utils.merge_vision_embeds import merge_vision_embeddings
@@ -41,7 +42,6 @@ from vllm_neuron.utils.weight_loader import (
 )
 
 from .config import InternVLConfig, InternVLTextConfig
-from .projector import InternVLProjector
 from .text_model import Qwen2DecoderLayer, Qwen2RMSNorm, Qwen2RotaryEmbedding
 from .vision_encoder import InternVisionModel
 
@@ -141,7 +141,7 @@ class InternVLTextModel(nn.Module):
         return hidden_states
 
 
-class InternVLChatModel(nn.Module):
+class InternVLChatModel(nn.Module, SupportsVisionWarmup):
     """InternVL3: vision tower + projector + Qwen2 decoder + LM head."""
 
     def __init__(self, config: InternVLConfig):
@@ -150,8 +150,9 @@ class InternVLChatModel(nn.Module):
         self.text_config = config.text_config
 
         dtype = config.text_config.torch_dtype
-        self.visual = InternVisionModel(config.vision_config, dtype=dtype)
-        self.projector = InternVLProjector(config, dtype=dtype)
+        # The projector lives inside the tower so one compiled module spans
+        # pixels -> LLM space, matching Qwen3VLVisionModel.
+        self.visual = InternVisionModel(config, dtype=dtype)
         self.language_model = InternVLTextModel(config.text_config)
 
         self.tp_group = get_tp_group()
@@ -307,43 +308,116 @@ class InternVLChatModel(nn.Module):
                 "embed_multimodal requires image_num_patches and mm_hashes"
             )
 
-        dtype = self.text_config.torch_dtype
-        vit_embeds = self.visual(pixel_values_flat.to(dtype))
-        embeds = self.projector(vit_embeds)  # [total_tiles, 256, llm_hidden]
-
         per_tile = self.config.embed_tokens_per_tile
-        llm_hidden = self.text_config.hidden_size
         block_size = encoder_cache.block_size
-
-        tiles = [int(n) for n in image_num_patches.tolist()]
-        if sum(tiles) != embeds.shape[0]:
+        if per_tile % block_size and block_size % per_tile:
             raise ValueError(
-                f"image_num_patches sums to {sum(tiles)} tiles but the encoder "
-                f"produced {embeds.shape[0]}"
+                f"embed tokens per tile ({per_tile}) and cache block size "
+                f"({block_size}) must be multiples of one another"
             )
 
-        tile_cursor = 0
-        for mm_hash, n_tiles in zip(mm_hashes, tiles):
-            item = embeds[tile_cursor : tile_cursor + n_tiles]
-            tile_cursor += n_tiles
-            # [n_tiles, 256, hidden] -> [n_tiles * 256, hidden]
-            item = item.reshape(n_tiles * per_tile, llm_hidden)
+        tiles = [int(n) for n in image_num_patches.tolist()]
+        if sum(tiles) != pixel_values_flat.shape[0]:
+            raise ValueError(
+                f"image_num_patches sums to {sum(tiles)} tiles but got "
+                f"{pixel_values_flat.shape[0]} tile images"
+            )
 
-            num_tokens = item.shape[0]
+        # Allocate every item's blocks first, then hand the whole flat batch to the
+        # compiled tower in one call: it scatter-writes into the buffer in-graph.
+        write_block_ids: list[int] = []
+        for mm_hash, n_tiles in zip(mm_hashes, tiles):
+            num_tokens = n_tiles * per_tile
             num_blocks = math.ceil(num_tokens / block_size)
-            # allocate() wants the token count carried by each block, so the
-            # final block reports the remainder rather than a full block_size.
             tokens_per_block = [
                 min(block_size, num_tokens - b * block_size) for b in range(num_blocks)
             ]
-            block_ids = encoder_cache.allocate(mm_hash, tokens_per_block)
+            write_block_ids.extend(encoder_cache.allocate(mm_hash, tokens_per_block))
 
-            for b, (block_id, n_rows) in enumerate(zip(block_ids, tokens_per_block)):
-                start = b * block_size
-                rows = item[start : start + n_rows]
-                encoder_cache.buffer[block_id, :n_rows] = rows.to(
-                    encoder_cache.buffer.dtype
-                )
+        # The compiled graph has a static tile count, so pad the batch up to the
+        # selected bucket and send the padding blocks to the scratch block, which
+        # exists precisely to absorb writes that are not real cache entries.
+        real_tiles = pixel_values_flat.shape[0]
+        bucket = self._select_vision_bucket(real_tiles)
+        padded_tiles = self._padded_tile_count(
+            bucket, self.config.vision_neuron_config
+        )
+        px = pixel_values_flat.to(self.text_config.torch_dtype)
+        if padded_tiles > real_tiles:
+            pad = px.new_zeros((padded_tiles - real_tiles, *px.shape[1:]))
+            px = torch.cat([px, pad], dim=0)
+
+        scratch = encoder_cache.scratch_block_id
+        while len(write_block_ids) < padded_tiles * per_tile // block_size:
+            write_block_ids.append(scratch)
+
+        ids = torch.tensor(
+            write_block_ids, dtype=torch.int64, device=encoder_cache.buffer.device
+        )
+        self.visual(px, encoder_cache.buffer, ids)
+
+    def build_vision_synthetic_inputs(
+        self,
+        bucket: int,
+        vision_neuron_config: VisionNeuronConfig,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        """Shape-only inputs matching ``visual.forward``, for per-bucket warmup.
+
+        Declaring SupportsVisionWarmup is what makes the runner pre-compile the
+        vision graph; without it the graph is only built on the first real request,
+        where it looks like a hang.
+
+        Buckets count raw (pre-merge) patches, so a bucket is just a tile count:
+        ``bucket / patches_per_tile`` tiles of ``[3, image_size, image_size]``.
+        """
+        vc = self.config.vision_config
+        patches_per_tile = vc.num_patches_per_tile
+        num_tiles = self._padded_tile_count(bucket, vision_neuron_config)
+        return {
+            "pixel_values": torch.zeros(
+                num_tiles,
+                vc.num_channels,
+                vc.image_size,
+                vc.image_size,
+                dtype=self.text_config.torch_dtype,
+                device=device,
+            ),
+            # The runner overwrites write_block_ids with
+            #   zeros(ceil(bucket / vision_attention_block_size) padded to dp_size)
+            # so this only has to agree on the length.
+            "write_block_ids": torch.zeros(num_tiles, dtype=torch.int64, device=device),
+        }
+
+    def _padded_tile_count(
+        self, bucket: int, vision_neuron_config: VisionNeuronConfig
+    ) -> int:
+        """Tiles the compiled vision graph consumes for a bucket.
+
+        Must match the block count the runner derives, because it builds
+        write_block_ids itself as
+        ``ceil(bucket / vision_attention_block_size)`` padded up to ``dp_size``.
+        One InternVL tile is one VE block, so tiles and blocks are the same number.
+        A mismatch shows up as an XLA lowering failure on index_put_ ("Input
+        dimension should be either 1 or equal to the output dimension"), because the
+        value tensor then has fewer rows than the index.
+        """
+        block = vision_neuron_config.vision_attention_block_size
+        dp = max(1, vision_neuron_config.dp_size)
+        return math.ceil(math.ceil(bucket / block) / dp) * dp
+
+    def _select_vision_bucket(self, num_tiles: int) -> int:
+        """Smallest configured bucket that holds ``num_tiles`` tiles."""
+        vnc = self.config.vision_neuron_config
+        patches = num_tiles * self.config.vision_config.num_patches_per_tile
+        buckets = sorted(vnc.num_vision_tokens_buckets or [])
+        for b in buckets:
+            if b >= patches:
+                return b
+        raise ValueError(
+            f"{num_tiles} tiles need {patches} raw vision patches, above the "
+            f"largest configured bucket ({buckets[-1] if buckets else None})"
+        )
 
     # ── Config / KV cache / weights ──────────────────────────────────────
 
@@ -408,9 +482,6 @@ class InternVLChatModel(nn.Module):
         if not self.text_config.tie_word_embeddings:
             mappings["lm_head.weight"] = "language_model.lm_head.weight"
 
-        # The projector is replicated, so the text rank is harmless for it.
-        for name, key in self.projector.build_weight_mappings().items():
-            mappings[f"projector.{name}"] = key
 
         checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
         rank_sharded = checkpoint.load_sharded_pipelined(

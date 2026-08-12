@@ -9,9 +9,12 @@ bucket-aware admission control.
 
 import inspect
 import logging
+import os
 from collections import deque
 from enum import Enum, auto
 from typing import TYPE_CHECKING
+
+import torch
 
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -75,6 +78,66 @@ class SchedulerState(Enum):
         return self.name
 
 
+def _pin_engine_core_cpu_threads() -> None:
+    """Keep EngineCore on 1 CPU thread so multimodal profiling cannot deadlock.
+
+    EngineCore is created with ``fork()``, and torch's intra-op thread pool does
+    not survive a fork: the child's pool still reports the parent's thread count
+    but has no live worker threads, so the first CPU op big enough to reach
+    ``at::parallel_for`` blocks forever on a barrier. Minimal repro, no vLLM:
+
+        work()                 # any CPU op over ~32k elements, in the parent
+        if os.fork() == 0:
+            work()             # hangs forever in the child
+
+    Only ``set_num_threads(1)`` escapes it -- setting the count back to N
+    re-deadlocks, so the pool genuinely cannot be rebuilt post-fork.
+
+    vLLM already guards the one call that trips this: ``MultiModalBudget``, which
+    the base ``Scheduler`` constructor builds by running the HF processor over a
+    worst-case dummy image, is wrapped in ``set_default_torch_num_threads()``
+    ("Avoid hang during startup"). But that helper resolves its thread count from
+    **OMP_NUM_THREADS**, and ``NeuronPlatform.check_and_update_config`` raises that
+    variable to min(8, cpu_count) for multimodal models so frontend patchify
+    parallelizes. EngineCore inherits the raised value across the fork, upstream's
+    guard becomes a no-op, and startup hangs with no log output.
+
+    So the fix has to be the environment variable, not ``set_num_threads``: the
+    guard would overwrite a bare thread-count change right back to 8.
+
+    Whether a model trips it is down to its image processor. Qwen3-VL's is
+    numpy-only and slips through; InternVL's goes through torchvision, whose
+    ``to_tensor`` does a ``permute().contiguous()`` over 448*448*3 elements --
+    just past the ``parallel_for`` grain size. The bug is one processor away for
+    any multimodal model, which is why this lives in the shared scheduler.
+
+    Safe because EngineCore does no heavy CPU tensor work: multimodal processing
+    for real requests runs in the frontend, and the model runs in the workers.
+    The frontend keeps its raised value; this only touches EngineCore's copy.
+    """
+    os.environ["OMP_NUM_THREADS"] = "1"
+    if torch.get_num_threads() != 1:
+        torch.set_num_threads(1)
+
+
+def _arm_debug_stack_dump() -> None:
+    """Arm a repeating faulthandler dump when VLLM_NEURON_DEBUG_STACK_SECONDS is set.
+
+    Bring-up stalls inside EngineCore are otherwise invisible: EngineCore is
+    *forked*, so a timer armed at import time in the parent neither survives the
+    fork nor re-arms (the module is already in sys.modules), and the parent's own
+    stack only ever shows zmq.poll in wait_for_engine_startup. The scheduler
+    constructor is the first plugin code that reliably runs in EngineCore after
+    the executor is up, which makes it a usable arming point.
+    """
+    seconds = os.environ.get("VLLM_NEURON_DEBUG_STACK_SECONDS")
+    if not seconds:
+        return
+    import faulthandler
+
+    faulthandler.dump_traceback_later(float(seconds), repeat=True, exit=False)
+
+
 class NeuronScheduler(Scheduler):
     """
     Scheduler for Neuron platform with prefill/decode separation.
@@ -110,6 +173,11 @@ class NeuronScheduler(Scheduler):
         """
         if mm_registry is None:
             mm_registry = MULTIMODAL_REGISTRY
+
+        _arm_debug_stack_dump()
+        # Must precede super().__init__(): the MultiModalBudget it builds is what
+        # deadlocks in the forked EngineCore process.
+        _pin_engine_core_cpu_threads()
 
         super().__init__(
             vllm_config=vllm_config,

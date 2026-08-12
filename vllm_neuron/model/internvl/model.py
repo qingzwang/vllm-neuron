@@ -342,7 +342,12 @@ class InternVLChatModel(nn.Module, SupportsVisionWarmup):
         padded_tiles = self._padded_tile_count(
             bucket, self.config.vision_neuron_config
         )
-        px = pixel_values_flat.to(self.text_config.torch_dtype)
+        # The runner hands multimodal kwargs over on CPU (they come straight off
+        # the mm processor), so the move to device happens here — same as
+        # qwen3_vl's embed_multimodal. Without it the traced graph mixes a CPU
+        # activation with device parameters and dynamo fails on the first matmul.
+        device = next(self.visual.parameters()).device
+        px = pixel_values_flat.to(device=device, dtype=self.text_config.torch_dtype)
         if padded_tiles > real_tiles:
             pad = px.new_zeros((padded_tiles - real_tiles, *px.shape[1:]))
             px = torch.cat([px, pad], dim=0)

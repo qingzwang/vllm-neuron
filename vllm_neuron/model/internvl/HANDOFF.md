@@ -3,6 +3,22 @@
 Branch `model/InternVL3-8B`, cut from `release-0.21.0.1.0.0`. No overlap with
 `benchmark/Qwen3-VL-8B`.
 
+## Status: working on device at TP=4
+
+`examples/vllm_neuron/models/internvl/smoke_test.py` runs end to end on the
+default (multiprocess) path and generates correct text for both tile counts:
+
+    [1 tile, flat blue]
+      'The image is a solid blue color with a uniform texture. There are no
+       discernible objects, patterns, or variations in color. ...'
+    [3 tiles (2x1 + thumbnail), red left / blue right]
+      'The left half of the image is red, and the right half is blue.'
+
+The second case is the one that matters for correctness: it covers dynamic
+tiling, multiple cache blocks per item, padding up to the compiled bucket, and —
+because the halves are different colours — **tile order**, which is easy to get
+wrong in a way that still produces fluent output.
+
 ## Done
 
 | Piece | File | Status |
@@ -10,9 +26,9 @@ Branch `model/InternVL3-8B`, cut from `release-0.21.0.1.0.0`. No overlap with
 | Configs | `config.py` | used by the verified pieces below |
 | InternViT-300M tower | `vision_encoder.py` | **verified vs HF**, rel 8.0e-6 |
 | pixel shuffle + projector | `projector.py` | **verified vs HF**, rel 2.5e-6 |
-| Qwen2 decoder layers | `text_model.py` | written, imports, **not executed** |
+| Qwen2 decoder layers | `text_model.py` | **executed on device**, output correct |
 | Factory | `factory.py` | logic verified against the real config |
-| Top-level model | `model.py` | written, **not executed** |
+| Top-level model | `model.py` | **executed on device**, 1 and 3 tiles |
 | Registry entry | `registry.py`, `__init__.py` | import chain verified |
 
 Validator: `examples/vllm_neuron/models/internvl/validate_vision_encoder.py`
@@ -59,99 +75,110 @@ one VE block at the default `vision_attention_block_size`, and produces exactly
 256 merged tokens, i.e. exactly one cache block. Tiles, VE blocks and cache blocks
 are all the same count.
 
-## Remaining: EngineCore still never signals ready
+## Solved: the bring-up stall was an OpenMP-after-fork deadlock
 
-**This is independent of the vision work above and survives it.** With vision
-warmup succeeding and engine init logging completion at 192.38 s, EngineCore still
-goes quiet right after the `NeuronAsyncScheduler` warning and never sends the ready
-message. The parent stays blocked in `zmq.poll` under `wait_for_engine_startup`,
-the four workers poll at ~8% with nothing to do, and EngineCore itself sits at
-0.2% CPU — alive, blocked, not spinning.
+For a long time this looked like a lost ready handshake: engine init logged
+completion, EngineCore went quiet right after the `NeuronAsyncScheduler` warning
+and never sent the ready message, the parent sat in `zmq.poll` under
+`wait_for_engine_startup`, and EngineCore itself sat at 0.2% CPU — alive, blocked,
+not spinning. **It was none of that.** It was blocked *before* the handshake, in
+the scheduler constructor, on a `permute().contiguous()`.
 
-So the ordering is now clear: weights load, all graphs (text **and** vision)
-compile, warmup completes, and then the bring-up handshake does not finish. No
-request is ever submitted.
+    torchvision/transforms/functional.py:174 in to_tensor        <- blocked here
+    vllm/transformers_utils/processors/internvl.py:187 image_to_pixel_values_internvl
+    vllm/multimodal/.../processor.py  apply
+    vllm/multimodal/encoder_budget.py:87  MultiModalBudget.__init__
+    vllm/v1/core/sched/scheduler.py:187   Scheduler.__init__
+    vllm_neuron/vllm/core/scheduler.py    NeuronAsyncScheduler.__init__
 
-**Next step, and the only one that will answer it:** get a stack out of the
-EngineCore *process*. The parent's `faulthandler` dump does not cover it, and
-`kill -ABRT` on it produced the parent's stack rather than EngineCore's. Options:
+The chain, which is worth understanding because it is one image processor away
+from biting any multimodal model on this plugin:
 
-- `faulthandler.dump_traceback_later` installed from inside code that runs in
-  EngineCore — `vllm_neuron/vllm/platform.py` class methods do, and are a cheap
-  injection point for a temporary probe.
-- Or set `VLLM_ENABLE_V1_MULTIPROCESSING=0` if this vLLM honours it, which
-  collapses EngineCore into the parent and makes one stack dump cover everything.
-  That is the fastest experiment left to try.
+1. EngineCore is created with `fork()`. Torch's intra-op thread pool does not
+   survive a fork — the child still reports the parent's thread count but has no
+   live worker threads, so the first CPU op large enough to reach
+   `at::parallel_for` blocks forever on a barrier. Repro, no vLLM involved:
 
-Compare against a Qwen3-VL run at the same point: there the scheduler warning is
-followed immediately by request activity, so whatever EngineCore does between
-scheduler construction and the ready message is the whole search space.
+       work()                 # any CPU op over ~32k elements, in the parent
+       if os.fork() == 0:
+           work()             # hangs forever in the child
 
-## Earlier (superseded) diagnosis: EngineCore never signals ready
+   Only `set_num_threads(1)` escapes it; setting the count back to N
+   re-deadlocks, so the pool genuinely cannot be rebuilt post-fork.
+2. Constructing the base `Scheduler` builds a `MultiModalBudget`, which runs the
+   HF processor over a worst-case dummy image. vLLM knows this hangs and wraps it
+   in `set_default_torch_num_threads()` — the comment there is literally
+   "Avoid hang during startup".
+3. **That guard resolves its thread count from `OMP_NUM_THREADS`**, and
+   `NeuronPlatform.check_and_update_config` raises that variable to
+   min(8, cpu_count) for multimodal models so frontend patchify parallelizes.
+   EngineCore inherits the raised value across the fork, so upstream's guard
+   becomes a no-op.
+4. Whether a model trips it comes down to its image processor. Qwen3-VL's is
+   numpy-only and slips through. InternVL's goes through torchvision, whose
+   `to_tensor` does a `permute().contiguous()` over 448*448*3 elements — just
+   past the `parallel_for` grain size.
 
-**Corrected diagnosis.** An earlier note in this file said the *request* hangs.
-A `faulthandler` stack dump of the parent process shows otherwise: it is still
-inside `LLM.__init__`, blocked in `zmq.poll` under
-`vllm/v1/engine/utils.py::wait_for_engine_startup`. No request has been submitted
-at all.
+Fix: `_pin_engine_core_cpu_threads()` in `vllm_neuron/vllm/core/scheduler.py`,
+called before `super().__init__()`. It sets the **environment variable** back to
+1 for this process; a bare `torch.set_num_threads(1)` does not work, because
+step 2's guard overwrites it straight back to 8. The frontend keeps its raised
+value, so the patchify optimisation the bump exists for is unaffected. Verified:
+Qwen3-VL still starts and generates correctly with this change in place.
 
-    smoke_test.py:50 in main            <- still constructing LLM(...)
-    vllm/entrypoints/llm.py:381
-    vllm/v1/engine/llm_engine.py:170 / 104
-    vllm/v1/engine/core_client.py:723 / 535
-    vllm/v1/engine/utils.py:1128 launch_core_engines
-    vllm/v1/engine/utils.py:1169 wait_for_engine_startup
-    zmq/sugar/poll.py                   <- waiting for the ready handshake
+### Why this took so long, and the tooling that ended it
 
-Meanwhile EngineCore **is alive** (0.3% CPU) and has already logged
-`init engine (profile, create kv cache, warmup model) took 46.92 s`, followed by
-the `NeuronAsyncScheduler` warning — and then nothing. So weights, compilation and
-warmup all succeeded; what never happens is the ready message back to the parent.
+Every stack dump of the parent showed `zmq.poll` in `wait_for_engine_startup`,
+which reads as "EngineCore never replied" and points away from EngineCore's own
+work. `kill -ABRT` on the EngineCore pid produced the parent's stack. And a
+`faulthandler` timer armed at import time in the parent never fires in EngineCore:
+the fork does not carry the timer thread over, and the module is already in
+`sys.modules` so it is not re-imported.
 
-The four workers poll at ~11% waiting for work, which is consistent: they are
-fine, nobody has asked them to do anything.
+Two things that do work, both kept:
 
-**Next step.** Instrument EngineCore between scheduler construction and the ready
-handshake, since that is the only remaining window:
+- `VLLM_NEURON_DEBUG_STACK_SECONDS=<n>` — arms a repeating `faulthandler` dump
+  from inside `NeuronScheduler.__init__`, which is plugin code that reliably runs
+  *in* EngineCore. This is what produced the stack above.
+- `VLLM_ENABLE_V1_MULTIPROCESSING=0` — collapses EngineCore into the parent.
+  Bypasses the fork entirely (so it hides this class of bug), but it turns worker
+  errors into a plain traceback in the foreground, which is how the CPU/device
+  mismatch below was found in one run instead of several.
 
-1. `faulthandler.dump_traceback_later` inside the EngineCore process (the parent's
-   dump does not cover it) to see what it is blocked on after the scheduler
-   warning.
-2. Suspect anything the ready payload needs from the model — `get_kv_spec()` and
-   the KV-cache config exchange are the obvious candidates, and both are
-   model-supplied code paths that are still unexecuted elsewhere.
-3. Compare against a Qwen3-VL run: in that log the scheduler warning is
-   immediately followed by request activity, so a side-by-side of the two
-   EngineCore processes at that point should isolate the difference quickly.
+### The other bug the same session found
 
-**This is a much tighter target than "the request hangs"** — the failure is in
-engine bring-up, after warmup, before the first request.
+With multiprocessing off, the request actually ran and failed loudly:
 
-**Everything else in this file still holds**, and the eight fixes above are real:
+    Unhandled FakeTensor Device Propagation for aten.mm.default,
+    found two different devices cpu, neuron:0
+      ... vision_encoder.py:106 in forward
+          patches = torch.matmul(x, self.proj_weight) + self.proj_bias
+
+The runner hands multimodal kwargs over **on CPU** — they come straight off the
+mm processor. Vision warmup passed because `build_vision_synthetic_inputs` builds
+its tensors on device, so only real requests hit it. `embed_multimodal` now moves
+`pixel_values_flat` to the visual tower's device, same as qwen3_vl does.
+
+**Everything else in this file still holds**, and the earlier fixes are real:
 each was found by this same run failing earlier and louder.
 
-### Original plan for this step
+### Still to do
 
-**On-device TP=4 smoke test** validates everything not yet executed:
-`text_model.py`, `model.py`, the encoder-cache write path, and the vision
-encoder's TP sharding.
-
-    llm = LLM(model="/mnt/nvme/models/InternVL3-8B-Instruct",
-              tensor_parallel_size=4, max_model_len=4096,
-              max_num_batched_tokens=2048, max_num_seqs=1,
-              additional_config={...})   # see BENCHMARK_REPORT.md on the other
-                                        # branch for the neuron_config shape
+- **Latency numbers.** Nothing has been measured. `max_model_len` is the knob
+  that matters most: on Qwen3-VL, oversizing it cost 3x TPOT, because decode then
+  attends over the whole window per sequence. Size it to the actual prompt.
+- **Batch > 1.** Only `max_num_seqs=1` has run. Note the multi-`num_seqs_buckets`
+  hang recorded on the Qwen3-VL branch — one engine per batch size worked there.
+- **`encoder_cache_num_blocks`.** Set to 64 in the smoke test and never stressed.
+  The block-vs-token budget hazard below is what to expect when it is too small,
+  and it only shows up once several *distinct* images are in flight.
+- **More than 3 tiles.** 1 and 3 are covered; 13 (the bucket's worst case) is not.
 
 **Read the generated text before any latency number.** A wrong TP shard, a missed
 LayerScale or a mis-ordered pixel shuffle all produce plausible timings with
 garbage output — that failure mode cost real time on the Qwen3-VL branch.
 
-Expect to iterate on: `num_vision_tokens_buckets` (tile count driven, 256 embed
-tokens per tile), `encoder_cache_num_blocks` (see the block-vs-token hazard
-below), and `max_model_len` (size it to the actual prompt; oversizing it cost 3x
-TPOT on Qwen3-VL).
-
-### Bugs the first on-device run already found and fixed
+### Bugs the first on-device runs found and fixed
 
 Each of these failed at engine init or graph trace, i.e. long before any output
 could be inspected:
@@ -192,19 +219,20 @@ could be inspected:
    bucket for the worst-case tile count (max_dynamic_patch + thumbnail = 13 tiles
    -> 13312 raw patches), not for the test image.
 
-### Known-unverified specifics to check first if it misbehaves
+### Specifics now confirmed on device
+
+These were the open questions before the model ran; all of them held.
 
 - `Qwen2Attention.forward_prefill` passes `bias=` to `NF.qkv_proj` and
-  `forward_decode` passes `bias_qkv=` to `NF.attention_decode`. Both kwargs exist,
-  but neither call has been executed.
-- `embed_multimodal` writes into `encoder_cache.buffer[block_id, :n_rows]`
-  directly. `allocate(mm_hash, tokens_per_block)` takes a **per-block token list**,
-  not a count — an earlier draft got that wrong. Compare against
-  `qwen3_vl/model_bf16.py:1051`, which instead has the vision NEFF scatter-write
-  into the buffer; the direct write here is simpler but unproven on device.
-- `merge_vision_embeddings` is reused from the qwen3_vl utils. It should infer
-  zero deepstack levels from `fat_dim == visual_dim`; confirm it returns
-  `(hidden, None)` rather than raising.
+  `forward_decode` passes `bias_qkv=` to `NF.attention_decode`. Both execute, and
+  both want the bias as `[1, I]` rather than `[I]`.
+- `allocate(mm_hash, tokens_per_block)` takes a **per-block token list**, not a
+  count. `embed_multimodal` no longer writes into the buffer itself: like
+  `qwen3_vl/model_bf16.py:1051`, the vision NEFF scatter-writes with `index_put_`
+  in-graph, and `embed_multimodal` only allocates, pads to the bucket and routes
+  padding blocks to the scratch block.
+- `merge_vision_embeddings`, reused from the qwen3_vl utils, does infer zero
+  deepstack levels from `fat_dim == visual_dim` and returns `(hidden, None)`.
 
 ## Contract notes (the expensive part to rediscover)
 

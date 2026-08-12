@@ -224,6 +224,12 @@ a Trainium accelerator. The quick brown fox jumps over the lazy dog while the
 engineer measures decode latency across batch sizes on a Trainium accelerator...
 ```
 
+**DP=2 下同样验证通过**：TP=2 × DP=2、16 并发、视频负载，输出正确
+（"a young child ... reading a large, thick book"），每请求恰好 256 token。真实性能
+286.1 tok/s / 1.12 req/s，对比 TP=4 batch 8 的 284.1 / 1.11 —— **打平**，而 E2E
+13485 ms 是 TP=4 的 6905 ms 的 1.95 倍。乱码版本报的 310.9 tok/s（+9.4%）是假的。
+**所以「小 TP + 多副本」这条提升吞吐的路，修好之后依然不划算。**
+
 `kernel_call_count` 从 **109 降到 73**，正好少 36 个 = 每层一个 QKV kernel 退回 fallback
 （与 §5.4 里 MLP 那 36 个是两套独立的，各自每层一个）。
 

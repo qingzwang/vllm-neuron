@@ -11,23 +11,47 @@ Branch `model/InternVL3-8B`, cut from `release-0.21.0.1.0.0`. No overlap with
 | InternViT-300M tower | `vision_encoder.py` | **verified vs HF**, rel 8.0e-6 |
 | pixel shuffle + projector | `projector.py` | **verified vs HF**, rel 2.5e-6 |
 | Qwen2 decoder layers | `text_model.py` | written, imports, **not executed** |
-| Factory | `factory.py` | written, **not executed** (imports `.model`, absent) |
+| Factory | `factory.py` | logic verified against the real config |
+| Top-level model | `model.py` | written, **not executed** |
+| Registry entry | `registry.py`, `__init__.py` | import chain verified |
 
 Validator: `examples/vllm_neuron/models/internvl/validate_vision_encoder.py`
 (CPU, float32, real checkpoint). Run with `VLLM_NEURON_CPU_MODE=1`; takes seconds.
 
 ## Remaining
 
-1. **`model.py`** — top-level `InternVLChatModel`, the only blocker for a first
-   run. Needs: `InternVLTextModel` (embed_tokens + 28 `Qwen2DecoderLayer` + norm),
-   `lm_head`, `forward`, `embed_multimodal`, `get_kv_spec`, `bind_kv_cache`,
-   `load_weights`, `from_configs`.
-2. **Register** `("InternVLChatModel", InternVLChatModel)` in
-   `vllm_neuron/model/registry.py` and export from `__init__.py`.
-3. **On-device TP=4 smoke test.** This is also what validates `text_model.py`
-   numerically and the vision encoder's TP sharding — a wrong shard shows up
-   immediately as garbage output, so **read the generated text, not just the
-   latency numbers.**
+**On-device TP=4 smoke test** is the only step left, and it is what validates
+everything not yet executed: `text_model.py`, `model.py`, the encoder-cache write
+path, and the vision encoder's TP sharding.
+
+    llm = LLM(model="/mnt/nvme/models/InternVL3-8B-Instruct",
+              tensor_parallel_size=4, max_model_len=4096,
+              max_num_batched_tokens=2048, max_num_seqs=1,
+              additional_config={...})   # see BENCHMARK_REPORT.md on the other
+                                        # branch for the neuron_config shape
+
+**Read the generated text before any latency number.** A wrong TP shard, a missed
+LayerScale or a mis-ordered pixel shuffle all produce plausible timings with
+garbage output — that failure mode cost real time on the Qwen3-VL branch.
+
+Expect to iterate on: `num_vision_tokens_buckets` (tile count driven, 256 embed
+tokens per tile), `encoder_cache_num_blocks` (see the block-vs-token hazard
+below), and `max_model_len` (size it to the actual prompt; oversizing it cost 3x
+TPOT on Qwen3-VL).
+
+### Known-unverified specifics to check first if it misbehaves
+
+- `Qwen2Attention.forward_prefill` passes `bias=` to `NF.qkv_proj` and
+  `forward_decode` passes `bias_qkv=` to `NF.attention_decode`. Both kwargs exist,
+  but neither call has been executed.
+- `embed_multimodal` writes into `encoder_cache.buffer[block_id, :n_rows]`
+  directly. `allocate(mm_hash, tokens_per_block)` takes a **per-block token list**,
+  not a count — an earlier draft got that wrong. Compare against
+  `qwen3_vl/model_bf16.py:1051`, which instead has the vision NEFF scatter-write
+  into the buffer; the direct write here is simpler but unproven on device.
+- `merge_vision_embeddings` is reused from the qwen3_vl utils. It should infer
+  zero deepstack levels from `fat_dim == visual_dim`; confirm it returns
+  `(hidden, None)` rather than raising.
 
 ## Contract notes (the expensive part to rediscover)
 

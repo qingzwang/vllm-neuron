@@ -25,8 +25,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from vllm_neuron.utils.weight_loader import set_weight_loader
+
 from .config import InternVLConfig
 from .vision_encoder import _gelu
+from .weight_loaders import replicated_transposed_loader
 
 
 def pixel_shuffle(x: torch.Tensor, scale_factor: float) -> torch.Tensor:
@@ -85,6 +88,10 @@ class InternVLProjector(nn.Module):
         self.fc1_bias = nn.Parameter(torch.empty(llm_hidden, dtype=dtype))
         self.fc2_weight = nn.Parameter(torch.empty(llm_hidden, llm_hidden, dtype=dtype))
         self.fc2_bias = nn.Parameter(torch.empty(llm_hidden, dtype=dtype))
+
+        # Checkpoint holds HF Linear layout [out, in]; these params are [in, out].
+        for w in (self.fc1_weight, self.fc2_weight):
+            set_weight_loader(w, replicated_transposed_loader())
 
     def forward(self, vit_embeds: torch.Tensor) -> torch.Tensor:
         n, num_patches, _ = vit_embeds.shape

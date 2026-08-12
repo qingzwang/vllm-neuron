@@ -353,3 +353,44 @@ class InternVisionModel(nn.Module):
                 }
             )
         return m
+
+    def load_weights(
+        self,
+        checkpoint_path: str,
+        device: str = "cpu",
+        *,
+        cpu_mode: bool = True,
+    ) -> None:
+        """Load vision weights using the **vision** TP rank.
+
+        This has to be separate from the top-level load_weights: that one passes
+        the text TP rank, and the vision tower lives in its own TP group (default
+        resolution is vision tp=1, dp=world_size). Feeding a text rank of 1..3 to
+        a tp=1 vision loader walks the slice past the end of the tensor and
+        silently returns a short shard.
+        """
+        from vllm_neuron.parallel.neuron_parallel_state import (
+            get_neuron_vision_tp_group,
+        )
+        from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+
+        tp_group = get_neuron_vision_tp_group()
+        tp_rank = tp_group.rank_in_group if tp_group else 0
+        tp_size = tp_group.world_size if tp_group else 1
+
+        mappings = self.build_weight_mappings()
+        checkpoint = SafetensorsCheckpoint(checkpoint_path)
+        loader = (
+            checkpoint.load_sharded if cpu_mode else checkpoint.load_sharded_pipelined
+        )
+        sd = loader(
+            rank=tp_rank,
+            world_size=tp_size,
+            model=self,
+            mappings=mappings,
+            device=device,
+        ).state_dict
+        for name, tensor in sd.items():
+            if tensor.dtype != self.dtype:
+                sd[name] = tensor.to(self.dtype)
+        self.load_state_dict(sd, strict=False, assign=True)

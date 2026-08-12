@@ -38,7 +38,6 @@ from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import (
     set_weight_loader,
     sharding_weight_loader,
-    sharding_weight_loader_with_padding,
 )
 
 from .config import InternVLConfig, InternVLTextConfig
@@ -81,15 +80,11 @@ class InternVLTextModel(nn.Module):
         )
         self.rotary_emb = Qwen2RotaryEmbedding(config)
 
-        set_weight_loader(
-            self.embed_tokens.weight,
-            sharding_weight_loader(
-                shard_dim=0,
-                shard_size=self.embed_tokens.vocab_size_per_rank,
-                num_shards=self.embed_tokens.tp_size,
-                is_storage_transposed=False,
-            ),
-        )
+        # No weight loader is attached here on purpose: VocabDimShardedEmbedding
+        # installs its own with pad_shard=True, which InternVL3 needs because its
+        # vocab (151674) is not divisible by the TP size. Overriding it with a
+        # non-padding loader makes the last rank's slice run past the end of the
+        # tensor, and strict=False then silently leaves the parameter on meta.
 
     def forward(
         self,
@@ -123,6 +118,8 @@ class InternVLTextModel(nn.Module):
                 rank=self.rank,
             )
 
+        # cos/sin cover the FULL sequence, not this rank's SP slice: attention and
+        # MLP each all-gather at entry during prefill, so they see all T tokens.
         position_embeddings = self.rotary_emb(
             positions, device=hidden_states.device, dtype=hidden_states.dtype
         )
@@ -166,10 +163,22 @@ class InternVLChatModel(nn.Module):
         debug_logits = nc is not None and nc.debug_logits_dir is not None
         self._gather_logits = (nc is not None and nc.max_logprobs != 0) or debug_logits
 
+        # <-- MODEL-SPECIFIC: InternVL3's vocab is 151674, which is NOT divisible
+        # by 4, and ColumnParallelLinear asserts divisibility (nn/cpl.py has a
+        # "TODO: Add flag to enable padding"). Every other model in this plugin
+        # happens to have a divisible vocab, so this is the first one to need it.
+        # Round the LM head up to a multiple of world_size and mask the padding
+        # out of the logits — zero-padded weights would otherwise yield logit 0,
+        # which can beat genuinely negative logits and silently emit a token
+        # outside the vocabulary.
+        vocab = self.text_config.vocab_size
+        self.vocab_size_per_rank = math.ceil(vocab / self.world_size)
+        self.padded_vocab_size = self.vocab_size_per_rank * self.world_size
+
         # >>> PARALLELISM: column-parallel LM head <<<
         self.lm_head = neuron_nn.ColumnParallelLinear(
             config.text_config.hidden_size,
-            config.text_config.vocab_size,
+            self.padded_vocab_size,
             bias=False,
             dtype=dtype,
             gather_output=not self.on_device_sampling_config,
@@ -177,15 +186,22 @@ class InternVLChatModel(nn.Module):
         )
         set_weight_loader(
             self.lm_head.weight,
-            sharding_weight_loader_with_padding(
+            sharding_weight_loader(
                 shard_dim=0,
-                shard_size=self.text_config.vocab_size // self.world_size,
+                shard_size=self.vocab_size_per_rank,
                 num_shards=self.world_size,
-                pad_dim=1,
-                padded_size=self.text_config.hidden_size,
-                unpadded_size=self.text_config.hidden_size,
+                is_storage_transposed=False,
+                pad_shard=True,
             ),
         )
+
+        # How many of this rank's logit columns fall past the real vocabulary.
+        # Computed from plain ints: the model is constructed under a meta device,
+        # where building a mask tensor and calling .any() would raise
+        # "Tensor.item() cannot be called on meta tensors".
+        start = self.rank * self.vocab_size_per_rank
+        end = start + self.vocab_size_per_rank
+        self._num_pad_cols = min(self.vocab_size_per_rank, max(0, end - vocab))
         if self.on_device_sampling_config is not None:
             self.sampler = Sampler(
                 self.on_device_sampling_config,
@@ -235,6 +251,15 @@ class InternVLChatModel(nn.Module):
             hidden_states, dim=0, index=sampling_positions
         )
         logits = self.lm_head(hidden_states)
+        if self._num_pad_cols:
+            # Padding always occupies the tail of the last rank's shard. Rebuild
+            # the row by concatenation rather than an in-place write so the shape
+            # stays static and the graph stays functional. Zero-weight columns
+            # would otherwise score 0 and can beat genuinely negative logits,
+            # emitting a token id outside the vocabulary.
+            real = logits[..., : -self._num_pad_cols]
+            pad = torch.full_like(logits[..., -self._num_pad_cols :], float("-inf"))
+            logits = torch.cat([real, pad], dim=-1)
 
         gathered_logits = None
         if self._gather_logits:
@@ -383,8 +408,7 @@ class InternVLChatModel(nn.Module):
         if not self.text_config.tie_word_embeddings:
             mappings["lm_head.weight"] = "language_model.lm_head.weight"
 
-        for name, key in self.visual.build_weight_mappings().items():
-            mappings[f"visual.{name}"] = key
+        # The projector is replicated, so the text rank is harmless for it.
         for name, key in self.projector.build_weight_mappings().items():
             mappings[f"projector.{name}"] = key
 
@@ -403,3 +427,30 @@ class InternVLChatModel(nn.Module):
             if tensor.dtype != target_dtype:
                 rank_sharded[name] = tensor.to(target_dtype)
         self.load_state_dict(rank_sharded, strict=False, assign=True)
+
+        # Vision weights load separately: the tower has its own TP group, so it
+        # must be sharded by the vision rank rather than the text rank.
+        self.visual.load_weights(checkpoint_path, device="cpu", cpu_mode=True)
+
+        self._assert_no_meta_params()
+
+    def _assert_no_meta_params(self) -> None:
+        """Fail with the offending names if any parameter is still on meta.
+
+        The model is constructed on the meta device and materialized by
+        load_weights. A name missing from the checkpoint mapping stays on meta and
+        surfaces much later as torch's "Cannot copy out of meta tensor" from
+        model.to(device), which names nothing. List them here instead.
+        """
+        stranded = [
+            name
+            for name, tensor in list(self.named_parameters())
+            + list(self.named_buffers())
+            if tensor.device.type == "meta"
+        ]
+        if stranded:
+            raise RuntimeError(
+                f"{len(stranded)} parameter(s) were never loaded and remain on "
+                f"the meta device: {stranded[:12]}"
+                + (" ..." if len(stranded) > 12 else "")
+            )

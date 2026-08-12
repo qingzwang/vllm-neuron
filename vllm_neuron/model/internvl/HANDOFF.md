@@ -39,6 +39,47 @@ tokens per tile), `encoder_cache_num_blocks` (see the block-vs-token hazard
 below), and `max_model_len` (size it to the actual prompt; oversizing it cost 3x
 TPOT on Qwen3-VL).
 
+### Bugs the first on-device run already found and fixed
+
+Each of these failed at engine init or graph trace, i.e. long before any output
+could be inspected:
+
+1. **`vocab_size` 151674 is not divisible by TP=4.** `ColumnParallelLinear`
+   asserts divisibility (`nn/cpl.py` still has "TODO: Add flag to enable
+   padding"), and every other model in this plugin happens to have a divisible
+   vocab. The LM head is now rounded up to `ceil(vocab/ws)*ws` with the padded
+   tail columns forced to `-inf` — zero-weight columns score 0, which can beat
+   genuinely negative logits and emit an out-of-vocab token id.
+2. **`VocabDimShardedEmbedding` already attaches its own loader** with
+   `pad_shard=True`, which this model needs for the same reason. Overriding it
+   with a plain loader made rank 3's slice run past the end of the tensor;
+   `strict=False` then silently left `embed_tokens.weight` on the meta device.
+   `_assert_no_meta_params()` now names such parameters instead of letting torch
+   raise a nameless "Cannot copy out of meta tensor" from `model.to(device)`.
+3. **The vision tower must load with the *vision* rank.** Folding its mapping
+   into the top-level `load_weights` fed it the text rank (0..3) while the vision
+   TP group is size 1, so slices ran off the end and produced short shards.
+   `InternVisionModel.load_weights` now does its own rank-correct load, matching
+   what qwen3_vl does.
+4. **The shared `fused_qkv_weight_loader` asserts 2-D slices**, so Qwen2's 1-D
+   q/k/v biases need `fused_qkv_bias_loader` (added here).
+5. **The projector's checkpoint tensors are HF `[out, in]`** while the params are
+   `[in, out]`; it is replicated, so it needs a transpose-only loader.
+6. **The QKV kernels require bias shaped `[1, I]`**, not `[I]` — both
+   `NF.qkv_proj(bias=)` and `NF.attention_decode(bias_qkv=)`.
+7. **SP all-gather at the entry of attention *and* MLP.** Prefill runs both over
+   the full sequence and reduce-scatters at the end, so each has to undo
+   `embed_tokens`' scatter first. Without it the residual add sees `T/ws` vs
+   `T/ws**2`. Note this also means cos/sin must cover the **full** sequence, not
+   the rank's slice — an earlier attempt "fixed" the length mismatch by slicing
+   positions, which was the wrong direction.
+8. **`num_vision_tokens_buckets` gates schedulability.** The runner derives
+   `max_vision_blocks_per_request = ceil(bucket / merge_factor / cache_block_size)`
+   and a request needing more blocks can never be scheduled — the scheduler spins
+   with **no log output at all**, which is indistinguishable from a hang. Size the
+   bucket for the worst-case tile count (max_dynamic_patch + thumbnail = 13 tiles
+   -> 13312 raw patches), not for the test image.
+
 ### Known-unverified specifics to check first if it misbehaves
 
 - `Qwen2Attention.forward_prefill` passes `bias=` to `NF.qkv_proj` and

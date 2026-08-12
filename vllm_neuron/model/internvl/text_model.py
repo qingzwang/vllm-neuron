@@ -36,6 +36,7 @@ from vllm_neuron.utils.weight_loader import (
 )
 
 from .config import InternVLTextConfig
+from .weight_loaders import fused_qkv_bias_loader
 
 
 class Qwen2RMSNorm(nn.Module):
@@ -141,18 +142,28 @@ class Qwen2Attention(nn.Module):
 
     def _setup_weight_loaders(self):
         """Checkpoint stores q/k/v separately; fuse and shard them per rank."""
-        for param, shard_dim in ((self.qkv_proj_weight, 1), (self.qkv_proj_bias, 0)):
-            set_weight_loader(
-                param,
-                fused_qkv_weight_loader(
-                    q_size=self.q_size,
-                    kv_size=self.kv_size,
-                    shard_dim=shard_dim,
-                    num_shards=self.world_size,
-                    is_storage_transposed=shard_dim == 1,
-                    num_kv_replicas=self.num_kv_replicas,
-                ),
-            )
+        set_weight_loader(
+            self.qkv_proj_weight,
+            fused_qkv_weight_loader(
+                q_size=self.q_size,
+                kv_size=self.kv_size,
+                shard_dim=1,
+                num_shards=self.world_size,
+                is_storage_transposed=True,
+                num_kv_replicas=self.num_kv_replicas,
+            ),
+        )
+        # The shared fused loader asserts 2-D checkpoint slices, so the 1-D
+        # biases need their own loader.
+        set_weight_loader(
+            self.qkv_proj_bias,
+            fused_qkv_bias_loader(
+                q_size=self.q_size,
+                kv_size=self.kv_size,
+                num_shards=self.world_size,
+                num_kv_replicas=self.num_kv_replicas,
+            ),
+        )
         set_weight_loader(
             self.o_proj_weight,
             sharding_weight_loader(
@@ -176,6 +187,12 @@ class Qwen2Attention(nn.Module):
             return self.forward_decode(
                 hidden_states, positions, position_embeddings, attn_metadata
             )
+        # >>> PARALLELISM: all-gather out of the SP layout before attention <<<
+        # Prefill runs attention over the whole sequence and reduce-scatters at
+        # the end, so the entry has to undo embed_tokens' scatter. Skipping this
+        # makes the residual add see mismatched lengths (T/ws vs T/ws**2).
+        if self.world_size > 1:
+            hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
         return self.forward_prefill(
             hidden_states, positions, position_embeddings, attn_metadata
         )
@@ -223,7 +240,9 @@ class Qwen2Attention(nn.Module):
         qkv = NF.qkv_proj(
             hidden=hidden_states.unsqueeze(0),
             qkv_weights=self.qkv_proj_weight,
-            bias=self.qkv_proj_bias,
+            # The CTE kernel validates bias as [1, I] or [pmax, I]; a bare
+            # [I] vector is rejected.
+            bias=self.qkv_proj_bias.unsqueeze(0),
             cos_cache=cos_cache,
             sin_cache=sin_cache,
             num_q_heads=self.num_attention_heads_per_rank,
@@ -310,7 +329,8 @@ class Qwen2Attention(nn.Module):
             X=hidden_states.view(B, S, hidden),
             W_qkv=self.qkv_proj_weight,
             # <-- MODEL-SPECIFIC: Qwen2 QKV bias; QK norm stays disabled.
-            bias_qkv=self.qkv_proj_bias,
+            # Same [1, I] requirement as the CTE kernel.
+            bias_qkv=self.qkv_proj_bias.unsqueeze(0),
             rmsnorm_X_enabled=False,
             rmsnorm_QK_pre_rope_enabled=False,
             cos=cos_k,
@@ -418,6 +438,9 @@ class Qwen2MLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, is_prefill: bool) -> torch.Tensor:
+        # >>> PARALLELISM: all-gather out of SP, mirroring the attention entry <<<
+        if is_prefill and self.world_size > 1:
+            hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
         out = NF.mlp(
             hidden=hidden_states,
             gate_w=self.gate_proj_weight,

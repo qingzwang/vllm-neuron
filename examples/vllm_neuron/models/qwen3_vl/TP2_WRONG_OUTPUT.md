@@ -1,11 +1,13 @@
 # Qwen3-VL-8B 在 TP=2 下静默输出乱码
 
-**日期**: 2026-08-11 · **复现次数**: 3/3（100%）· **状态**: 未修复，已绕过（只用 TP=4）
+**日期**: 2026-08-11 · **复现次数**: 3/3（100%）· **状态**: 已定位到 kernel 层，未修复，已绕过（只用 TP=4）
 **严重性**: 高 —— **静默的数值错误，无任何报错或警告**
 
 一句话：`tensor_parallel_size=2` 时 Qwen3-VL-8B-Instruct 能正常编译、正常推理、
 性能指标完全合理，但**生成的文本是乱码**。同样配置在 `tensor_parallel_size=4` 下正确。
-纯文本输入同样复现，故障在**文本骨干的张量并行分片**，与视觉塔和数据并行无关。
+纯文本输入同样复现（与视觉塔、数据并行无关），且**关掉 NKI kernel 后 TP=2 输出正确**
+（§5）—— 故障在 **kernel 层**：某个 NKI kernel 在 TP=2 的张量形状下算错。
+分片逻辑、集合通讯、权重加载均已排除。
 
 > 这类失败比崩溃危险：崩溃会拦住你，静默算错不会。只看性能表会得出
 > 「TP=2 × DP=2 比 TP=4 快 9.4%」的自信结论，而结果是错的。
@@ -131,10 +133,82 @@ intermediate 4304 / out_hidden 4096。TP=2 时视觉塔按 `resolve_tp_dp(2)` �
 每个请求都恰好产出 256 token，10 轮迭代方差极小（TPOT p50 44.08 / p90 42.21）。
 **从任何性能维度看都是"成功"的。** 唯一的破绽只有生成文本。
 
-## 5. 未做的定位工作
+## 5. 根因：某个 NKI kernel 在 TP=2 的形状下算错
 
-只做到「TP=2 的文本骨干算错」这一层，没有定位到具体哪个算子/层。仓库里有现成的
-工具可以继续往下查（都没跑）：
+用 `VLLM_NEURON_DISABLE_NKI_KERNELS=1`（该开关强制 `can_run_kernel()` 返回 False，
+日志中 `kernel_call_count: 0` 可验证）做 2×2 对照，纯文本负载：
+
+| TP | NKI kernels | 输出 | TTFT p50 | TPOT p50 | tok/s |
+|---|---|---|---|---|---|
+| 4 | 开 | ✅ | 577 | 23.01 | 317.0 |
+| 4 | 关 | ✅ | 804 | 24.33 | 291.5 |
+| **2** | **开** | **❌ 乱码** | 773 | 43.88 | 171.0 |
+| **2** | **关** | **✅ 正确** | 1895 | 53.62 | 131.4 |
+
+**关掉 NKI kernel 后 TP=2 输出正确。** 这一格是决定性的：
+
+- **张量并行的分片逻辑、集合通讯、权重加载全部无罪** —— 否则关 kernel 也救不回来。
+  （`fused_qkv_weight_loader` 与 head 分片数学也人工核对过，TP=2 下 16 Q / 4 KV per rank、
+  `num_key_value_groups=4`，与 TP=4 一致且正确。）
+- **故障在 kernel 层**：某个 NKI kernel 在 TP=2 的张量形状下产生错误结果。
+- TP=4 关 kernel 也正确 → 各 PyTorch fallback 路径本身是对的。
+
+### 5.1 首要嫌疑：QKV kernel 的尺寸比例
+
+`vllm_neuron/functional/attention/qkv.py` 的 `_can_use_qkv_kernel` 里有一段注释，
+**明确承认这个 kernel 在某些尺寸比例下算错**：
+
+> *"The kernel produces incorrect results when fused_qkv_dim is large relative to H
+> (e.g., vision TP=1: H=1280, fused_qkv_dim=3\*H=3840). Validated configurations have
+> fused_qkv_dim <= H. Fall back to PyTorch when this is exceeded until the kernel is
+> validated for larger ratios."*
+
+对应的守卫是 `if fused_qkv_dim > H: return False`。本模型 `H = 4096`（hidden_size，不分片），
+`fused_qkv_dim = (num_q_heads + 2*num_kv_heads) * head_dim` 按 rank 计：
+
+| TP | q/kv heads per rank | `fused_qkv_dim` | `fused_qkv_dim / H` | 守卫 | 实测输出 |
+|---|---|---|---|---|---|
+| 4 | 8 / 2 | 1536 | **0.375** | 通过 | ✅ |
+| 2 | 16 / 4 | 3072 | **0.75** | 通过 | ❌ |
+
+**两个都通过了 `<= H` 的守卫，但 TP=2 的比例是 TP=4 的两倍，紧贴边界。**
+如果该 kernel 实际只在较小比例下被验证过，那么 `fused_qkv_dim <= H` 这个守卫**太松**，
+TP=2 落进了未验证（且错误）的区间。这与注释里已知的失效模式（比例过大）方向一致。
+
+**尚未确认**是不是 QKV kernel —— `VLLM_NEURON_DISABLE_NKI_KERNELS` 是全局开关，
+无法只关某一个。要确认需要逐 kernel 开关，或用
+`examples/vllm_neuron/accuracy/run_tensor_capture_qwen3_vl.py` 抓 TP=2 下 QKV 输出与
+PyTorch 参考对比。
+
+### 5.2 一个被排除的岔路（记录以免他人重走）
+
+先前注意到 TP=2 的图比 TP=4 少 **36 个** NKI kernel 调用（145 → 109，`rewrite_count`
+两者都是 189），而 36 正好等于文本层数，并追到了 `vllm_neuron/functional/mlp.py:196`
+的 CTE PSUM 约束：`can_shard_on_i` 因 `H=4096 < _MIN_H_FOR_I_SHARDING=7168` 恒为 False，
+故 `effective_i = I`，约束化为 `I <= 8*512 = 4096`：
+
+| TP | 每 rank `I` = 12288/TP | `ceil(I/512)` | ≤ 8 |
+|---|---|---|---|
+| 4 | 3072 | 6 | ✅ 用 kernel |
+| 2 | 6144 | 12 | ❌ 退回 PyTorch |
+
+算术精确对上 36 这个差值。**但这不是正确性 bug 的原因** —— 上表「TP=4 关 kernel」一行
+证明 PyTorch fallback 路径是对的。这个约束只造成 TP=2 下 prefill MLP 的**性能**损失。
+
+### 5.3 规避手段
+
+`VLLM_NEURON_DISABLE_NKI_KERNELS=1` 能让 TP=2 输出正确，代价是性能：
+TPOT 43.88 → 53.62 ms（+22%）、TTFT 773 → 1895 ms（+145%）、吞吐 171.0 → 131.4 tok/s（−23%）。
+
+**但对本机没有实用价值**：修正后的 TP=2（131.4 tok/s）远低于 TP=4 开 kernel 的
+317.0 tok/s。结论仍然是**用 TP=4**。这个开关的价值在于**诊断**，以及在只有
+TP=2 可选的机器上作为临时正确性兜底。
+
+## 6. 未做的定位工作
+
+已定位到 kernel 层（§5），但**没有确认是哪一个 kernel**。`VLLM_NEURON_DISABLE_NKI_KERNELS`
+是全局开关，无法逐个关闭。首要嫌疑是 QKV kernel 的尺寸比例（§5.1）。
+仓库里有现成的工具可以继续往下查（都没跑）：
 
 | 工具 | 用途 |
 |---|---|
@@ -143,12 +217,14 @@ intermediate 4304 / out_hidden 4096。TP=2 时视觉塔按 `resolve_tp_dp(2)` �
 | `examples/vllm_neuron/accuracy/run_tensor_capture_qwen3_vl.py` | 逐层抓中间 tensor，二分定位发散的层 |
 | `docs/model-dev/accuracy-debugging-guide.md` | 官方精度调试流程 |
 
-建议的下一步：用 `run_tensor_capture_qwen3_vl.py` 在 TP=2 和 TP=4 下各抓一遍逐层输出，
-二分找第一个发散的层。若发散点在 attention 的输出投影或 MLP 的 row-parallel 归约处，
-指向 all-reduce / 分片边界；若在 QKV 之后立刻发散，指向 column-parallel 的权重切分或
-KV head 复制逻辑。
+建议的下一步：用 `run_tensor_capture_qwen3_vl.py` 在 **TP=2 开 kernel** 与
+**TP=2 关 kernel**（后者已知正确，是天然的 golden 参考）下各抓一遍逐层输出，
+二分找第一个发散的算子。这比与 TP=4 对比更干净 —— 两次运行的分片方式完全相同，
+唯一变量就是 kernel，所以第一个发散点直接就是出错的 kernel。
+若发散点在 QKV 投影，即可确认 §5.1 的假设，修法是把
+`_can_use_qkv_kernel` 里 `fused_qkv_dim > H` 的守卫收紧到实际验证过的比例。
 
-## 6. 影响
+## 7. 影响
 
 - **TP=4 是本机唯一可用配置**：TP=1 编不出来（[`TP1_COMPILE_FAILURE.md`](TP1_COMPILE_FAILURE.md)），
   TP=2 静默算错，TP=3 不能整除 head 数。
@@ -158,7 +234,7 @@ KV head 复制逻辑。
   也就是说 TP=8、TP=2 这类值在 trn2.48xlarge 上同样值得先做正确性抽查。
 - 生产不受影响（本机本来就只能用 TP=4），但**任何人在其他实例上调 TP 值都可能中招**。
 
-## 7. 保留的现场
+## 8. 保留的现场
 
 | 内容 | 路径 |
 |---|---|
@@ -210,9 +286,53 @@ Why it is easy to miss:
   2.26.6360.0+6f180f47, vllm-neuron 0.21.0.1.0.0, vLLM 0.21.0, torch 2.11.0, bf16
 - **Config:** `max_model_len=2048`, `max_num_batched_tokens=2048`,
   `max_num_seqs=8`, `num_seqs_buckets=[8]`, `enable_prefix_caching=False`
-- **Not localized further:** which layer/op diverges. The right next step is
-  `examples/vllm_neuron/accuracy/run_tensor_capture_qwen3_vl.py` at TP=2 vs TP=4
-  to bisect the first diverging layer.
+**Localized to the kernel layer.** With `VLLM_NEURON_DISABLE_NKI_KERNELS=1`
+(verified: `kernel_call_count: 0`), **TP=2 produces correct output**:
+
+| TP | NKI kernels | output | TPOT p50 | tok/s |
+|---|---|---|---|---|
+| 4 | on | correct | 23.01 | 317.0 |
+| 4 | off | correct | 24.33 | 291.5 |
+| 2 | on | **garbage** | 43.88 | 171.0 |
+| 2 | **off** | **correct** | 53.62 | 131.4 |
+
+That exonerates the TP sharding, the collectives and the weight loaders — none of
+those change when kernels are disabled. The fault is an NKI kernel that computes
+the wrong thing at TP=2 shapes. The PyTorch fallbacks are all correct.
+
+**Prime suspect: the QKV kernel's size ratio.** `_can_use_qkv_kernel` in
+`vllm_neuron/functional/attention/qkv.py` already documents that this kernel
+"produces incorrect results when fused_qkv_dim is large relative to H ...
+Validated configurations have fused_qkv_dim <= H", and guards with
+`fused_qkv_dim > H`. With H=4096 (unsharded hidden):
+
+| TP | q/kv heads per rank | fused_qkv_dim | ratio to H | guard | output |
+|---|---|---|---|---|---|
+| 4 | 8 / 2 | 1536 | 0.375 | passes | correct |
+| 2 | 16 / 4 | 3072 | **0.75** | passes | **garbage** |
+
+Both pass the `<= H` guard, but TP=2 sits at twice the ratio. If the kernel was
+only validated at smaller ratios, that guard is too loose. Not confirmed — the
+disable switch is global, so a single kernel cannot be isolated with it.
+
+**Ruled out along the way** (recorded so nobody re-walks it): TP=2 traces 36
+fewer NKI kernel calls than TP=4 (145 → 109, 36 = num_hidden_layers), which
+traces to the CTE PSUM constraint in `vllm_neuron/functional/mlp.py:196` —
+`can_shard_on_i` is always False here since H=4096 < 7168, so the constraint is
+`I <= 8*512 = 4096`, and per-rank I is 3072 at TP=4 (passes) but 6144 at TP=2
+(falls back). The arithmetic matches the count exactly, but the "TP=4, kernels
+off" row proves the fallbacks are correct, so this is a *performance* effect
+only, not the correctness bug.
+
+**Workaround:** `VLLM_NEURON_DISABLE_NKI_KERNELS=1` makes TP=2 correct at a cost
+(TPOT +22%, TTFT +145%, throughput −23%). Not useful in practice here — corrected
+TP=2 at 131.4 tok/s is well below TP=4 with kernels at 317.0 tok/s — but it is a
+clean golden reference for bisecting, since sharding is identical between the two
+runs and the kernel is the only variable.
+
+**Best next step:** `run_tensor_capture_qwen3_vl.py` at TP=2 with kernels on vs
+off, and bisect the first diverging op. Same sharding both sides, so the first
+divergence is the faulty kernel directly.
 - **Note:** the Qwen3-VL model recipe documents only TP=16, so TP values other
   than 16 may be unvalidated in general — worth a correctness spot-check at TP=8
   and TP=2 on trn2.48xlarge as well.

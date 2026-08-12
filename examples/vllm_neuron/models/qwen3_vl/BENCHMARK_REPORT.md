@@ -363,8 +363,11 @@ TP=1:  Neuron HBM: 17.08 GiB used, 6.92 GiB free
 | **TP=2**, 纯文本, DP=1 | `\ \\b\b\b\l\l\l\l\l\l\l\l\l\l\l\l\l\l ...` | ❌ |
 | **TP=1** | 编不出来（§6.3） | — |
 
-**定位**：纯文本在 TP=2 下同样乱码 → 坏在**文本骨干的张量并行分片**，与视觉塔无关；
-DP=1 和 DP=2 都乱码 → 与请求级 DP 无关。**结论：`tensor_parallel_size=2` 本身是坏的。**
+**定位到 kernel 层**：纯文本同样乱码 → 与视觉塔无关；DP=1/DP=2 都乱码 → 与请求级 DP 无关；
+而 **`VLLM_NEURON_DISABLE_NKI_KERNELS=1` 后 TP=2 输出正确** → 分片逻辑、集合通讯、
+权重加载全部无罪，**故障是某个 NKI kernel 在 TP=2 的形状下算错**。
+首要嫌疑是 QKV kernel 的尺寸比例守卫太松（`fused_qkv_dim/H` 在 TP=2 是 0.75、TP=4 是 0.375，
+而代码注释已承认该 kernel 在比例过大时算错）。详见 TP2_WRONG_OUTPUT.md §5。
 
 **为什么危险**：性能数字看起来完全正常，甚至符合物理直觉（TP=2 的 TPOT 约 44–45 ms，
 是 TP=4 的 23.96 ms 的 1.85 倍，正好对应核数减半）：

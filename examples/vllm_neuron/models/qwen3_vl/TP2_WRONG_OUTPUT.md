@@ -1,13 +1,15 @@
 # Qwen3-VL-8B 在 TP=2 下静默输出乱码
 
-**日期**: 2026-08-11 · **复现次数**: 3/3（100%）· **状态**: 已定位到 kernel 层，未修复，已绕过（只用 TP=4）
+**日期**: 2026-08-11 · **复现次数**: 3/3（100%）· **状态**: **根因已确认，插件侧已修复并验证**（真正的修法在 nkilib，见 §5.2）
 **严重性**: 高 —— **静默的数值错误，无任何报错或警告**
 
 一句话：`tensor_parallel_size=2` 时 Qwen3-VL-8B-Instruct 能正常编译、正常推理、
 性能指标完全合理，但**生成的文本是乱码**。同样配置在 `tensor_parallel_size=4` 下正确。
-纯文本输入同样复现（与视觉塔、数据并行无关），且**关掉 NKI kernel 后 TP=2 输出正确**
-（§5）—— 故障在 **kernel 层**：某个 NKI kernel 在 TP=2 的张量形状下算错。
-分片逻辑、集合通讯、权重加载均已排除。
+**根因**：NKI QKV kernel 在 `fused_qkv_dim >= 3072` 时静默算错（相对误差 1.06），
+而它自己的 SBUF 容量校验只在 ≥ 3584 才报错，3072 恰好漏过去。Qwen3-VL-8B 每 rank 的
+`fused_qkv_dim` 在 TP=2 是 **3072**（错）、TP=4 是 **1536**（对）。
+判据是绝对值而非与 hidden 的比例，所以原有的 `fused_qkv_dim > H` 守卫拦不住。
+**已在插件侧修复并验证**（§5.3）。复现器：同目录 `qkv_kernel_isolation.py`，约 1 分钟。
 
 > 这类失败比崩溃危险：崩溃会拦住你，静默算错不会。只看性能表会得出
 > 「TP=2 × DP=2 比 TP=4 快 9.4%」的自信结论，而结果是错的。
@@ -133,7 +135,7 @@ intermediate 4304 / out_hidden 4096。TP=2 时视觉塔按 `resolve_tp_dp(2)` �
 每个请求都恰好产出 256 token，10 轮迭代方差极小（TPOT p50 44.08 / p90 42.21）。
 **从任何性能维度看都是"成功"的。** 唯一的破绽只有生成文本。
 
-## 5. 根因：某个 NKI kernel 在 TP=2 的形状下算错
+## 5. 根因：NKI QKV kernel 在 fused_qkv_dim >= 3072 时算错
 
 用 `VLLM_NEURON_DISABLE_NKI_KERNELS=1`（该开关强制 `can_run_kernel()` 返回 False，
 日志中 `kernel_call_count: 0` 可验证）做 2×2 对照，纯文本负载：
@@ -153,7 +155,95 @@ intermediate 4304 / out_hidden 4096。TP=2 时视觉塔按 `resolve_tp_dp(2)` �
 - **故障在 kernel 层**：某个 NKI kernel 在 TP=2 的张量形状下产生错误结果。
 - TP=4 关 kernel 也正确 → 各 PyTorch fallback 路径本身是对的。
 
-### 5.1 首要嫌疑：QKV kernel 的尺寸比例
+### 5.1 确认：QKV kernel 在 `fused_qkv_dim >= 3072` 时算错
+
+用 `qkv_kernel_isolation.py`（同目录）单独测这个 kernel —— 同一个 `NF.qkv_proj`，
+CPU 上跑（`can_run_kernel` 返回 False → PyTorch 分支）当 golden，Neuron 上跑走 kernel，
+直接比最大相对误差。整个 sweep 约 1 分钟。**T=512 与 T=2048 结果完全一致**，
+所以阈值与序列长度无关。
+
+| `fused_qkv_dim` | q/kv per rank | H | fused/H | rel 误差 | 判定 |
+|---|---|---|---|---|---|
+| 512 | 2/1 | 4096 | 0.125 | 0.0013 | ✅ |
+| 768 | 4/1 | 4096 | 0.188 | 0.0028 | ✅ |
+| **1536** | **8/2** | 4096 | 0.375 | 0.0011 | ✅ **(TP=4)** |
+| 2048 | 8/4 | 4096 | 0.500 | 0.0021 | ✅ |
+| 2560 | 16/2 | 4096 | 0.625 | 0.0021 | ✅ |
+| 2688 | 15/3 | 4096 | 0.656 | 0.0026 | ✅ |
+| 2816 | 16/3 | 4096 | 0.688 | 0.0021 | ✅ |
+| **2944** | **17/3** | 4096 | 0.719 | 0.0046 | ✅ **最后一个正确值** |
+| **3072** | **16/4** | 4096 | 0.750 | **1.0607** | ❌ **(TP=2)** |
+| 3072 | 20/2 | 4096 | 0.750 | 1.0607 | ❌ 换 q/kv 拆分同样错 |
+| 3072 | 16/4 | **8192** | **0.375** | 1.0051 | ❌ **比例小也错** |
+| 1536 | 8/2 | **2048** | **0.750** | 0.0045 | ✅ **比例大但 fused 小就对** |
+| 3584 | 20/4 | 4096 | 0.875 | — | 编译报错（见下） |
+| 6144 | 32/8 | 4096 | 1.500 | 0.0039 | ✅ 被现有 `> H` 守卫拦下走 fallback |
+
+**判据是 `fused_qkv_dim` 的绝对值，不是它与 H 的比例** —— 最后两行是关键：
+3072 在 H=8192（比例 0.375）照样错，1536 在 H=2048（比例 0.75）照样对。
+所以现有守卫 `fused_qkv_dim > H` **判据本身就不对**：它碰巧拦住 TP=1（6144 > 4096），
+漏掉 TP=2（3072 < 4096），而且会错误放行 H=8192 下的 3072。
+
+### 5.2 为什么 3072 会漏过去：kernel 自己的 SBUF 校验太乐观
+
+`fused_qkv_dim = 3584` 时 kernel **明确报错**：
+
+```
+[NCC_INKI016] Kernel validation exception: SBUF budget exceeded even after
+reducing weight buffers: sbuf_tile_space_non_buffered=229380, available=212984
+```
+
+所以 kernel 内部有 SBUF 容量校验，只是**阈值设得偏高**：
+
+| `fused_qkv_dim` | 行为 |
+|---|---|
+| ≤ 2944 | 正确 |
+| **3072** | **通过 SBUF 校验，但静默算错** ← bug |
+| ≥ 3584 | SBUF 校验拦下，明确报错 |
+
+按 3584 的数字线性缩放，3072 大约需要 196k，低于 212,984 的可用量，所以校验放行 ——
+但生成的代码是错的。**根本问题在 nkilib 的 SBUF 会计在接近上限时过于乐观**，
+那部分不在本仓库内，我们改不了。
+
+### 5.3 修复（已实施并验证）
+
+能在插件侧修：把守卫从「比例」改成「绝对值」，让坏区间退回 PyTorch。
+`vllm_neuron/functional/attention/qkv.py`：
+
+```python
+_MIN_BROKEN_FUSED_QKV_DIM = 3072
+...
+if fused_qkv_dim >= _MIN_BROKEN_FUSED_QKV_DIM:
+    return False
+```
+
+**验证**：全模型 TP=2 纯文本，打补丁后输出正确：
+
+```
+a Trainium accelerator. The quick brown fox jumps over the lazy dog while the
+engineer measures decode latency across batch sizes on a Trainium accelerator...
+```
+
+`kernel_call_count` 从 **109 降到 73**，正好少 36 个 = 每层一个 QKV kernel 退回 fallback
+（与 §5.4 里 MLP 那 36 个是两套独立的，各自每层一个）。
+
+代价（TP=2 纯文本，batch 8）：
+
+| TP=2 配置 | 输出 | TTFT p50 | TPOT p50 | tok/s |
+|---|---|---|---|---|
+| 未修（kernel 全开） | ❌ 乱码 | 773 | 43.88 | 171.0 |
+| **打补丁**（仅 QKV 退回） | ✅ **正确** | 1470 | 45.96 | **155.1** |
+| 全关 kernel（诊断用） | ✅ 正确 | 1895 | 53.62 | 131.4 |
+| *对照 TP=4（kernel 全开）* | ✅ 正确 | 577 | 23.01 | **317.0** |
+
+修好的 TP=2 是 155.1 tok/s，仍只有 TP=4 的一半（核数减半，符合预期）。
+**所以这个修复不改变「用 TP=4」的建议** —— 它的价值是让 TP=2 在必须使用时**算得对**，
+以及给上游一个精确的修复位置。
+
+> 该守卫是保守取值：只知道 2944 正确、3072 错误，边界就取 3072。真正的修法应该是
+> nkilib 修正 SBUF 会计，之后这个守卫可以放宽或删除。
+
+### 5.4 一个被排除的岔路：MLP kernel（记录以免他人重走）
 
 `vllm_neuron/functional/attention/qkv.py` 的 `_can_use_qkv_kernel` 里有一段注释，
 **明确承认这个 kernel 在某些尺寸比例下算错**：
@@ -180,7 +270,7 @@ TP=2 落进了未验证（且错误）的区间。这与注释里已知的失效
 `examples/vllm_neuron/accuracy/run_tensor_capture_qwen3_vl.py` 抓 TP=2 下 QKV 输出与
 PyTorch 参考对比。
 
-### 5.2 一个被排除的岔路（记录以免他人重走）
+
 
 先前注意到 TP=2 的图比 TP=4 少 **36 个** NKI kernel 调用（145 → 109，`rewrite_count`
 两者都是 189），而 36 正好等于文本层数，并追到了 `vllm_neuron/functional/mlp.py:196`
@@ -195,7 +285,7 @@ PyTorch 参考对比。
 算术精确对上 36 这个差值。**但这不是正确性 bug 的原因** —— 上表「TP=4 关 kernel」一行
 证明 PyTorch fallback 路径是对的。这个约束只造成 TP=2 下 prefill MLP 的**性能**损失。
 
-### 5.3 规避手段
+### 5.5 全局关闭 kernel 的开关
 
 `VLLM_NEURON_DISABLE_NKI_KERNELS=1` 能让 TP=2 输出正确，代价是性能：
 TPOT 43.88 → 53.62 ms（+22%）、TTFT 773 → 1895 ms（+145%）、吞吐 171.0 → 131.4 tok/s（−23%）。
@@ -300,7 +390,68 @@ That exonerates the TP sharding, the collectives and the weight loaders — none
 those change when kernels are disabled. The fault is an NKI kernel that computes
 the wrong thing at TP=2 shapes. The PyTorch fallbacks are all correct.
 
-**Prime suspect: the QKV kernel's size ratio.** `_can_use_qkv_kernel` in
+**Root cause confirmed: the NKI QKV kernel is wrong from fused_qkv_dim=3072 up.**
+Isolated with `qkv_kernel_isolation.py` (same directory, ~1 min): the same
+`NF.qkv_proj` on CPU takes the PyTorch branch and serves as golden, on device it
+takes the kernel. Identical results at T=512 and T=2048, so the threshold is
+sequence-length independent.
+
+| fused_qkv_dim | q/kv per rank | H | fused/H | rel err | verdict |
+|---|---|---|---|---|---|
+| 512 / 768 / 1536 / 2048 / 2560 / 2688 / 2816 / 2944 | — | 4096 | .125–.719 | .0011–.0068 | OK |
+| **3072** | 16/4 | 4096 | 0.750 | **1.0607** | **WRONG (TP=2)** |
+| 3072 | 20/2 | 4096 | 0.750 | 1.0607 | WRONG — split-independent |
+| 3072 | 16/4 | **8192** | **0.375** | 1.0051 | **WRONG — ratio-independent** |
+| 1536 | 8/2 | **2048** | **0.750** | 0.0045 | OK — ratio-independent |
+| 3584 | 20/4 | 4096 | 0.875 | — | loud compile error, see below |
+
+**The criterion is absolute fused_qkv_dim, not its ratio to H.** The last three
+rows settle it: 3072 is wrong at H=8192 (ratio 0.375) and 1536 is fine at H=2048
+(ratio 0.75). So the existing `fused_qkv_dim > H` guard uses the wrong criterion —
+it happens to catch TP=1 (6144 > 4096) but misses TP=2 (3072 < 4096), and it would
+wrongly admit 3072 at H=8192.
+
+**Why 3072 slips through: the kernel's own SBUF check is too optimistic.** At
+fused_qkv_dim=3584 the kernel fails loudly:
+
+```
+[NCC_INKI016] Kernel validation exception: SBUF budget exceeded even after
+reducing weight buffers: sbuf_tile_space_non_buffered=229380, available=212984
+```
+
+So there is an SBUF capacity check; its threshold is just set too high. Scaling
+229380 by 3072/3584 gives ~196k against 212,984 available, so 3072 passes
+validation and then computes garbage. The real fix belongs in nkilib's SBUF
+accounting, which is outside this repo.
+
+**Plugin-side fix (implemented and verified).** Replace the ratio guard with an
+absolute bound in `vllm_neuron/functional/attention/qkv.py`:
+
+```python
+_MIN_BROKEN_FUSED_QKV_DIM = 3072
+...
+if fused_qkv_dim >= _MIN_BROKEN_FUSED_QKV_DIM:
+    return False
+```
+
+Verified on the full model at TP=2, text-only: output is correct, and
+`kernel_call_count` drops 109 → 73, exactly 36 = num_hidden_layers, i.e. one QKV
+kernel per layer now taking the PyTorch path.
+
+| TP=2 config | output | TTFT p50 | TPOT p50 | tok/s |
+|---|---|---|---|---|
+| unpatched (kernels on) | garbage | 773 | 43.88 | 171.0 |
+| **patched** (QKV falls back) | **correct** | 1470 | 45.96 | **155.1** |
+| all kernels off (diagnostic) | correct | 1895 | 53.62 | 131.4 |
+| *TP=4 reference (kernels on)* | correct | 577 | 23.01 | **317.0** |
+
+Fixed TP=2 still runs at half of TP=4, as expected from halving the cores, so this
+does not change the recommendation to use TP=4 — its value is making TP=2 correct
+where TP=2 is the only option, and giving upstream an exact location. The bound is
+conservative: 2944 is verified good and 3072 verified bad, so the guard sits at
+3072.
+
+**Superseded hypothesis (kept so nobody re-walks it): the QKV kernel's size ratio.** `_can_use_qkv_kernel` in
 `vllm_neuron/functional/attention/qkv.py` already documents that this kernel
 "produces incorrect results when fused_qkv_dim is large relative to H ...
 Validated configurations have fused_qkv_dim <= H", and guards with

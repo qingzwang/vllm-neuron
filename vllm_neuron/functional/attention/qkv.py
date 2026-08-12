@@ -573,6 +573,12 @@ def _torch_qkv_impl(
         raise ValueError(f"Unsupported output layout: {output_layout}")
 
 
+# Smallest fused_qkv_dim at which the NKI QKV kernel is known to compute wrong
+# results. Its internal SBUF budget check only fires at 3584, so the 3072 case
+# passes validation and silently returns garbage. See _can_use_qkv_kernel.
+_MIN_BROKEN_FUSED_QKV_DIM = 3072
+
+
 def _can_use_qkv_kernel(
     hidden: Tensor,
     qkv_weights: Tensor,
@@ -616,10 +622,24 @@ def _can_use_qkv_kernel(
     if fused_qkv_dim > 4096:
         return False
 
-    # The kernel produces incorrect results when fused_qkv_dim is large
-    # relative to H (e.g., vision TP=1: H=1280, fused_qkv_dim=3*H=3840).
-    # Validated configurations have fused_qkv_dim <= H. Fall back to PyTorch
-    # when this is exceeded until the kernel is validated for larger ratios.
+    # The kernel silently computes wrong results from fused_qkv_dim=3072 upward,
+    # while its own SBUF budget check only starts rejecting at 3584 ("SBUF budget
+    # exceeded even after reducing weight buffers", NCC_INKI016). 3072 slips
+    # through that check and produces garbage, so guard it here.
+    #
+    # Measured against the PyTorch path (max relative error, bf16, H=4096,
+    # per-head QK RMSNorm + M-RoPE, identical at T=512 and T=2048):
+    #     fused_qkv_dim  1536  2048  2560  2944 | 3072 | 3584
+    #     rel error     .0038 .0041 .0045 .0068 | 1.04 | compile error
+    # The boundary tracks fused_qkv_dim alone, not its ratio to H: 3072 is also
+    # wrong at H=8192 (ratio 0.375), and 1536 is fine at H=2048 (ratio 0.75).
+    # This is what makes Qwen3-VL-8B wrong at TP=2 (per-rank fused_qkv_dim
+    # 3072) while TP=4 (1536) is correct.
+    if fused_qkv_dim >= _MIN_BROKEN_FUSED_QKV_DIM:
+        return False
+
+    # Kept for the ratio case the previous guard was written for (vision TP=1:
+    # H=1280, fused_qkv_dim=3840), now subsumed by the absolute bound above.
     if fused_qkv_dim > H:
         return False
 

@@ -178,6 +178,12 @@ async def run(args) -> dict:
                 "num_vision_tokens_buckets": [vision_bucket],
                 "vision_attention_block_size": PATCHES_PER_TILE,
                 "encoder_cache_num_blocks": encoder_cache_num_blocks,
+                # Default (1, 1) resolves to tp=1, dp=world_size. Raising vision
+                # tp shrinks the per-rank attention tensor by tp (16 heads split
+                # across ranks) and removes the dp-multiple tile padding, at the
+                # cost of an all-reduce per layer per residual branch.
+                "tp_size": args.vision_tp_size,
+                "dp_size": args.vision_dp_size,
             },
         },
     )
@@ -269,6 +275,8 @@ async def run(args) -> dict:
         "image_size": list(image.size),
         "batch_size": args.batch_size,
         "tensor_parallel_size": args.tensor_parallel_size,
+        "vision_tp_size": args.vision_tp_size,
+        "vision_dp_size": args.vision_dp_size,
         "max_tokens": args.max_tokens,
         "max_model_len": max_model_len,
         "max_num_batched_tokens": max_num_batched_tokens,
@@ -339,6 +347,14 @@ def main():
         "this is the single biggest TPOT regression on this plugin.",
     )
     p.add_argument("--encoder-cache-num-blocks", type=int, default=None)
+    p.add_argument(
+        "--vision-tp-size",
+        type=int,
+        default=1,
+        help="vision-encoder TP. 1 (with dp also 1) resolves to tp=1, "
+        "dp=world_size, which is the plugin default.",
+    )
+    p.add_argument("--vision-dp-size", type=int, default=1)
     p.add_argument(
         "--reuse-image",
         action="store_true",

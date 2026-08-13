@@ -6,10 +6,17 @@ LayerNorm, MLP, LayerScale) -> drop CLS.
 
 Simpler than the Qwen3-VL encoder in one important way: InternVL's dynamic
 tiling always emits **448x448 tiles**, so every item is exactly
-``grid_size**2 = 1024`` patches. There is no variable-length packing, no
-bin-packing across items and no block-local attention bounds — each tile is an
-independent sequence of a fixed length, so the whole batch is just
-``[num_tiles, 1 + 1024, hidden]`` and attention runs per tile.
+``grid_size**2 = 1024`` patches. There is no variable-length packing and no
+bin-packing across items — each tile is an independent sequence of a fixed
+length, so the whole batch is just ``[num_tiles, 1 + 1024, hidden]`` and
+attention runs per tile.
+
+Attention goes through ``NF.flash_attention``. A naive
+``softmax(q @ k^T) @ v`` here is correct but materialises
+``[tiles, heads, s, s]`` — 67 MB per tile at vision tp=1, so over 1 GB per layer
+at 16 tiles — and measured superlinear in the tile count even though the FLOPs
+are linear (see BENCHMARK_REPORT.md). Attention bounds are used only to mask the
+sequence padding that the kernel's tile alignment requires, not for packing.
 
 torch_neuronx replaces F.gelu/nn.GELU with a C extension that Dynamo cannot
 trace, so this module uses an erf-based equivalent (same approach as the
@@ -30,7 +37,9 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+import vllm_neuron.functional as NF
 from vllm_neuron.parallel.neuron_parallel_state import get_neuron_vision_tp_group
 from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
 
@@ -40,6 +49,13 @@ from .weight_loaders import (
     vis_qkv_bias_loader,
     vis_qkv_weight_loader,
 )
+
+# The sequence-packed attention kernel loads bounds in tiles of this size and reads
+# ceil(s / align) whole tiles, so the attention sequence length must be a multiple
+# of it or the NEFF bakes an out-of-bounds DMA that the runtime rejects at load.
+# InternViT's s is 1 + grid_size**2 = 1025, so the tower always pads (see
+# InternVisionModel.tower). Same constant and same reason as the Qwen3-VL encoder.
+_ATTN_SEQ_ALIGN = 128
 
 
 @torch.compiler.allow_in_graph
@@ -173,23 +189,46 @@ class InternVisionAttention(nn.Module):
             ),
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """[n, s, hidden] -> [n, s, hidden]."""
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        bound_min: torch.Tensor,
+        bound_max: torch.Tensor,
+    ) -> torch.Tensor:
+        """``[n, s, hidden] -> [n, s, hidden]``, attending within each tile.
+
+        Args:
+            hidden_states: ``[n, s, hidden]``, s already padded to
+                ``_ATTN_SEQ_ALIGN``.
+            bound_min: ``[n, s, 1]`` int32, inclusive lower KV bound per query.
+            bound_max: ``[n, s, 1]`` int32, exclusive upper KV bound per query.
+        """
         n, s, _ = hidden_states.shape
         h, d = self.num_heads_per_rank, self.head_dim
 
         qkv = torch.matmul(hidden_states, self.qkv_weight) + self.qkv_bias
         q, k, v = qkv.split(h * d, dim=-1)
-        # [n, s, h*d] -> [n, h, s, d]
-        q = q.reshape(n, s, h, d).transpose(1, 2)
-        k = k.reshape(n, s, h, d).transpose(1, 2)
-        v = v.reshape(n, s, h, d).transpose(1, 2)
+        # The kernel folds heads into the batch dim: [n, s, h*d] -> [n*h, s, d].
+        q = q.reshape(n, s, h, d).permute(0, 2, 1, 3).reshape(n * h, s, d)
+        k = k.reshape(n, s, h, d).permute(0, 2, 1, 3).reshape(n * h, s, d)
+        v = v.reshape(n, s, h, d).permute(0, 2, 1, 3).reshape(n * h, s, d)
 
-        attn = torch.matmul(q * self.scale, k.transpose(-2, -1))
-        attn = torch.softmax(attn.float(), dim=-1).to(self.dtype)
-        out = torch.matmul(attn, v)
-        # [n, h, s, d] -> [n, s, h*d]
-        out = out.transpose(1, 2).reshape(n, s, h * d)
+        # Bounds are per tile; the kernel wants them per (tile, head) row.
+        out = NF.flash_attention(
+            q,
+            k,
+            v,
+            scale=self.scale,
+            # <-- MODEL-SPECIFIC: InternViT attention is bidirectional.
+            causal_mask=False,
+            tp_q=True,
+            tp_k=True,
+            bound_min=bound_min.repeat_interleave(h, dim=0),
+            bound_max=bound_max.repeat_interleave(h, dim=0),
+        )
+
+        # [n*h, s, d] -> [n, s, h*d]
+        out = out.reshape(n, h, s, d).permute(0, 2, 1, 3).reshape(n, s, h * d)
 
         out = torch.matmul(out, self.proj_weight)
         # >>> PARALLELISM: row-parallel reduction, then the un-sharded bias <<<
@@ -284,8 +323,16 @@ class InternVisionEncoderLayer(nn.Module):
         self.ls1 = nn.Parameter(torch.empty(config.hidden_size, dtype=dtype))
         self.ls2 = nn.Parameter(torch.empty(config.hidden_size, dtype=dtype))
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = hidden_states + self.attn(self.norm1(hidden_states)) * self.ls1
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        bound_min: torch.Tensor,
+        bound_max: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states = (
+            hidden_states
+            + self.attn(self.norm1(hidden_states), bound_min, bound_max) * self.ls1
+        )
         hidden_states = hidden_states + self.mlp(self.norm2(hidden_states)) * self.ls2
         return hidden_states
 
@@ -325,10 +372,32 @@ class InternVisionModel(nn.Module):
     def tower(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """``[tiles, 3, H, W]`` -> ``[tiles, num_patches, vit_hidden]``, CLS dropped."""
         hidden_states = self.embeddings(pixel_values)
+        tiles, real_s, _ = hidden_states.shape
+
+        # The attention kernel reads bounds in tiles of _ATTN_SEQ_ALIGN and covers
+        # ceil(s / align) whole tiles, so an unaligned s bakes an out-of-bounds DMA
+        # into the NEFF that the runtime rejects at load. s here is
+        # 1 + grid_size**2 = 1025, which is never aligned, so always pad.
+        padded_s = -(-real_s // _ATTN_SEQ_ALIGN) * _ATTN_SEQ_ALIGN
+        if padded_s > real_s:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, padded_s - real_s))
+
+        # Every real query attends the whole real sequence: this is plain
+        # bidirectional attention within a tile, and the bounds exist only to hide
+        # the padding. Pad rows get bound_min == bound_max == 0 so they attend to
+        # nothing, and real bound_max stops at real_s so nothing attends them.
+        device = hidden_states.device
+        positions = torch.arange(padded_s, device=device)
+        is_real = (positions < real_s).to(torch.int32).reshape(1, padded_s, 1)
+        bound_min = torch.zeros(tiles, padded_s, 1, dtype=torch.int32, device=device)
+        bound_max = (is_real * real_s).expand(tiles, padded_s, 1).contiguous()
+
         for layer in self.layers:
-            hidden_states = layer(hidden_states)
-        # Drop the CLS token; only patch tokens feed the projector.
-        return hidden_states[:, 1:, :]
+            hidden_states = layer(hidden_states, bound_min, bound_max)
+
+        # Drop the CLS token and the alignment padding; only real patch tokens feed
+        # the projector.
+        return hidden_states[:, 1:real_s, :]
 
     def encode_tiles(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """``[tiles, 3, H, W]`` -> ``[tiles, embed_per_tile, llm_hidden]``."""

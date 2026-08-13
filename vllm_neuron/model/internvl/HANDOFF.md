@@ -162,21 +162,39 @@ its tensors on device, so only real requests hit it. `embed_multimodal` now move
 **Everything else in this file still holds**, and the earlier fixes are real:
 each was found by this same run failing earlier and louder.
 
-### Still to do
+### Measured and optimised — see `examples/vllm_neuron/models/internvl/BENCHMARK_REPORT.md`
 
-- **Latency numbers.** Nothing has been measured. `max_model_len` is the knob
-  that matters most: on Qwen3-VL, oversizing it cost 3x TPOT, because decode then
-  attends over the whole window per sequence. Size it to the actual prompt.
-- **Batch > 1.** Only `max_num_seqs=1` has run. Note the multi-`num_seqs_buckets`
-  hang recorded on the Qwen3-VL branch — one engine per batch size worked there.
-- **`encoder_cache_num_blocks`.** Set to 64 in the smoke test and never stressed.
-  The block-vs-token budget hazard below is what to expect when it is too small,
-  and it only shows up once several *distinct* images are in flight.
-- **More than 3 tiles.** 1 and 3 are covered; 13 (the bucket's worst case) is not.
+Latency is measured, correctness is checked against HF on real photos, and the
+vision encoder has been through one round of optimisation. Headlines:
+
+- 13 tiles, batch 1: TTFT **4733 -> 562 ms**; the vision encoder alone
+  **4546 -> 375 ms (12.1x)**. Batch 8 throughput 0.60 -> 1.07 req/s.
+- The win is `NF.flash_attention` in `InternVisionAttention`. The naive
+  `softmax(q@k^T)@v` was correct but materialised `[tiles, heads, s, s]` and was
+  measured **quadratic in the per-rank tile count** even though the FLOPs are
+  linear. It is linear now.
+- Two traps in that port: s = 1 + grid_size**2 = **1025 is never a multiple of
+  128**, so the tower must pad (the kernel reads bounds in whole 128-tiles and an
+  unaligned s bakes an out-of-bounds DMA into the NEFF that the runtime rejects at
+  load); and the bounds here exist **only** to mask that padding, unlike qwen3_vl
+  where they also do frame packing.
+- **Keep vision tp=1 / dp=4** (the default). tp=4/dp=1 is 4.2x *slower* — the
+  per-rank s x s tensor barely shrinks while every layer gains two all-reduces —
+  and tp=2/dp=2 hangs the vision graph on device with
+  `FATAL-RT-UNDEFINED-STATE`.
+- TPOT is 12.2-12.9 ms at batch 1 **regardless of image size**. At batch > 1 the
+  reported TPOT includes prefill interference, not just decode: it is
+  `(e2e - ttft) / (n-1)`, and one request's decode is interrupted by the others'
+  prefills.
 
 **Read the generated text before any latency number.** A wrong TP shard, a missed
 LayerScale or a mis-ordered pixel shuffle all produce plausible timings with
 garbage output — that failure mode cost real time on the Qwen3-VL branch.
+`compare_vs_hf.py` now automates that check against the HF reference.
+
+Still open: vision cost is still slightly superlinear at 4 tiles/rank (4.48x vs
+4x); the vision bucket is sized for one image so batched prefills serialise; and
+`encoder_cache_num_blocks` has not been stressed with many distinct images.
 
 ### Bugs the first on-device runs found and fixed
 

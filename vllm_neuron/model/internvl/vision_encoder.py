@@ -129,8 +129,10 @@ class InternVisionPatchEmbed(nn.Module):
 class InternVisionAttention(nn.Module):
     """Multi-head self-attention over one tile's fixed-length sequence.
 
-    Plain softmax attention with no mask: every tile attends within itself and
-    the batch dim already separates tiles.
+    Bidirectional and unmasked in substance — every tile attends within itself and
+    the batch dim already separates tiles. The only masking is the attention
+    bounds, which hide the sequence padding the kernel's tile alignment forces
+    (see ``_ATTN_SEQ_ALIGN`` and ``InternVisionModel.tower``).
     """
 
     def __init__(self, config: InternVLVisionConfig, dtype: torch.dtype) -> None:

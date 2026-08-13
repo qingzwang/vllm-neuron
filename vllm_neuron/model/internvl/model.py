@@ -287,6 +287,8 @@ class InternVLChatModel(nn.Module, SupportsVisionWarmup):
         image_num_patches: torch.Tensor | None = None,
         encoder_cache=None,
         mm_hashes: list[str] | None = None,
+        pixel_values_flat_video: torch.Tensor | None = None,
+        video_num_patches: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
         """Encode tiles and scatter the result into the on-device encoder cache.
@@ -295,17 +297,44 @@ class InternVLChatModel(nn.Module, SupportsVisionWarmup):
             pixel_values_flat: ``[total_tiles, 3, 448, 448]``, flat across images.
             image_num_patches: ``[num_images]`` — tiles belonging to each image.
             encoder_cache: ``EncoderCacheBlocks`` (buffer + allocate).
-            mm_hashes: One identifier per image, same order as image_num_patches.
+            mm_hashes: One identifier per item, same order as the count tensor.
+            pixel_values_flat_video: ``[total_frames, 3, 448, 448]``, video
+                equivalent of ``pixel_values_flat``.
+            video_num_patches: ``[num_videos]`` — frames belonging to each video.
 
         Every tile yields exactly ``embed_tokens_per_tile`` (256) tokens, so an
         image with n tiles occupies ``n * 256`` rows of the cache — no packing
         decisions to make, unlike Qwen3-VL's variable-size items.
+
+        Video needs no separate path. vLLM's video processor asserts exactly one
+        tile per frame (``video_to_pixel_values_internvl``), so a video arrives as
+        one tile per frame in the same layout an image uses, and a frame costs the
+        same 256 tokens as a tile. There is no temporal merging and no timestamp
+        text, so unlike Qwen3-VL a frame is just an independent single-tile image;
+        only the kwarg names differ.
         """
+        # The runner groups multimodal kwargs by modality, so exactly one pair
+        # arrives per call. Enforce it: silently dropping one modality would only
+        # surface as wrong output far downstream.
+        if pixel_values_flat is not None and pixel_values_flat_video is not None:
+            raise ValueError(
+                "embed_multimodal: cannot supply both pixel_values_flat and "
+                "pixel_values_flat_video in a single call; caller must group by "
+                "modality."
+            )
+        if pixel_values_flat is None and pixel_values_flat_video is not None:
+            pixel_values_flat = pixel_values_flat_video
+            image_num_patches = video_num_patches
+
         if pixel_values_flat is None:
-            raise ValueError("embed_multimodal requires pixel_values_flat")
+            raise ValueError(
+                "embed_multimodal requires pixel_values_flat (images) or "
+                "pixel_values_flat_video (video)"
+            )
         if image_num_patches is None or mm_hashes is None:
             raise ValueError(
-                "embed_multimodal requires image_num_patches and mm_hashes"
+                "embed_multimodal requires a per-item tile/frame count "
+                "(image_num_patches or video_num_patches) and mm_hashes"
             )
 
         per_tile = self.config.embed_tokens_per_tile
@@ -319,7 +348,7 @@ class InternVLChatModel(nn.Module, SupportsVisionWarmup):
         tiles = [int(n) for n in image_num_patches.tolist()]
         if sum(tiles) != pixel_values_flat.shape[0]:
             raise ValueError(
-                f"image_num_patches sums to {sum(tiles)} tiles but got "
+                f"per-item counts sum to {sum(tiles)} tiles/frames but got "
                 f"{pixel_values_flat.shape[0]} tile images"
             )
 

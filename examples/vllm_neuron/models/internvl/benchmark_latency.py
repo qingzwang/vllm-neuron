@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Latency benchmark for InternVL3-8B on Neuron: TTFT, TPOT, end-to-end.
 
-Runs ONE configuration per invocation (one batch size, one tile count) and appends
-a JSON record to --output. Loop it from the shell to build a sweep:
+Runs ONE configuration per invocation (one batch size, one tile/frame count) and
+appends a JSON record to --output. Loop it from the shell to build a sweep:
 
     for BS in 1 2 4 8; do
       python examples/vllm_neuron/models/internvl/benchmark_latency.py \
         --batch-size $BS --tiles 7 --output /tmp/internvl_latency.json
     done
+
+Video works through the same path: --video-frames 16 sends a 16-frame clip instead
+of an image. vLLM's video processor emits exactly one tile per frame, so N frames
+cost the same as N tiles and every sizing rule below is unchanged.
 
 One engine per process on purpose. Passing several num_seqs_buckets to a single
 engine hangs on the first request (recorded on the Qwen3-VL branch), and tearing
@@ -54,6 +58,12 @@ QUESTION = "Describe this image in detail."
 # each 2x2 patch neighbourhood, so one tile is a fixed 256 embed tokens.
 PATCHES_PER_TILE = 1024
 EMBEDS_PER_TILE = 256
+
+# On top of a tile's 256 embedding tokens, the prompt carries wrapper text per item
+# -- <img>/</img>, and for video a "FrameN: " prefix on every frame. The NxDI
+# reference for this workload budgets 258 tokens per image for the same reason. Only
+# used to add slack to max_model_len; the engine's real count is what gets reported.
+_WRAPPER_TOKENS_PER_ITEM = 8
 
 
 def build_image(tiles: int, image_size: int):
@@ -103,6 +113,20 @@ def build_image(tiles: int, image_size: int):
     return image
 
 
+def build_video(frames: int, image_size: int):
+    """Return ``[frames, size, size, 3]`` uint8.
+
+    vLLM's video processor asserts exactly one tile per frame, so frames need no
+    aspect-ratio games: a frame is a single tile whatever its size, and the tile
+    count is just the frame count.
+    """
+    import numpy as np
+
+    video = np.zeros((frames, image_size, image_size, 3), dtype=np.uint8)
+    video[:, :, :, :] = (90, 140, 200)
+    return video
+
+
 def tag_image(image, tag: int):
     """Make an image byte-unique so its mm_hash misses the encoder cache.
 
@@ -114,6 +138,37 @@ def tag_image(image, tag: int):
     return px
 
 
+def tag_video(video, tag: int):
+    """Byte-unique video, same reasoning as tag_image."""
+    out = video.copy()
+    out[0, 0, 0, :] = (tag & 0xFF, (tag >> 8) & 0xFF, (tag >> 16) & 0xFF)
+    return out
+
+
+def pad_question(tok, question: str, target_tokens: int) -> str:
+    """Grow the question to roughly ``target_tokens`` tokens.
+
+    Real prompts carry a long instruction, and text tokens share the prefill and the
+    decode window with the vision tokens. A one-line question understates both, so
+    this mirrors the NxDI reference workload's 500-token text padding.
+
+    The filler is plausible analysis instructions rather than repeated filler words,
+    so tokenisation stays representative.
+    """
+    filler = (
+        " Consider the interplay of light and shadow. Note any geometric patterns "
+        "or natural forms. Evaluate the balance between foreground and background. "
+        "Assess the emotional impact of the colour palette. Identify any visual "
+        "rhythm or repetition. Comment on the technical quality indicators visible."
+    )
+    while len(tok(question).input_ids) < target_tokens:
+        question += filler
+    ids = tok(question).input_ids
+    if len(ids) > target_tokens:
+        question = tok.decode(ids[:target_tokens])
+    return question
+
+
 async def run(args) -> dict:
     from transformers import AutoTokenizer
 
@@ -121,39 +176,68 @@ async def run(args) -> dict:
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
 
-    image = build_image(args.tiles, args.image_size)
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+
+    is_video = args.video_frames is not None
+    if is_video:
+        # One tile per frame, so the "tile count" that drives every sizing decision
+        # below is just the frame count.
+        num_tiles = args.video_frames
+        media = build_video(args.video_frames, args.image_size)
+        placeholder, modality = "<video>", "video"
+        shape_desc = f"{args.video_frames} frames of {args.image_size}x{args.image_size}"
+    else:
+        num_tiles = args.tiles
+        media = build_image(args.tiles, args.image_size)
+        placeholder, modality = "<image>", "image"
+        shape_desc = f"{media.size[0]}x{media.size[1]}"
+
+    question = QUESTION
+    if args.text_tokens:
+        question = pad_question(tok, question, args.text_tokens)
     prompt = tok.apply_chat_template(
-        [{"role": "user", "content": f"<image>\n{QUESTION}"}],
+        [{"role": "user", "content": f"{placeholder}\n{question}"}],
         tokenize=False,
         add_generation_prompt=True,
     )
 
-    # Size max_model_len to the workload; see the module docstring. The <image>
-    # placeholder expands to EMBEDS_PER_TILE tokens per tile.
+    # Workload accounting. EMBEDS_PER_TILE is the *embedding* cost of a tile; the
+    # prompt also carries per-item wrapper tokens (<img>/</img>, and for video a
+    # "FrameN: " prefix per frame), so the estimate below is a floor. The engine
+    # reports the true count and it goes in the record as prompt_tokens.
     text_tokens = len(tok(prompt).input_ids)
-    est_prompt_tokens = text_tokens + args.tiles * EMBEDS_PER_TILE
-    needed = est_prompt_tokens + args.max_tokens
+    est_vision_tokens = num_tiles * EMBEDS_PER_TILE
+    est_prompt_tokens = text_tokens + est_vision_tokens
+    # Slack for those wrapper tokens: enough that max_model_len does not have to be
+    # re-guessed per frame count, and small enough not to reintroduce the oversized
+    # window that costs TPOT.
+    needed = est_prompt_tokens + num_tiles * _WRAPPER_TOKENS_PER_ITEM + args.max_tokens
     # Round up to a multiple of 256, not to a power of two: a 7-tile prompt needs
     # ~2100 tokens, and the next power of two (4096) is nearly double that. Decode
     # attends over the whole window, so that slack is paid on every token.
     max_model_len = args.max_model_len or max(256, -(-needed // 256) * 256)
     max_num_batched_tokens = min(max_model_len, args.max_num_batched_tokens)
 
-    vision_bucket = args.tiles * PATCHES_PER_TILE
+    vision_bucket = num_tiles * PATCHES_PER_TILE
     # One block per item per tile, plus headroom: the scheduler admits items on a
     # token budget while the allocator works in blocks, so a tight number here
     # crashes mid-stream with "Encoder cache full" once several distinct images
     # are in flight.
     encoder_cache_num_blocks = args.encoder_cache_num_blocks or (
-        args.tiles * args.batch_size * 2 + 8
+        num_tiles * args.batch_size * 2 + 8
     )
 
     print(
-        f"config: tiles={args.tiles} image={image.size} batch={args.batch_size}\n"
-        f"        est_prompt_tokens={est_prompt_tokens} (text {text_tokens})\n"
-        f"        max_model_len={max_model_len} vision_bucket={vision_bucket}\n"
-        f"        encoder_cache_num_blocks={encoder_cache_num_blocks}",
+        f"workload: {modality} {shape_desc}, batch {args.batch_size}\n"
+        f"  text tokens        ~{text_tokens}\n"
+        f"  vision tokens      ~{est_vision_tokens} "
+        f"({num_tiles} x {EMBEDS_PER_TILE})\n"
+        f"  est. total input   ~{est_prompt_tokens} (floor; excludes per-item "
+        f"wrapper tokens)\n"
+        f"  output tokens       {args.max_tokens}\n"
+        f"  max_model_len       {max_model_len}\n"
+        f"  vision_bucket       {vision_bucket} raw patches\n"
+        f"  encoder_cache_blocks {encoder_cache_num_blocks}",
         flush=True,
     )
 
@@ -165,7 +249,7 @@ async def run(args) -> dict:
         max_num_seqs=args.batch_size,
         tensor_parallel_size=args.tensor_parallel_size,
         enable_prefix_caching=False,
-        limit_mm_per_prompt={"image": 1},
+        limit_mm_per_prompt={modality: 1},
         disable_log_stats=True,
         additional_config={
             "neuron_config": {
@@ -203,12 +287,11 @@ async def run(args) -> dict:
 
     async def one(req_id: str, tag: int) -> dict:
         nonlocal sample_text
-        payload = {
-            "prompt": prompt,
-            "multi_modal_data": {
-                "image": image if args.reuse_image else tag_image(image, tag)
-            },
-        }
+        if args.reuse_image:
+            item = media
+        else:
+            item = tag_video(media, tag) if is_video else tag_image(media, tag)
+        payload = {"prompt": prompt, "multi_modal_data": {modality: item}}
         start = time.perf_counter()
         ttft = None
         n_tokens = 0
@@ -271,8 +354,11 @@ async def run(args) -> dict:
 
     record = {
         "model": args.model,
-        "tiles": args.tiles,
-        "image_size": list(image.size),
+        "modality": modality,
+        "tiles": num_tiles,
+        "video_frames": args.video_frames,
+        "text_tokens_requested": args.text_tokens,
+        "media_shape": shape_desc,
         "batch_size": args.batch_size,
         "tensor_parallel_size": args.tensor_parallel_size,
         "vision_tp_size": args.vision_tp_size,
@@ -334,6 +420,22 @@ def main():
         "achievable block count.",
     )
     p.add_argument("--image-size", type=int, default=448)
+    p.add_argument(
+        "--video-frames",
+        type=int,
+        default=None,
+        help="send a video of N frames instead of an image. One tile per frame, so "
+        "N frames cost the same as N tiles; 16 is a 1-second 16fps clip. Overrides "
+        "--tiles.",
+    )
+    p.add_argument(
+        "--text-tokens",
+        type=int,
+        default=None,
+        help="pad the question to roughly this many tokens. Real prompts carry a "
+        "long instruction that shares the prefill and the decode window with the "
+        "vision tokens; the NxDI reference workload uses 500.",
+    )
     p.add_argument("--max-tokens", type=int, default=256)
     p.add_argument("--iters", type=int, default=5)
     p.add_argument("--warmup", type=int, default=1)

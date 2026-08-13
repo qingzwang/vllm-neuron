@@ -59,6 +59,75 @@ prefill；优化前后都实测过，确认它不受视觉侧改动影响（13 t
 162 vs 169 ms。tile 数落在 4 的倍数之间时多出来的 tile 基本免费，跨过一个倍数则跳
 一整档。
 
+## 2.5 Video
+
+Video 在这个实现里**不需要单独的代码路径**：vLLM 的 video processor 里有
+`assert len(pil_frame) == 1`，每帧固定 1 个 tile / 256 embed token，没有 temporal
+merging、没有时间戳文本（不像 Qwen3-VL）。所以一帧就是一张独立的单 tile 图，
+`embed_multimodal` 只需把 `pixel_values_flat_video` / `video_num_patches` 折到 image
+路径上。帧序由 `video_smoke_test.py` 用红→绿→蓝三段 clip 验证（帧序错了照样能产出流畅
+文字，必须专门验）。
+
+### 16 帧 448×448（1 秒 @16fps），256 输出 token
+
+| batch | TTFT mean | TTFT p99 | TPOT | E2E | 整批 wall | 吞吐 |
+|---|---|---|---|---|---|---|
+| 1 | 571 ms | 578 ms | 12.68 ms | 3804 ms | 3806 ms | 0.26 req/s |
+| 2 | 806 | 1037 | 13.79 | 4322 | 4360 | 0.46 |
+| 4 | 1310 | 2008 | 20.60 | 6563 | 6684 | 0.60 |
+| 8 | 2228 | 3745 | 27.75 | 9305 | 9781 | **0.82** |
+
+视觉编码剥离（帧数即 tile 数，dp=4 下 8 和 16 都无需补齐）：
+
+| 帧数 | 每 rank | TTFT 冷 | 缓存命中 | **视觉编码** |
+|---|---|---|---|---|
+| 8 | 2 | 281 ms | 126 ms | **155 ms** |
+| 16 | 4 | 571 | 228 | **343 ms** |
+
+与 image 侧一致：16 帧的 343 ms 对应 13 tiles 图的 375 ms（两者补齐后都是 16 tiles）。
+
+**500 token 文本 padding 几乎不影响**：TTFT 571 → 591 ms，TPOT 12.68 → 12.36。成本全在
+视觉 token，文本 token 便宜。
+
+### 达到 1 req/s 的配置
+
+16 帧 + 256 输出在 batch 8 只有 0.82 req/s，**不达标**。两个可行配置：
+
+| 配置 | max_model_len | TTFT | TPOT | E2E | 吞吐 |
+|---|---|---|---|---|---|
+| 16 帧, batch 8, **128** 输出 | 4608 | 2232 ms | 34.89 ms | 6663 ms | 1.12 req/s |
+| **8 帧, batch 8, 256 输出** | 2560 | **1096 ms** | 21.89 ms | 6678 ms | **1.16 req/s** |
+
+**推荐 8 帧（1 秒 clip 降到 8fps）**：吞吐相同，但 TTFT 只有一半（1096 vs 2232 ms），
+而且保留完整 256 输出 token。视觉 token 从 4096 砍到 2048，`max_model_len` 跟着从 4608
+降到 2560 —— 后者对 TPOT 的影响比前者更大。
+
+### 与 Qwen3-VL-8B 的对比：差距是架构性的
+
+同一台机器、同样 16 帧 448×448、256 输出 token（Qwen3-VL 数据见
+`benchmark/Qwen3-VL-8B` 分支）：
+
+| | Qwen3-VL-8B | InternVL3-8B |
+|---|---|---|
+| 视觉 token / clip | ~1300 | **4096**（16 × 256）|
+| prompt token | ~1651 | ~4150+ |
+| 视觉 bucket | 8192 raw patch | **16384** |
+| max_model_len | 2048 | 4608 |
+| TTFT (bs=1) | 294 ms | 571 ms |
+| TPOT (bs=1) | 11.35 ms | 12.68 ms |
+| batch 8 吞吐 | 1.11 req/s | 0.82 req/s |
+
+根因是 **InternVL3 没有 temporal merging**。Qwen3-VL 的 `temporal_patch_size=2` 把 16 帧
+合成 T=8 再做 2×2 空间 merge；InternVL3 每帧独立成 256 token，**同一个 clip 用掉约 2.5 倍
+视觉 token**。
+
+拖累的不是视觉编码器 —— flash attention 之后 343 ms 已经很快，比 Qwen3-VL 的视觉侧只慢
+一点。真正的代价是这 4096 个视觉 token 要流过文本骨干：prefill 更长，更关键的是
+`max_model_len` 被顶到 4608 而解码每个 token 都要在整个窗口上做 attention。所以 batch 8
+的 TPOT 反而更高（27.75 vs 23.96 ms），尽管视觉更快。
+
+**结论：做 1 秒实时视频，InternVL3 先天比 Qwen3-VL 贵**，达标要靠减帧数或减输出长度。
+
 ## 3. 优化前后对比
 
 | tiles | 每 rank | 视觉编码（原始） | 中间步：bf16 softmax | **flash attention** | 总加速 |
@@ -219,4 +288,9 @@ Qwen3-VL 上这一项曾造成 3.1× 的 TPOT 退化。2304 这种非 2 的幂�
   配，`_cap_encoder_budget_to_vision_bucket` 于是每个 prefill step 只放行一张图，batch
   的 prefill 串行 —— 这是 batch TTFT 随 batch 增长的原因。
 - **精度评测**：只做了 HF 对照，没跑基准集。
-- **多图 prompt**：`limit_mm_per_prompt={"image": 1}`。
+- **多图 prompt**：`limit_mm_per_prompt` 固定为 1。NxDI 上那个参考负载是
+  **15 张图 × 258 token + 500 文本 ≈ 4390 token**，和 16 帧 video（~4150）token 量级
+  接近但**不是同一场景** —— 多图每张最多 13 tile 且各自独立走 dynamic tiling，video 每帧
+  强制 1 tile。要和 NxDI 的数直接对比，得把 `limit_mm_per_prompt` 放开到 15 再测一轮。
+- **video 的 tile 上限**：每帧固定 1 tile 是 vLLM processor 的选择
+  (`assert len(pil_frame) == 1`)，没试过让帧走多 tile。

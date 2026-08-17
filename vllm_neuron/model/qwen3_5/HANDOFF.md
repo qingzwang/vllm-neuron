@@ -205,19 +205,110 @@ DeltaNet and gated-attention math, in vLLM's idiom, and unlike the NxDI referenc
 it is guaranteed consistent with the cache layout above. NxDI remains the
 reference for the **NKI kernels**, which vLLM has no equivalent of.
 
+## The model: implemented in torch, validated against HF on CPU
+
+`transformers` 5.14.1 ships `modeling_qwen3_5.py`, and it is a *better* oracle
+than the NxDI reference for everything except the NKI kernels: it has
+`torch_chunk_gated_delta_rule` and `torch_recurrent_gated_delta_rule` as plain
+functions, so the delta rule can be compared piece by piece rather than
+end-to-end. Both layer kinds were built against it first, in float32 on CPU, so
+that implementation error was ruled out before compilation ever entered the
+picture. Two check scripts under
+`examples/vllm_neuron/models/qwen3_5/` are the record of that:
+
+| script | covers |
+|---|---|
+| `check_deltanet_vs_hf.py` | our kernels vs HF's; module prefill vs HF's module, padded and not; decode replayed token-by-token vs prefill incl. both state carries; TP=4 vs TP=1 through the real loaders |
+| `check_attention_vs_hf.py` | zero-centred RMSNorm; partial interleaved mRoPE; attention prefill vs HF's module; MLP; decode replay vs prefill (paged KV scatter/gather); TP=4 vs TP=1 |
+
+Everything agrees to <= 1e-6 relative, and most of the attention pieces are
+bit-exact. Run both after any change to either layer — they are cheap (seconds,
+CPU) and they catch the whole class of "fluent but wrong" bug this model is
+prone to.
+
+**Run them with `PYTHONPATH=/mnt/nvme/vllm-neuron`.** The venv's editable
+install of `vllm_neuron` resolves through a static module map, so subpackages
+added after install time (`vllm_neuron.model.qwen3_5`) are invisible without it.
+
+### Things that would have silently produced wrong output
+
+- **`Qwen3_5RMSNorm` scales by `1 + weight`,** and the checkpoint's norm tensors
+  are distributed around 0 to match. The usual `weight * x` would multiply
+  activations by roughly zero. Applies to `input_layernorm`,
+  `post_attention_layernorm`, `q_norm`, `k_norm` and the final `norm` — but
+  **not** to the DeltaNet's output norm, which is HF's `Qwen3_5RMSNormGated` and
+  uses plain `weight`. Two different norms in one model.
+- **`q_proj` emits `[query | gate]` per head** (twice the query width) and the
+  attention output is scaled by `sigmoid(gate)` before `o_proj`. Because each
+  head's contribution is a contiguous `2 * head_dim` block, sharding q_proj's
+  output dim by whole heads keeps query and gate together.
+- **Rotary is partial**: only the first 64 of each head's 256 dims rotate. The
+  remaining 192 pass through. mRoPE sections `[11, 11, 10]` sum to
+  `rotary_dim / 2`, not `head_dim / 2`.
+- **The prefill padding mask comes from `positions`, not from new metadata.**
+  The runner pads a prefill by appending token id 0 with `positions` frozen at
+  the last real value, so a token is real iff
+  `positions[i] - positions[0] == i`. Zeroing `g` and `beta` at the pads makes
+  them exact no-ops (decay `exp(0) == 1`, delta 0), so the state written out is
+  the state after the last real token. Verified: a short prompt padded to a
+  bucket reproduces HF on the unpadded prompt.
+
+### The UT-transform inverse: do not use the Neumann series
+
+The in-chunk `(I - A)^-1` (HF's `attn` loop) looks like an easy win: `A` is
+strictly lower triangular, so `sum_j A^j` terminates and could be summed by
+repeated squaring as `prod (I + A^(2^i))` — 10 matmuls instead of 63 dependent
+slice-assignments, and slice-assignment-into-a-shared-tensor is exactly the
+pattern the NxDI reference flags as hitting neuronx-cc codegen failures.
+
+**It does not work.** With this checkpoint's weights `|A^16|` reaches 2.7e6
+while the true inverse has entries of magnitude 1, so the product loses every
+significant digit: measured 0.57 absolute error in float32, against 1.2e-7 for
+elimination. Symptom at the module level was a 8e-4 relative output error that
+looked like plausible rounding.
+
+`deltanet.py` uses the **blocked** form of the same elimination instead: keep
+`T` block diagonal and double the block width, so `T_L A_LU T_U` is a masked
+quadrant of `T @ A @ T`. Two matmuls per round, `log2(64) = 6` rounds, every
+intermediate a true inverse of a sub-problem so nothing grows. This is worth
+remembering when the NKI port lands: the kernel has to be stable in this same
+way, and a "clever" series expansion will pass a random-input test and fail on
+real weights.
+
+### Deliberately deferred
+
+- **No NKI kernels yet.** The delta rule is torch. The chunked prefill is
+  matmul-heavy so it should map reasonably, but this is the first thing to
+  measure. `nki_deltanet.py` (recurrent step) is the simplest starting point;
+  the fused multihead kernel is the one that breaks on vision embeddings later.
+- **Attention runs in torch too**, because `head_dim` 256 exceeds the flash
+  kernel's `MAX_HEAD_DIM` of 128 and the decode megakernel fuses a QKV
+  projection and full-width RoPE that do not match this layer's gate and partial
+  rotary. Only 6 of 24 layers.
+- **Padded decode rows** read and write the *last* state block, chosen because
+  `slot_mapping` is `-1` there and that is where `index_put_`'s negative-index
+  wrap already sends the attention path's padded writes. Verify at bring-up that
+  the last mamba block is not also handed to a live sequence.
+- **No prefix caching / chunked prefill.** Prefill starts from a zero state,
+  which matches what the attention path already assumes (its prefill is plain
+  causal flash attention with no prefix).
+- **Speculative decode** raises: the DeltaNet decode path wants one token per
+  request, and multi-token decode needs the recurrence stepped per draft token.
+
 ## Status
 
 - [x] Branch, checkpoint, reference clone
 - [x] `config.py`, validated against the real checkpoint
 - [x] `LayerSpec`/`KVSpec` + `MambaSpec` plumbing (spec emission + allocation)
-- [ ] DeltaNet layer + NKI kernel port
-- [ ] Gated GQA layer with partial interleaved mRoPE
-- [ ] Text-only bring-up at TP=4, HF cross-check
+- [x] DeltaNet layer, matched to HF in float32 (`deltanet.py`)
+- [x] Gated GQA layer with partial interleaved mRoPE (`model.py`)
+- [x] Text decoder, factory, registry entry
+- [ ] Text-only bring-up at TP=4 on device
+- [ ] NKI kernel port + latency measurement
 - [ ] VL stage
 
-Next: the DeltaNet layer. The state buffers now arrive as
-`kv_caches[layer_name] = [conv_state, recurrent_state]`, so the layer needs to read
-and write those in place, and the NKI kernel port decides how. Start from the
-reference's `nki_deltanet.py` (recurrent step, simplest) to get decode correct
-before taking on the chunked/fused prefill path — and remember the fused
-multihead kernel is the one that breaks on vision embeddings later.
+Next: bring-up on device at TP=4. The layers are numerically settled, so what is
+untested is everything the CPU checks cannot reach — compilation of the chunked
+recurrence, whether the hybrid KV cache manager actually creates the second
+group on the Neuron path, warmup for both groups, and the state-index convention
+for padded batch rows. Expect the first failures there rather than in the math.

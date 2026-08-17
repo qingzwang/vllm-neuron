@@ -238,77 +238,89 @@ def chunk_gated_delta_rule(
     if t % chunk_size:
         raise ValueError(f"sequence length {t} must be a multiple of {chunk_size}")
     num_chunks = t // chunk_size
+    bh = b * h
+    bhc = bh * num_chunks
+    device, dtype = query.device, query.dtype
 
-    query = query * (dk**-0.5)
+    # Everything below is deliberately kept at rank 3. neuronx-cc fails codegen
+    # on higher-rank matmul chains at these dimensions: the NxDI reference had to
+    # collapse its attention to (B*H, S, d) for exactly this reason
+    # ("NCC_INLA001: Expected 2D tensor but got 4D AP") and flags its own
+    # PyTorch chunked DeltaNet forward as hitting a codegen ICE "with these
+    # DeltaNet dimensions", defaulting to NKI kernels instead. The natural
+    # formulation here is rank 5 — [b, h, chunks, chunk, dim] — so fold the
+    # leading dims into one and index chunks by reshaping rather than slicing.
+    def chunked(x: torch.Tensor) -> torch.Tensor:
+        """``[b, h, t, d] -> [b*h*chunks, chunk, d]``: every chunk independent."""
+        return x.reshape(bhc, chunk_size, x.shape[-1])
 
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
+    query = chunked(query * (dk**-0.5))
+    key_c = chunked(key)
+    v_beta = chunked(value * beta.unsqueeze(-1))
+    k_beta = chunked(key * beta.unsqueeze(-1))
+    value_c = chunked(value)
+    g = g.reshape(bhc, chunk_size)
 
-    def to_chunks(x: torch.Tensor) -> torch.Tensor:
-        return x.reshape(b, h, num_chunks, chunk_size, x.shape[-1])
+    # Masks as float multiplies rather than tril/triu/masked_fill: one construct
+    # instead of three, and no bool tensors in the matmul chain.
+    rows = torch.arange(chunk_size, device=device).reshape(chunk_size, 1)
+    cols = torch.arange(chunk_size, device=device).reshape(1, chunk_size)
+    lower = (rows >= cols).to(dtype)  # i >= j, diagonal included
+    strictly_lower = (rows > cols).to(dtype)
 
-    query = to_chunks(query)
-    key = to_chunks(key)
-    value = to_chunks(value)
-    k_beta = to_chunks(k_beta)
-    v_beta = to_chunks(v_beta)
-    g = g.reshape(b, h, num_chunks, chunk_size)
+    # Cumulative log-decay within each chunk. A matmul with an upper-triangular
+    # ones matrix rather than ``torch.cumsum``: exact, and the plugin already
+    # prefers that form on Neuron (see ``NF.cumsum``, which falls back to matmul
+    # off-device for the same reason). ``chunk_size`` is 64, so this is tiny.
+    g = g @ (cols >= rows).to(dtype)
 
-    # Cumulative log-decay within each chunk, and the pairwise decay between
-    # positions i >= j. ``tril`` before ``exp`` keeps the upper triangle at
-    # exp(0) == 1; the second ``tril`` zeroes it.
-    #
-    # The cumsum is a matmul with an upper-triangular ones matrix rather than
-    # ``torch.cumsum``: exact, and the plugin already prefers that form on Neuron
-    # (see ``NF.cumsum``, which falls back to matmul off-device for the same
-    # reason). ``chunk_size`` is 64, so the matrix is tiny.
-    prefix_sum = torch.ones(
-        chunk_size, chunk_size, dtype=g.dtype, device=g.device
-    ).triu()
-    g = g @ prefix_sum
-    decay_mask = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().tril()
+    # Pairwise decay exp(g_i - g_j) for i >= j, zero above the diagonal. The
+    # mask is applied before the exp so the upper triangle is exp(0) == 1 rather
+    # than exp(+large), then zeroed.
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)) * lower).exp() * lower
 
-    strict_upper = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
-        diagonal=0,
-    )
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(
-        strict_upper, 0
-    )
+    # ``decay_mask`` already zeroes i < j, so the extra mask here only has to
+    # drop the diagonal.
+    attn = -((k_beta @ key_c.transpose(-1, -2)) * decay_mask) * strictly_lower
     # UT transform: turn the sequential in-chunk dependency into one matrix.
     t_mat = _strictly_lower_inverse(attn, chunk_size)
 
-    value = t_mat @ v_beta
+    value_c = t_mat @ v_beta
     k_cumdecay = t_mat @ (k_beta * g.exp().unsqueeze(-1))
 
-    state = initial_state.to(query.dtype)
-    causal_mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
-        diagonal=1,
-    )
+    # Regroup so a chunk index can be taken without slicing a rank-5 tensor:
+    # [b*h*chunks, chunk, d] -> chunks x [b*h, chunk, d].
+    def per_chunk(x: torch.Tensor) -> list[torch.Tensor]:
+        return list(x.reshape(bh, num_chunks, chunk_size, x.shape[-1]).unbind(1))
 
+    query_l = per_chunk(query)
+    key_l = per_chunk(key_c)
+    value_l = per_chunk(value_c)
+    k_cumdecay_l = per_chunk(k_cumdecay)
+    decay_l = list(
+        decay_mask.reshape(bh, num_chunks, chunk_size, chunk_size).unbind(1)
+    )
+    g_l = list(g.reshape(bh, num_chunks, chunk_size).unbind(1))
+
+    state = initial_state.reshape(bh, dk, dv).to(dtype)
     outputs = []
     for i in range(num_chunks):
-        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
-        # Intra-chunk contribution ...
-        attn_i = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill(
-            causal_mask, 0
-        )
-        v_new = v_i - k_cumdecay[:, :, i] @ state
+        q_i, k_i, v_i, g_i = query_l[i], key_l[i], value_l[i], g_l[i]
+        # Intra-chunk contribution. No causal masking needed: ``decay_l[i]``
+        # is already zero above the diagonal.
+        attn_i = (q_i @ k_i.transpose(-1, -2)) * decay_l[i]
+        v_new = v_i - k_cumdecay_l[i] @ state
         # ... plus what the state carried in from earlier chunks.
-        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ state
+        attn_inter = (q_i * g_i.unsqueeze(-1).exp()) @ state
         outputs.append(attn_inter + attn_i @ v_new)
 
-        state = (
-            state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(
-                -1, -2
-            )
-            @ v_new
-        )
+        g_last = g_i[:, -1:]
+        state = state * g_last.unsqueeze(-1).exp() + (
+            k_i * (g_last - g_i).unsqueeze(-1).exp()
+        ).transpose(-1, -2) @ v_new
 
-    output = torch.stack(outputs, dim=2).reshape(b, h, t, dv)
-    return output, state
+    output = torch.stack(outputs, dim=1).reshape(b, h, t, dv)
+    return output, state.reshape(b, h, dk, dv)
 
 
 def recurrent_gated_delta_rule_step(

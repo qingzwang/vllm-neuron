@@ -393,6 +393,43 @@ decided (the state write cannot matter until decode):
    worth confirming the device really keeps these tensors in float32 rather than
    demoting them despite `--auto-cast=none`.
 
+### Conclusion: the pure-torch chunked DeltaNet is not viable on Neuron
+
+Following the reference's TP/Neuron notes closed this out. `modeling_qwen35.py`
+line 3114 documents that it had to collapse attention to `(B*H, S, d)` because
+neuronx-cc fails codegen on rank-4 attention weights (`NCC_INLA001: Expected 2D
+tensor but got 4D AP`), and line 1912 says its own PyTorch `_chunk_forward`
+"can hit neuronx-cc codegen ICE NCC_INLA001 with these DeltaNet dimensions" —
+which is why `USE_NKI_FUSED` defaults to **1** and the torch path exists only
+for debugging. That is exactly the code this port started from.
+
+Measured here, both pure-torch formulations of the chunked delta rule fail, in
+opposite ways:
+
+| formulation | compiles | correct |
+|---|---|---|
+| rank 5, `[b, h, chunks, chunk, dim]` | yes | **no** — garbage from the first token |
+| rank 3, `[b*h*chunks, chunk, dim]` (the reference's documented remedy) | **no** — `neuronx-cc` 70 | exact on CPU |
+
+Both are numerically exact on CPU against HF (~1e-7), so this is a compiler
+limit, not a maths bug. **HEAD carries the rank-3 form, so it does not currently
+compile**; the rank-5 form is one `git revert` of the rank-3 commit away if you
+want a device-runnable (but wrong) build to keep bisecting with.
+
+The fix is therefore the same one the reference took: **port the NKI kernel**.
+That was already on the plan as a performance item; it turns out to be a
+correctness prerequisite. Start from `src/nki_kernels/nki_deltanet.py`
+(recurrent step — simplest, and enough to validate decode) before
+`nki_deltanet_fused.py` (the reference's default prefill path), and remember the
+fused *multihead* variant is the one that breaks on vision embeddings in the VL
+stage.
+
+Everything around the kernel is ready and verified, which is the good news: the
+spine is proven correct on device, both mixers are exact on CPU including at
+TP=4 through the real loaders, and `check_{deltanet,attention,model}_vs_hf.py`
+will validate an NKI kernel the moment it lands — swap it in behind
+`chunk_gated_delta_rule` and re-run them.
+
 ## Status
 
 - [x] Branch, checkpoint, reference clone
@@ -404,5 +441,6 @@ decided (the state write cannot matter until decode):
 - [x] Boots, compiles and generates at TP=4
 - [x] Spine (embed / MLP / norms / head / sampler / collectives) verified on device
 - [ ] **Correct output** — wrong from the first token; localised to a mixer
-- [ ] NKI kernel port + latency measurement
+- [ ] **NKI kernel port** — now a correctness prerequisite, not just perf
+- [ ] Latency measurement
 - [ ] VL stage

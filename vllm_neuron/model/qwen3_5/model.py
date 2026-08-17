@@ -373,6 +373,10 @@ class Qwen3_5Attention(nn.Module):
         k = k.repeat_interleave(self.num_kv_groups, dim=0)
         v = v.repeat_interleave(self.num_kv_groups, dim=0)
 
+        # Already rank 3 ([heads, tokens, tokens]), which is what neuronx-cc
+        # wants. ``masked_fill`` rather than ``torch.where``: the latter needs a
+        # materialised full-size sentinel tensor, and at T=1024 that is an extra
+        # [heads, 1024, 1024] float32 allocation the compiler did not accept.
         scores = (q.float() @ k.float().transpose(-1, -2)) * self.scaling
         causal = torch.ones(tokens, tokens, dtype=torch.bool, device=q.device).triu(1)
         scores = scores.masked_fill(causal, float("-inf"))
@@ -404,6 +408,7 @@ class Qwen3_5Attention(nn.Module):
         # -> [reqs, kv_heads, ctx, dim].
         blocks = block_table.to(torch.long)
         nkh = self.num_kv_heads_per_rank
+        nh = self.num_heads_per_rank
         k_ctx = self.k_cache[blocks].permute(0, 2, 1, 3, 4).reshape(
             num_reqs, nkh, -1, self.head_dim
         )
@@ -412,15 +417,25 @@ class Qwen3_5Attention(nn.Module):
         )
         ctx_len = k_ctx.shape[2]
 
-        q = q.transpose(0, 1).reshape(num_reqs, self.num_heads_per_rank, 1, self.head_dim)
-        k_ctx = k_ctx.repeat_interleave(self.num_kv_groups, dim=1)
-        v_ctx = v_ctx.repeat_interleave(self.num_kv_groups, dim=1)
+        # Fold (request, head) into one batch dim so the attention matmuls stay
+        # rank 3. The NxDI reference had to do the same — neuronx-cc fails
+        # codegen on rank-4 attention weights ("NCC_INLA001: Expected 2D tensor
+        # but got 4D AP").
+        rows = num_reqs * nh
+        q = q.transpose(0, 1).reshape(rows, 1, self.head_dim)
+        k_ctx = k_ctx.repeat_interleave(self.num_kv_groups, dim=1).reshape(
+            rows, ctx_len, self.head_dim
+        )
+        v_ctx = v_ctx.repeat_interleave(self.num_kv_groups, dim=1).reshape(
+            rows, ctx_len, self.head_dim
+        )
 
         scores = (q.float() @ k_ctx.float().transpose(-1, -2)) * self.scaling
         # Everything at or before this token's position is visible; the rest of
-        # the page is uninitialised.
-        key_positions = torch.arange(ctx_len, device=q.device).view(1, 1, 1, ctx_len)
-        visible = key_positions <= positions.view(num_reqs, 1, 1, 1)
+        # the page is uninitialised. Position 0 is always visible, so no row is
+        # ever fully masked and the -inf cannot turn into NaN.
+        key_positions = torch.arange(ctx_len, device=q.device).view(1, 1, ctx_len)
+        visible = key_positions <= positions.repeat_interleave(nh).view(rows, 1, 1)
         scores = scores.masked_fill(~visible, float("-inf"))
         attn = torch.softmax(scores, dim=-1).to(v_ctx.dtype)
         attn_output = (attn @ v_ctx).reshape(num_reqs, self.q_size)

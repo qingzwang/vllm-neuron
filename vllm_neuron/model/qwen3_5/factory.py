@@ -51,8 +51,6 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         text_neuron_config: NeuronConfig | None,
         vision_neuron_config: VisionNeuronConfig | None,
     ) -> nn.Module:
-        cls._validate_config(vision_neuron_config)
-
         from .model import Qwen3_5ForCausalLM
 
         return Qwen3_5ForCausalLM.from_configs(
@@ -61,15 +59,53 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             vision_neuron_config=vision_neuron_config,
         )
 
+    # ── vLLM's hybrid-model contract ─────────────────────────────────────
+    # vLLM asks the *registered* class — which is this one, not its own
+    # implementation — for the recurrent state geometry, and uses it to size the
+    # state pages the block planner allocates. Delegating to
+    # ``Mamba*Calculator`` is what keeps that sizing identical to what
+    # ``Qwen3_5TextConfig.state_shapes`` reports to the model runner; a second
+    # copy of the arithmetic would alias memory rather than raise.
+
     @classmethod
-    def _validate_config(cls, vision_neuron_config: VisionNeuronConfig | None) -> None:
-        # The runner only builds a VisionNeuronConfig when the engine was set up
-        # to serve images or video. Failing here beats accepting the request and
-        # answering from the text alone, which reads as a bad model rather than a
-        # missing feature.
-        if vision_neuron_config is not None:
-            raise NotImplementedError(
-                "Qwen3.5 on Neuron is text-only so far: the ViT tower is not "
-                "implemented. Start the engine without vision "
-                "(no limit_mm_per_prompt / vision bucket configuration)."
-            )
+    def get_mamba_state_shape_from_config(cls, vllm_config) -> tuple[tuple[int, ...], ...]:
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateShapeCalculator,
+        )
+
+        hf_text_config = vllm_config.model_config.hf_text_config
+        num_spec = (
+            vllm_config.speculative_config.num_speculative_tokens
+            if vllm_config.speculative_config
+            else 0
+        )
+        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+            vllm_config.parallel_config.tensor_parallel_size,
+            hf_text_config.linear_num_key_heads,
+            hf_text_config.linear_num_value_heads,
+            hf_text_config.linear_key_head_dim,
+            hf_text_config.linear_value_head_dim,
+            hf_text_config.linear_conv_kernel_dim,
+            num_spec,
+        )
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateDtypeCalculator,
+        )
+
+        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+            vllm_config.model_config.dtype,
+            vllm_config.cache_config.mamba_cache_dtype,
+            vllm_config.cache_config.mamba_ssm_cache_dtype,
+        )
+
+    # No vision guard here on purpose. There is no signal at construction time
+    # that distinguishes "the user configured vision" from "the checkpoint merely
+    # has a vision_config": the runner auto-derives a VisionNeuronConfig with
+    # num_vision_tokens_buckets for every such checkpoint, so both an
+    # `is not None` check and a bucket check reject a plain text-only launch.
+    # The text-only model simply does not implement ``embed_multimodal`` or
+    # ``SupportsVisionWarmup``, so a request carrying an image fails loudly
+    # rather than being answered from the text alone.

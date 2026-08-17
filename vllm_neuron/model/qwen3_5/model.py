@@ -681,6 +681,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         spec_decode_metadata=None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
+        # Accepted and ignored. The runner passes these for any checkpoint whose
+        # HF config has a vision_config, which this one does even though the
+        # tower is not implemented yet; refusing them would block a text-only
+        # launch. Requests carrying images are rejected at the frontend instead —
+        # see the limit_mm_per_prompt in examples/.../qwen3_5/run.py. Consuming
+        # them is the VL stage's job.
+        vision_embedding_blocks: tuple[torch.Tensor, ...] | None = None,
+        vision_positions: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         positions = positions.to(torch.int32)
 

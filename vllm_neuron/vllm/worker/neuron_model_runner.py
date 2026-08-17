@@ -7744,12 +7744,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                         # typed_tensor[0] and typed_tensor[1] are views into this tensor
                         self._kv_cache_full_tensors[layer_name] = typed_tensor
 
-            # Recurrent-state layers (gated DeltaNet / Mamba). Each state tensor is
-            # strided out of the layer's raw page-aligned buffer, with the block
-            # dim striding by a whole page so successive blocks stay page-aligned
-            # and successive states sit at increasing offsets *within* a page.
-            # Mirrors vLLM's own gpu_model_runner branch exactly — the planner
-            # sized these pages, so the layout has to agree with it.
+            # Recurrent-state layers (gated DeltaNet / Mamba).
+            #
+            # vLLM's own gpu_model_runner strides each state tensor out of the
+            # layer's raw buffer with the block dim striding by a whole page, so
+            # each block stays page-aligned and one block's states sit together
+            # inside its page. **Neuron device tensors reject that**: the runtime
+            # raises "Detected non-contiguous slicing for requested Device
+            # Tensor" for any view whose stride is not the natural one.
+            #
+            # So lay the states out one after another instead — every block's
+            # conv state, then every block's recurrent state — which leaves each
+            # tensor contiguous. Safe only because nothing outside the model
+            # reads them: vLLM's stake in the layout is the *page size*, which is
+            # unchanged, so the planner's block accounting still holds, and its
+            # per-block state-copy hooks are inactive at
+            # ``mamba_cache_mode == "none"``. Revisit if prefix caching over
+            # recurrent state is ever enabled — those hooks are what it needs.
             elif isinstance(kv_cache_spec, MambaSpec):
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
@@ -7757,28 +7768,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
 
                     state_tensors = []
-                    storage_offset_bytes = 0
+                    offset_bytes = 0
                     for shape, dtype in zip(
                         kv_cache_spec.shapes, kv_cache_spec.dtypes
                     ):
                         dtype_size = get_dtype_size(dtype)
-                        num_element_per_page = (
-                            kv_cache_spec.page_size_bytes // dtype_size
+                        assert offset_bytes % dtype_size == 0, (
+                            f"state offset {offset_bytes} is misaligned for "
+                            f"{dtype}; order the shapes widest-dtype-first"
                         )
-                        target_shape = (num_blocks, *shape)
-                        stride = torch.empty(target_shape).stride()
-                        target_stride = (num_element_per_page, *stride[1:])
-                        assert storage_offset_bytes % dtype_size == 0
+                        numel = num_blocks * math.prod(shape)
+                        start = offset_bytes // dtype_size
                         state_tensors.append(
-                            torch.as_strided(
-                                raw_tensor.view(dtype),
-                                size=target_shape,
-                                stride=target_stride,
-                                storage_offset=storage_offset_bytes // dtype_size,
+                            raw_tensor.view(dtype)[start : start + numel].view(
+                                num_blocks, *shape
                             )
                         )
-                        storage_offset_bytes += stride[0] * dtype_size
+                        offset_bytes += numel * dtype_size
 
+                    assert offset_bytes <= raw_tensor.numel()
                     kv_caches[layer_name] = state_tensors
 
             # Spec decoding specifically use this because hidden_size of different layers

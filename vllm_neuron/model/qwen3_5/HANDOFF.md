@@ -156,12 +156,68 @@ for 2B.
   matching prefix is normal for bf16 vs an independent implementation, whereas
   divergence in the first few tokens is a bug.
 
+## Spec plumbing: done, and most of it was free
+
+vLLM already does the hard part. Measured on this box with the real checkpoint at
+TP=4:
+
+    is_hybrid: True                  <- derived from the HF config
+    mamba_block_size: 1024           <- set on the Neuron path (= max_model_len,
+                                        i.e. one block per sequence)
+    mamba_page_size_padded: None
+    mamba_cache_mode: 'none'
+
+`ModelConfig.is_hybrid` comes from the HF config, and
+`Platform._align_hybrid_block_size` fills in `mamba_block_size` /
+`mamba_page_size_padded` before the runner is asked for specs. **Do not recompute
+either** — the planner has already sized the pages from those values.
+
+What was added here:
+
+- `RecurrentLayerSpec` (name, shapes, dtypes) and
+  `KVSpec.recurrent_layers` in `vllm_neuron/model/kv_cache.py`. Purely additive
+  with a default of `[]`, so the five existing models that build
+  `KVSpec(layers=...)` are untouched.
+- A `MambaSpec` branch in the runner's `get_kv_cache_spec`, reading block size and
+  padding from `cache_config`.
+- A `MambaSpec` branch in the runner's `initialize_kv_cache`, striding each state
+  tensor out of the layer's raw page-aligned buffer (block dim strides by a whole
+  page; successive states sit at increasing offsets within a page). Copied from
+  vLLM's own `gpu_model_runner` branch on purpose.
+
+Verified end to end: 6 attention + 18 recurrent layers, per-rank state
+`conv (3, 1536) bf16` and `recurrent (4, 128, 128) fp32`, 0.271 MB per recurrent
+layer per sequence per rank → **4.88 MB per sequence per rank** for all 18.
+
+### The mistake worth not repeating
+
+The first version of `config.py` derived the state shapes by hand and got the conv
+state **transposed and unsharded**: `[conv_dim, kernel-1]` = `(6144, 3)` where vLLM
+uses `[kernel-1, conv_dim/tp]` = `(3, 1536)`. Because vLLM sizes the state *pages*
+from `MambaStateShapeCalculator` via
+`model_cls.get_mamba_state_shape_from_config`, a divergent layout would not raise
+— it would alias memory. `Qwen3_5TextConfig.state_shapes(tp_size)` now delegates
+to that same calculator, which is the only way to be sure the two agree.
+
+Also note vLLM ships a full `vllm/model_executor/models/qwen3_5.py` implementing
+both `get_mamba_state_{shape,dtype}_from_config`. It is a second reference for the
+DeltaNet and gated-attention math, in vLLM's idiom, and unlike the NxDI reference
+it is guaranteed consistent with the cache layout above. NxDI remains the
+reference for the **NKI kernels**, which vLLM has no equivalent of.
+
 ## Status
 
 - [x] Branch, checkpoint, reference clone
 - [x] `config.py`, validated against the real checkpoint
-- [ ] `LayerSpec`/`KVSpec` + `MambaSpec` plumbing
+- [x] `LayerSpec`/`KVSpec` + `MambaSpec` plumbing (spec emission + allocation)
 - [ ] DeltaNet layer + NKI kernel port
 - [ ] Gated GQA layer with partial interleaved mRoPE
 - [ ] Text-only bring-up at TP=4, HF cross-check
 - [ ] VL stage
+
+Next: the DeltaNet layer. The state buffers now arrive as
+`kv_caches[layer_name] = [conv_state, recurrent_state]`, so the layer needs to read
+and write those in place, and the NKI kernel port decides how. Start from the
+reference's `nki_deltanet.py` (recurrent step, simplest) to get decode correct
+before taking on the chunked/fused prefill path — and remember the fused
+multihead kernel is the one that breaks on vision embeddings later.

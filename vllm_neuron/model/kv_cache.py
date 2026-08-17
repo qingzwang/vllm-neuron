@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -22,12 +22,45 @@ class LayerSpec:
 
 
 @dataclass
+class RecurrentLayerSpec:
+    """Cache specification for a layer that keeps recurrent state, not a KV cache.
+
+    Linear-attention layers (gated DeltaNet, Mamba) hold a **fixed-size** state
+    per sequence however long that sequence is, so they have no block table, no
+    per-token growth and no context length. ``LayerSpec`` cannot describe them:
+    ``num_kv_heads``/``head_size`` are meaningless here, and what matters instead
+    is the concrete state tensor shapes.
+
+    Shapes are per-rank and given in vLLM's own order — for gated DeltaNet that is
+    ``(conv_state, recurrent_state)``. Take them from
+    ``MambaStateShapeCalculator`` rather than deriving them: vLLM sizes the state
+    pages from the same helper, so a divergent layout aliases memory instead of
+    raising.
+
+    Attributes:
+        name: Layer name, matching the key vLLM uses for its cache tensor.
+        shapes: One shape per state tensor, per rank.
+        dtypes: One dtype per state tensor, same order as ``shapes``.
+    """
+
+    name: str
+    shapes: tuple[tuple[int, ...], ...]
+    dtypes: tuple[torch.dtype, ...]
+
+
+@dataclass
 class KVSpec:
     """
     Defines the KV cache needs of a model by specifying all layer configurations.
 
     Contains a list of LayerSpec objects that collectively define the complete
     KV cache requirements for an entire transformer model.
+
+    ``recurrent_layers`` is separate and defaults to empty so that purely
+    attention-based models are unaffected. Hybrid models (e.g. Qwen3.5, whose 24
+    layers are 18 DeltaNet + 6 attention) populate both lists; the two kinds of
+    layer land in different vLLM KV cache groups.
     """
 
     layers: list[LayerSpec]
+    recurrent_layers: list[RecurrentLayerSpec] = field(default_factory=list)

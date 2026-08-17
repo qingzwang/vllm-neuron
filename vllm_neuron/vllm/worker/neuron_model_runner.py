@@ -33,9 +33,11 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -7742,6 +7744,43 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                         # typed_tensor[0] and typed_tensor[1] are views into this tensor
                         self._kv_cache_full_tensors[layer_name] = typed_tensor
 
+            # Recurrent-state layers (gated DeltaNet / Mamba). Each state tensor is
+            # strided out of the layer's raw page-aligned buffer, with the block
+            # dim striding by a whole page so successive blocks stay page-aligned
+            # and successive states sit at increasing offsets *within* a page.
+            # Mirrors vLLM's own gpu_model_runner branch exactly — the planner
+            # sized these pages, so the layout has to agree with it.
+            elif isinstance(kv_cache_spec, MambaSpec):
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+
+                    state_tensors = []
+                    storage_offset_bytes = 0
+                    for shape, dtype in zip(
+                        kv_cache_spec.shapes, kv_cache_spec.dtypes
+                    ):
+                        dtype_size = get_dtype_size(dtype)
+                        num_element_per_page = (
+                            kv_cache_spec.page_size_bytes // dtype_size
+                        )
+                        target_shape = (num_blocks, *shape)
+                        stride = torch.empty(target_shape).stride()
+                        target_stride = (num_element_per_page, *stride[1:])
+                        assert storage_offset_bytes % dtype_size == 0
+                        state_tensors.append(
+                            torch.as_strided(
+                                raw_tensor.view(dtype),
+                                size=target_shape,
+                                stride=target_stride,
+                                storage_offset=storage_offset_bytes // dtype_size,
+                            )
+                        )
+                        storage_offset_bytes += stride[0] * dtype_size
+
+                    kv_caches[layer_name] = state_tensors
+
             # Spec decoding specifically use this because hidden_size of different layers
             # (draft and target model) are different.
             # https://github.com/vllm-project/vllm/pull/25101
@@ -7849,6 +7888,35 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     sliding_window=layer.sliding_window_size,
                 )
             all_kv_cache_specs[layer_name] = spec
+
+        # Hybrid models (e.g. Qwen3.5: 18 gated-DeltaNet + 6 attention layers)
+        # additionally report layers that keep fixed-size recurrent state instead
+        # of a KV cache. vLLM puts those in their own KV cache group.
+        #
+        # block_size and page_size_padded come from cache_config, which vLLM has
+        # already filled in for us: ModelConfig.is_hybrid is derived from the HF
+        # config, and Platform._align_hybrid_block_size then sets mamba_block_size
+        # (measured: 1024 for a 1024-token max_model_len, i.e. one block per
+        # sequence) and mamba_page_size_padded. Do not recompute either — the
+        # planner has already sized the pages from those values.
+        for rec_layer in getattr(target_kv_spec, "recurrent_layers", ()):
+            mamba_block_size = self.vllm_config.cache_config.mamba_block_size
+            if mamba_block_size is None:
+                raise ValueError(
+                    "cache_config.mamba_block_size is unset but the model "
+                    f"reports recurrent layer {rec_layer.name!r}. vLLM normally "
+                    "sets it for hybrid models; check that ModelConfig.is_hybrid "
+                    "is True for this checkpoint."
+                )
+            all_kv_cache_specs[rec_layer.name] = MambaSpec(
+                shapes=rec_layer.shapes,
+                dtypes=rec_layer.dtypes,
+                block_size=mamba_block_size,
+                page_size_padded=(
+                    self.vllm_config.cache_config.mamba_page_size_padded
+                ),
+                mamba_cache_mode=self.vllm_config.cache_config.mamba_cache_mode,
+            )
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)

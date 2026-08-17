@@ -111,28 +111,49 @@ class Qwen3_5TextConfig:
             + self.linear_num_value_heads * self.linear_value_head_dim
         )
 
-    @property
-    def recurrent_state_shape(self) -> tuple[int, int, int]:
-        """Per-sequence DeltaNet state: ``[v_heads, k_head_dim, v_head_dim]``.
+    def state_shapes(self, tp_size: int) -> tuple[tuple[int, ...], ...]:
+        """Per-rank ``(conv_state_shape, recurrent_state_shape)`` for one layer.
 
-        Fixed size regardless of sequence length — that is the whole point of a
-        linear-attention layer, and the reason these layers cannot use a paged KV
-        cache spec.
+        Delegated to vLLM's own ``MambaStateShapeCalculator`` rather than derived
+        here, deliberately. vLLM sizes the state *pages* from the same helper (via
+        ``Platform._align_hybrid_block_size`` ->
+        ``model_cls.get_mamba_state_shape_from_config``), so re-deriving the
+        shapes would risk a layout that disagrees with the pages the planner
+        allocated — a silent memory-aliasing bug rather than an error. A
+        hand-rolled version of this got the conv state transposed
+        (``[conv_dim, kernel-1]`` instead of ``[kernel-1, conv_dim]``) and
+        unsharded.
+
+        At TP=4 this checkpoint gives conv ``(3, 1536)`` and recurrent
+        ``(4, 128, 128)``: the 16 value heads shard 4-per-rank, and only
+        ``kernel - 1`` conv columns are carried between steps because the current
+        token supplies the last one.
         """
-        return (
-            self.linear_num_value_heads,
-            self.linear_key_head_dim,
-            self.linear_value_head_dim,
+        from vllm.model_executor.layers.mamba.mamba_utils import (
+            MambaStateShapeCalculator,
         )
 
-    @property
-    def conv_state_shape(self) -> tuple[int, int]:
-        """Per-sequence conv window: ``[conv_dim, kernel - 1]``.
+        return tuple(
+            MambaStateShapeCalculator.gated_delta_net_state_shape(
+                tp_size,
+                self.linear_num_key_heads,
+                self.linear_num_value_heads,
+                self.linear_key_head_dim,
+                self.linear_value_head_dim,
+                self.linear_conv_kernel_dim,
+                0,  # num_spec: the MTP head is not wired up
+            )
+        )
 
-        Only ``kernel - 1`` columns are carried between steps; the current token
-        supplies the last one.
+    def state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
+        """``(conv_dtype, recurrent_dtype)``.
+
+        The conv window holds activations so it follows the model dtype, while the
+        recurrent state accumulates over the whole sequence and uses
+        ``mamba_ssm_dtype`` (float32 in this checkpoint) to stop the delta rule
+        drifting.
         """
-        return (self.conv_dim, self.linear_conv_kernel_dim - 1)
+        return (self.torch_dtype, self.ssm_dtype)
 
     @classmethod
     def from_hf(cls, text_cfg: PretrainedConfig) -> Qwen3_5TextConfig:

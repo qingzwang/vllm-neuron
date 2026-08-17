@@ -28,6 +28,8 @@ expected performance ceiling for this model and is why they are only 6 of 24.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,6 +51,25 @@ from .config import Qwen3_5Config, Qwen3_5TextConfig
 from .deltanet import Qwen3_5GatedDeltaNet
 
 HF_TEXT_PREFIX = "model.language_model"
+
+# Sequence parallelism: the embedding scatters tokens across ranks and each
+# mixer/MLP all-gathers on entry and reduce-scatters on exit. Setting
+# VLLM_NEURON_QWEN35_DISABLE_SP=1 keeps the full sequence on every rank and
+# all-reduces instead — mathematically equivalent, just more memory and
+# bandwidth. Kept as a bisection tool: SP is the one part of this model the CPU
+# checks cannot exercise (they force world_size=1), so toggling it separates
+# "the collectives are misplaced" from every other hypothesis in one run.
+SEQUENCE_PARALLEL = os.environ.get("VLLM_NEURON_QWEN35_DISABLE_SP") != "1"
+
+# Bisection tool. VLLM_NEURON_QWEN35_ABLATE_MIXERS drops mixers so a reduced
+# model can be compared between device and CPU; the output is meaningless text
+# either way, only the agreement matters. Values: "all" (or "1") drops every
+# mixer, leaving embed -> (residual + MLP) x 24 -> norm -> lm_head, which
+# isolates the "spine" that the per-layer CPU checks cannot cover at TP>1;
+# "delta" and "attn" drop one mixer kind to say which of the two is at fault.
+ABLATE_MIXERS = os.environ.get("VLLM_NEURON_QWEN35_ABLATE_MIXERS", "")
+if ABLATE_MIXERS == "1":
+    ABLATE_MIXERS = "all"
 
 LINEAR_ATTENTION = "linear_attention"
 
@@ -333,7 +354,7 @@ class Qwen3_5Attention(nn.Module):
             return self.forward_decode(
                 hidden_states, positions, position_embeddings, metadata
             )
-        if self.world_size > 1:
+        if self.world_size > 1 and SEQUENCE_PARALLEL:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
         return self.forward_prefill(hidden_states, position_embeddings, metadata)
 
@@ -360,7 +381,10 @@ class Qwen3_5Attention(nn.Module):
 
         output = self._finish(attn_output, gate)
         if self.world_size > 1:
-            output = self.tp_group.reduce_scatter(output, dim=0)
+            if SEQUENCE_PARALLEL:
+                output = self.tp_group.reduce_scatter(output, dim=0)
+            else:
+                self.tp_group.all_reduce(output)
         return output.contiguous()
 
     def forward_decode(
@@ -450,7 +474,7 @@ class Qwen3_5MLP(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, is_prefill: bool) -> torch.Tensor:
         hidden_states = hidden_states.to(self.dtype)
-        if is_prefill and self.world_size > 1:
+        if is_prefill and self.world_size > 1 and SEQUENCE_PARALLEL:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
 
         out = (
@@ -459,7 +483,7 @@ class Qwen3_5MLP(nn.Module):
         ) @ self.down_proj_weight
 
         if self.world_size > 1:
-            if is_prefill:
+            if is_prefill and SEQUENCE_PARALLEL:
                 out = self.tp_group.reduce_scatter(out, dim=0).contiguous()
             else:
                 self.tp_group.all_reduce(out)
@@ -497,15 +521,22 @@ class Qwen3_5DecoderLayer(nn.Module):
         metadata = attn_metadata[self.mixer_name]
         is_decode = metadata["max_query_len"] <= metadata["decode_token_threshold"]
 
+        ablate = ABLATE_MIXERS == "all" or ABLATE_MIXERS == (
+            "delta" if self.is_linear_attention else "attn"
+        )
+
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        if self.is_linear_attention:
-            hidden_states = self.linear_attn(hidden_states, positions, attn_metadata)
-        else:
-            hidden_states = self.self_attn(
-                hidden_states, positions, position_embeddings, attn_metadata
-            )
-        hidden_states = residual + hidden_states
+        if not ablate:
+            hidden_states = self.input_layernorm(hidden_states)
+            if self.is_linear_attention:
+                hidden_states = self.linear_attn(
+                    hidden_states, positions, attn_metadata
+                )
+            else:
+                hidden_states = self.self_attn(
+                    hidden_states, positions, position_embeddings, attn_metadata
+                )
+            hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -562,7 +593,7 @@ class Qwen3_5TextModel(nn.Module):
         )
 
         hidden_states = self.embed_tokens(
-            input_ids, scatter_tokens=is_prefill, rank=rank
+            input_ids, scatter_tokens=is_prefill and SEQUENCE_PARALLEL, rank=rank
         )
         position_embeddings = self.rotary_emb(
             rotary_position_ids if rotary_position_ids is not None else positions,
@@ -575,7 +606,7 @@ class Qwen3_5TextModel(nn.Module):
             )
 
         hidden_states = self.norm(hidden_states)
-        if is_prefill and self.world_size > 1:
+        if is_prefill and self.world_size > 1 and SEQUENCE_PARALLEL:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
         return hidden_states
 

@@ -352,27 +352,46 @@ document claimed.
   Qwen3-VL decoder next door makes it too (plain causal `NF.flash_attention`,
   no segmentation) and works.
 
-### Remaining suspects, most likely first
+### Localised: the spine is correct on device, a mixer is not
 
-1. **Sequence parallelism.** The one thing the CPU checks cannot exercise: they
-   force `world_size = 1`, so every `all_gather` / `reduce_scatter` around the
-   mixers and the MLP is untested. In particular whether
-   `VocabDimShardedEmbedding(scatter_tokens=True)` scatters in contiguous chunks
-   such that `all_gather(dim=0)` restores token order.
-2. **The `lm_head` / `Sampler` pairing.** `gather_output=False` plus on-device
-   sampling means the sampler does a cross-rank argmax over vocab shards. Copied
-   from Qwen3-VL but never checked against a known-good logit.
-3. **Runner prefill conventions** beyond the padding mask — e.g. whether
-   `sampling_positions` lands on the last *real* token.
+Bisected with the ablation switch in `model.py`
+(`VLLM_NEURON_QWEN35_ABLATE_MIXERS`), comparing the *same reduced model* between
+device and CPU. Output text is meaningless under ablation; only the agreement
+matters. CPU references come from a short driver over
+`check_model_vs_hf.build_ours`.
 
-**Do the layer-by-layer diff, do not guess.** Each device run costs ~8 minutes,
-and four guess-and-check cycles bought nothing. Capture per-layer hidden states
-in `Qwen3_5TextModel.forward` for one fixed short prompt, run HF's
-`Qwen3_5ForCausalLM` on the same tokens on CPU, and diff. The first diverging
-layer names the bug directly. Note bisecting by TP is not available: **TP=1 fails
-to compile** (`neuronx-cc` exit 70, same as Qwen3-VL), and TP=2 is suspect on
-this plugin — see `[[qwen3-vl-only-works-at-tp4]]`, where TP=2 silently produced
-garbage.
+| experiment | result |
+|---|---|
+| SP disabled (`VLLM_NEURON_QWEN35_DISABLE_SP=1`) | **same first tokens** as SP on -> the collectives are not the bug |
+| depthwise `F.conv1d` -> unrolled taps, `cumsum` -> matmul | output unchanged (2 of 4 prompts byte-identical) -> those ops were not wrong |
+| all mixers ablated | device **matches CPU**: prompt 1 `'atches'` exactly, prompt 3 `'icals'` = CPU's #2 in a near-tie (bf16 vs fp32) |
+| DeltaNet ablated, attention kept | **does not compile** (`neuronx-cc` 70) |
+| attention ablated, DeltaNet kept | **does not compile** (`neuronx-cc` 70) |
+
+So embedding, MLP, norms, the vocab-sharded LM head, the sampler and every
+collective are **correct on device**, and the fault is inside a mixer. Note only
+"all mixers on" and "all mixers off" compile, so the two mixer kinds cannot be
+separated by ablation — bisect by *simplifying* a mixer instead, adding pieces
+back on top of the known-good ablated model (e.g. keep the DeltaNet's
+projections, conv and output stage but set `core = v` to remove the recurrence).
+
+Ranked suspects inside the DeltaNet prefill, which is where the first token is
+decided (the state write cannot matter until decode):
+
+1. **`_strictly_lower_inverse`** — 6 dependent rounds of masked batched matmuls
+   over `[1, 4, 16, 64, 64]`. Already made its identity operand contiguous
+   rather than an `expand_as` broadcast view, untested on device.
+2. **The 16-iteration chunk loop** carrying `state` — long dependent chain of
+   batched matmuls.
+3. **The `is_real` padding mask**, derived from `positions`. Worth noting *no
+   other model in this plugin reads `positions` during prefill* (Qwen3-VL uses it
+   only in decode), so the runner's prefill `positions` have never been exercised
+   before. Print them from inside the graph to confirm they are `0..L-1` then
+   frozen.
+4. Extreme dynamic range: `g` reaches -4.6 per token, so the in-chunk cumsum
+   reaches -297 and `exp` underflows to 0. Fine in float32 (CPU agrees), but
+   worth confirming the device really keeps these tensors in float32 rather than
+   demoting them despite `--auto-cast=none`.
 
 ## Status
 
@@ -383,6 +402,7 @@ garbage.
 - [x] Gated GQA layer with partial interleaved mRoPE (`model.py`)
 - [x] Text decoder, factory, registry entry
 - [x] Boots, compiles and generates at TP=4
-- [ ] **Correct output** — wrong from the first token, see above
+- [x] Spine (embed / MLP / norms / head / sampler / collectives) verified on device
+- [ ] **Correct output** — wrong from the first token; localised to a mixer
 - [ ] NKI kernel port + latency measurement
 - [ ] VL stage

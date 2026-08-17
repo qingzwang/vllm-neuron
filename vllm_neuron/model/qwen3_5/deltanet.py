@@ -30,6 +30,8 @@ stored transposed (``[in_features, out_features]``) so a forward pass is
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -42,6 +44,11 @@ from vllm_neuron.utils.weight_loader import (
 )
 
 from .config import Qwen3_5TextConfig
+
+
+# Mirrors ``model.SEQUENCE_PARALLEL``; read from the environment rather than
+# imported because ``model`` imports this module, not the other way round.
+SEQUENCE_PARALLEL = os.environ.get("VLLM_NEURON_QWEN35_DISABLE_SP") != "1"
 
 # Chunk length for the prefill recurrence. 64 is what HF's reference kernel
 # uses, and the UT-transform inverse below assumes a power of two.
@@ -178,7 +185,13 @@ def _strictly_lower_inverse(a: torch.Tensor, size: int) -> torch.Tensor:
     rows = torch.arange(size, device=a.device).reshape(size, 1)
     cols = torch.arange(size, device=a.device).reshape(1, size)
 
-    inv = torch.eye(size, dtype=a.dtype, device=a.device).expand_as(a)
+    # ``.expand_as`` would give the matmuls below a stride-0 batched operand.
+    # Materialise instead: it is a 64x64 tensor, so the copy is free, and a
+    # broadcast view feeding a batched matmul is the kind of construct worth not
+    # asking a compiler to handle.
+    inv = torch.eye(size, dtype=a.dtype, device=a.device).repeat(
+        *a.shape[:-2], 1, 1
+    )
     width = 1
     while width < size:
         # The (lower-half, upper-half) quadrant of every width-2*width block.
@@ -244,7 +257,15 @@ def chunk_gated_delta_rule(
     # Cumulative log-decay within each chunk, and the pairwise decay between
     # positions i >= j. ``tril`` before ``exp`` keeps the upper triangle at
     # exp(0) == 1; the second ``tril`` zeroes it.
-    g = g.cumsum(dim=-1)
+    #
+    # The cumsum is a matmul with an upper-triangular ones matrix rather than
+    # ``torch.cumsum``: exact, and the plugin already prefers that form on Neuron
+    # (see ``NF.cumsum``, which falls back to matmul off-device for the same
+    # reason). ``chunk_size`` is 64, so the matrix is tiny.
+    prefix_sum = torch.ones(
+        chunk_size, chunk_size, dtype=g.dtype, device=g.device
+    ).triu()
+    g = g @ prefix_sum
     decay_mask = (g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().tril()
 
     strict_upper = torch.triu(
@@ -515,6 +536,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         g = -self.A_log.exp() * F.softplus(a.float() + self.dt_bias)
         return qkv, z, beta, g
 
+    def _causal_conv(self, qkv: torch.Tensor, num_tokens: int) -> torch.Tensor:
+        """Depthwise causal conv over the token dim, as a sum of shifted taps.
+
+        ``out[t, c] = sum_j w[c, j] * x[t - (K - 1) + j, c]``, i.e. exactly what
+        ``F.conv1d(..., groups=conv_dim, padding=K-1)[..., :T]`` computes.
+
+        Written out rather than calling the grouped conv on purpose. A 1536-group
+        depthwise conv1d is an exotic shape for neuronx-cc, and the NxDI reference
+        avoids it too — it unrolls the taps in its cached paths and keeps its one
+        ``F.conv1d`` call behind a flag that defaults to off. Four slices and four
+        multiplies are trivially compilable, and this form also drops the two
+        transposes the conv layout needed.
+        """
+        padded = F.pad(qkv, (0, 0, self.conv_kernel_size - 1, 0))
+        out = padded[: num_tokens] * self.conv1d_weight[:, 0]
+        for tap in range(1, self.conv_kernel_size):
+            out = out + padded[tap : tap + num_tokens] * self.conv1d_weight[:, tap]
+        return out
+
     def _split_heads(
         self, mixed: torch.Tensor, leading: tuple[int, ...]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -561,7 +601,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         metadata = attn_metadata[self.layer_name]
         if metadata["max_query_len"] <= metadata["decode_token_threshold"]:
             return self.forward_decode(hidden_states, metadata)
-        if self.world_size > 1:
+        if self.world_size > 1 and SEQUENCE_PARALLEL:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
         return self.forward_prefill(hidden_states, positions, metadata)
 
@@ -594,14 +634,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # into the last few real positions.
         qkv = qkv * real_f32.to(qkv.dtype)
 
-        conv_in = qkv.transpose(0, 1).unsqueeze(0)  # [1, conv_dim, T]
-        conv_out = F.conv1d(
-            conv_in,
-            self.conv1d_weight.unsqueeze(1),
-            groups=self.conv_dim,
-            padding=self.conv_kernel_size - 1,
-        )[..., :num_tokens]
-        mixed = F.silu(conv_out).squeeze(0).transpose(0, 1)
+        mixed = F.silu(self._causal_conv(qkv, num_tokens))
 
         q, k, v = self._split_heads(mixed, (num_tokens,))
         beta = beta * real_f32
@@ -649,7 +682,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         output = self._output(core, z, num_tokens)
         if self.world_size > 1:
-            output = self.tp_group.reduce_scatter(output, dim=0)
+            if SEQUENCE_PARALLEL:
+                output = self.tp_group.reduce_scatter(output, dim=0)
+            else:
+                self.tp_group.all_reduce(output)
         return output.contiguous()
 
     def forward_decode(

@@ -34,6 +34,7 @@ import torch.nn.functional as F
 from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.nn as neuron_nn
+from vllm_neuron.model.interfaces import SupportsMRoPE
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, RecurrentLayerSpec
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
@@ -579,7 +580,7 @@ class Qwen3_5TextModel(nn.Module):
         return hidden_states
 
 
-class Qwen3_5ForCausalLM(nn.Module):
+class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
     """Text-only Qwen3.5 with a tied LM head.
 
     The checkpoint has ``tie_word_embeddings: true`` and genuinely ships no
@@ -625,6 +626,31 @@ class Qwen3_5ForCausalLM(nn.Module):
                 self.on_device_sampling_config,
                 process_group=self.tp_group.device_group,
             )
+
+    # ── mRoPE ────────────────────────────────────────────────────────────
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list,
+    ) -> tuple[torch.Tensor, int]:
+        """3D mRoPE positions for a text-only prompt.
+
+        vLLM derives ``uses_mrope`` from the HF config and then *requires* this
+        protocol, so a text-only port of an mRoPE model still has to provide it.
+        With no vision items the three axes carry identical values, which is
+        exactly what a plain 1D position sequence expands to, and the decode
+        offset is zero because the last position is ``len - 1``.
+        """
+        if mm_features:
+            raise NotImplementedError(
+                "Qwen3.5 on Neuron is text-only so far: mRoPE positions for "
+                f"{len(mm_features)} multimodal item(s) need the vision grid "
+                "layout. Launch with limit_mm_per_prompt={'image': 0, "
+                "'video': 0}."
+            )
+        positions = torch.arange(len(input_tokens), dtype=torch.int64)
+        return positions.unsqueeze(0).expand(3, -1).contiguous(), 0
 
     # ── KV / state cache ─────────────────────────────────────────────────
 
@@ -813,6 +839,20 @@ class Qwen3_5ForCausalLM(nn.Module):
             device,
             strict=False,
         ).state_dict
+
+        # The checkpoint loader is necessarily strict=False (it does not know
+        # about buffers like rotary inv_freq), which means a parameter whose
+        # mapping key is wrong stays at its uninitialised ``torch.empty`` value
+        # and the model generates fluent garbage with no error anywhere. Check
+        # explicitly instead.
+        expected = {name for name, _ in self.named_parameters()}
+        unfilled = sorted(expected - set(rank_sharded))
+        if unfilled:
+            raise RuntimeError(
+                f"{len(unfilled)} parameter(s) got no checkpoint tensor and "
+                f"would stay uninitialised: {unfilled[:8]}"
+                + (" ..." if len(unfilled) > 8 else "")
+            )
 
         # dt_bias / A_log stay float32 (they feed a softplus/exp whose result
         # decides the decay rate); everything else follows the model dtype.

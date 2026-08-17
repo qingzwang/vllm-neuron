@@ -259,6 +259,26 @@ class NeuronPlatform(Platform):
             logger.info("Defaulting optimization level to O1 on Neuron")
 
     @classmethod
+    def _multimodal_inputs_enabled(cls, model_config) -> bool:
+        """False when every modality's per-prompt limit is 0.
+
+        A vision-capable checkpoint can legitimately be served text-only — either
+        because the port has no vision tower yet (Qwen3.5) or because the
+        operator only wants text. ``limit_mm_per_prompt={"image": 0, "video": 0}``
+        is how that is expressed, and vision bucket resolution should then be
+        skipped entirely rather than validated against a text-sized
+        ``max_model_len``.
+        """
+        mm_config = getattr(model_config, "multimodal_config", None)
+        if mm_config is None:
+            return False
+        limits = getattr(mm_config, "limit_per_prompt", None) or {}
+        # vLLM normalises the raw ints into per-modality ``BaseDummyOptions``
+        # (which also carry profiling hints), so read ``.count`` when present.
+        counts = [int(getattr(limit, "count", limit)) for limit in limits.values()]
+        return not (counts and all(count == 0 for count in counts))
+
+    @classmethod
     def _resolve_vision_auto_config(
         cls, vllm_config: "VllmConfig", model_config
     ) -> None:
@@ -419,7 +439,14 @@ class NeuronPlatform(Platform):
         # already prevents overflow without needing this flag.
 
         if hasattr(model_config.hf_config, "vision_config"):
-            cls._resolve_vision_auto_config(vllm_config, model_config)
+            if cls._multimodal_inputs_enabled(model_config):
+                cls._resolve_vision_auto_config(vllm_config, model_config)
+            else:
+                logger.info(
+                    "All multimodal per-prompt limits are 0: skipping vision "
+                    "bucket resolution and serving %s text-only",
+                    model_config.architecture,
+                )
 
         # Compute per-image embed limit for request validation.
         # Buckets are in raw-token space; mm_pos.length is in embed space.

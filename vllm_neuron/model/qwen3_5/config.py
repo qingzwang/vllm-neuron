@@ -82,6 +82,10 @@ class Qwen3_5TextConfig:
     max_position_embeddings: int
     torch_dtype: torch.dtype
 
+    # Attached by ``Qwen3_5Config.from_configs``; the model reads on-device
+    # sampling and logprob settings off it.
+    neuron_config: object | None = None
+
     @property
     def rotary_dim(self) -> int:
         """Rotary is applied to only the first ``rotary_dim`` dims of each head."""
@@ -327,3 +331,24 @@ class Qwen3_5Config:
             vision_start_token_id=getattr(hf_config, "vision_start_token_id", None),
             vision_end_token_id=getattr(hf_config, "vision_end_token_id", None),
         )
+
+    @classmethod
+    def from_configs(
+        cls,
+        hf_config: PretrainedConfig,
+        text_neuron_config: object | None = None,
+        vision_neuron_config: object | None = None,
+        *,
+        include_vision: bool = False,
+    ) -> Qwen3_5Config:
+        """Entry point used by the factory: HF config plus the runner's NeuronConfigs.
+
+        ``include_vision`` defaults to False because this port is text-only for
+        now; the ViT tower is parsed but not built, and a request carrying image
+        or video data is rejected by the factory rather than silently ignored.
+        """
+        config = cls.from_hf(hf_config, include_vision=include_vision)
+        config.text_config.neuron_config = text_neuron_config
+        config.neuron_config = text_neuron_config
+        config.vision_neuron_config = vision_neuron_config
+        return config

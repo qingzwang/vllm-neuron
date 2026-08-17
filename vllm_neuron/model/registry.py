@@ -4,6 +4,7 @@ import os
 from .llama3 import LlamaForCausalLM
 from .gpt_oss import GptOssForCausalLM
 from .llama3 import Eagle3LlamaForCausalLM
+from .qwen3_5 import Qwen3_5ForConditionalGeneration
 from .qwen3_vl import Qwen3VLForConditionalGeneration
 
 
@@ -21,6 +22,7 @@ def get_models() -> list[tuple[str, type]]:
         ("GptOssForCausalLM", GptOssForCausalLM),
         ("Eagle3LlamaForCausalLM", Eagle3LlamaForCausalLM),
         ("Qwen3VLForConditionalGeneration", Qwen3VLForConditionalGeneration),
+        ("Qwen3_5ForConditionalGeneration", Qwen3_5ForConditionalGeneration),
     ]
 
     # SyntheticNeuronModel is a testing-only model that replaces real neural

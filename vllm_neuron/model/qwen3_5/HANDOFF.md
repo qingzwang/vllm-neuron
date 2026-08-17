@@ -295,6 +295,85 @@ real weights.
 - **Speculative decode** raises: the DeltaNet decode path wants one token per
   request, and multi-token decode needs the recurrence stepped per draft token.
 
+## Bring-up: it runs, and the output is wrong
+
+`examples/vllm_neuron/models/qwen3_5/run.py` boots, compiles, warms up both KV
+cache groups on all 4 ranks and generates, exit 0. **Generation is wrong from the
+first token** — "The capital of France is" → " most". By the rule below, first-token
+divergence is a bug, not bf16 noise.
+
+Five plumbing fixes were needed to get that far; the first two are the
+interesting ones and both are corrections to what an earlier version of this
+document claimed.
+
+1. **vLLM's hybrid page-size alignment never runs on the Neuron path.**
+   `Platform._align_hybrid_block_size` grows the attention block size until its
+   page is at least the state page, then pads the state page to match — but vLLM
+   gates it on `_find_non_ssm_backend` finding one of *its own* attention
+   backends, and this platform registers none. Without it startup dies in
+   `unify_kv_cache_spec_page_size`, because a DeltaNet state page is 271360
+   bytes per rank and that factors as `1024 * 5 * 53`, so no sane block size
+   divides it. `Platform.update_block_size_for_backend` now calls vLLM's helper
+   directly with a stub backend supplying the one method it reads. Effect at
+   TP=4: **block_size 32 → 288**, `mamba_page_size_padded` None → 294912, 8.68%
+   state padding. Call vLLM's implementation rather than copying the arithmetic:
+   the same helper sizes the pages the planner allocates.
+2. **Neuron device tensors reject vLLM's state layout.** Its `gpu_model_runner`
+   strides each state tensor so the block dim steps by a whole page; the runtime
+   answers "Detected non-contiguous slicing for requested Device Tensor". The
+   runner now lays the states out one after another so each is contiguous. Sound
+   only because nothing outside the model reads them — the page size is
+   unchanged so the planner's accounting holds, and the per-block state-copy
+   hooks are inactive at `mamba_cache_mode == "none"`.
+3. Vision bucket resolution ran for a text-only launch of a vision-capable
+   checkpoint and then failed validating a 2048 vision block against a 1024 text
+   `max_model_len`. Now skipped when every `limit_mm_per_prompt` count is 0. Note
+   those counts are `BaseDummyOptions` objects, not ints.
+4. vLLM derives `uses_mrope` from the HF config and then *requires* the
+   `SupportsMRoPE` protocol, so even a text-only port must implement it.
+5. The runner passes `vision_embedding_blocks`/`vision_positions` to any model
+   whose HF config has a `vision_config`. Accepted and ignored.
+
+### What is ruled out, with evidence
+
+- **Both layer kinds.** Bit-exact or ~1e-7 against HF on CPU in float32,
+  including TP=4 through the real weight loaders. See the check scripts above.
+- **Weight loading completeness.** All 320 referenced checkpoint keys exist, and
+  `load_weights` now raises if any parameter got no tensor — it does not fire.
+  This mattered to check: the loader must be `strict=False` (it does not know
+  about buffers like rotary `inv_freq`), so a wrong mapping key would leave a
+  parameter at its uninitialised `torch.empty` value and produce exactly this
+  symptom with no error anywhere.
+- **Compiler downcasting.** The runner passes `--auto-cast=none`, so the float32
+  delta rule stays float32. This mattered because the in-chunk matrix has a
+  dynamic range that bf16 could not survive (see the Neumann note above).
+- **Packed prefills.** The DeltaNet padding mask and the attention causal mask
+  both assume one sequence per prefill forward. That assumption is safe: the
+  Qwen3-VL decoder next door makes it too (plain causal `NF.flash_attention`,
+  no segmentation) and works.
+
+### Remaining suspects, most likely first
+
+1. **Sequence parallelism.** The one thing the CPU checks cannot exercise: they
+   force `world_size = 1`, so every `all_gather` / `reduce_scatter` around the
+   mixers and the MLP is untested. In particular whether
+   `VocabDimShardedEmbedding(scatter_tokens=True)` scatters in contiguous chunks
+   such that `all_gather(dim=0)` restores token order.
+2. **The `lm_head` / `Sampler` pairing.** `gather_output=False` plus on-device
+   sampling means the sampler does a cross-rank argmax over vocab shards. Copied
+   from Qwen3-VL but never checked against a known-good logit.
+3. **Runner prefill conventions** beyond the padding mask — e.g. whether
+   `sampling_positions` lands on the last *real* token.
+
+**Do the layer-by-layer diff, do not guess.** Each device run costs ~8 minutes,
+and four guess-and-check cycles bought nothing. Capture per-layer hidden states
+in `Qwen3_5TextModel.forward` for one fixed short prompt, run HF's
+`Qwen3_5ForCausalLM` on the same tokens on CPU, and diff. The first diverging
+layer names the bug directly. Note bisecting by TP is not available: **TP=1 fails
+to compile** (`neuronx-cc` exit 70, same as Qwen3-VL), and TP=2 is suspect on
+this plugin — see `[[qwen3-vl-only-works-at-tp4]]`, where TP=2 silently produced
+garbage.
+
 ## Status
 
 - [x] Branch, checkpoint, reference clone
@@ -303,12 +382,7 @@ real weights.
 - [x] DeltaNet layer, matched to HF in float32 (`deltanet.py`)
 - [x] Gated GQA layer with partial interleaved mRoPE (`model.py`)
 - [x] Text decoder, factory, registry entry
-- [ ] Text-only bring-up at TP=4 on device
+- [x] Boots, compiles and generates at TP=4
+- [ ] **Correct output** — wrong from the first token, see above
 - [ ] NKI kernel port + latency measurement
 - [ ] VL stage
-
-Next: bring-up on device at TP=4. The layers are numerically settled, so what is
-untested is everything the CPU checks cannot reach — compilation of the chunked
-recurrence, whether the hybrid KV cache manager actually creates the second
-group on the Neuron path, warmup for both groups, and the state-index convention
-for padded batch rows. Expect the first failures there rather than in the math.

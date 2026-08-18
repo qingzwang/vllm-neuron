@@ -673,31 +673,55 @@ targeting ~72-78% of prefill. Decode still needs nothing.
 
 Two results, both worth keeping.
 
-### The kernel works and loses to torch
+### Two kernels vendored; the inverse algorithm is most of the story
 
-The reference's legacy single-head fused kernel is vendored verbatim at
-`nki_deltanet.py` and wired behind `VLLM_NEURON_QWEN35_ENABLE_NKI=1` (opt **in**;
-torch ships). `probe_nki_deltanet.py`, 4 heads on one rank:
+Both of the reference's chunked CTE kernels are vendored — `nki_deltanet.py` (its
+"legacy" one) and `nki_deltanet_fused.py` (its current one) — behind
+`VLLM_NEURON_QWEN35_ENABLE_NKI=1` with `VLLM_NEURON_QWEN35_NKI_VARIANT` selecting
+between them. Torch still ships. They differ only in how they apply the in-chunk
+`(I - A)^-1`, and that difference is 5.2x:
 
-| | torch | nki | |
+| variant | in-chunk inverse | ms/call | vs torch |
 |---|---|---|---|
-| seq 1024 | 0.99 ms | 9.72 ms | 0.10x |
-| seq 4096 | 2.95 ms | 37.51 ms | 0.08x |
+| torch | blocked elimination, 12 batched matmuls over all `(head, chunk)` pairs | **0.81** | — |
+| `fused` | **Neumann by power-doubling on 32x32 leaves** (`_leaf_inverse32_t`, 5 squaring rounds) then **Schur composition** 32 -> 64 -> 128 (`_offdiag_combine_t` = `left @ cross @ right`) | 1.86 | 0.43x |
+| `legacy` | forward substitution: 128 sequential steps, each a full 128x128x128 matmul with all but one row of the result masked away | 9.74 | 0.08x |
 
-It is *correct* — output within 1.2e-05 of the torch reference, final state within
-2.5e-06. It is a design mismatch, not a bug, and not launch overhead (the ratio
-gets worse with length). The kernel keeps the 128x128 state in SBUF across chunks
-to avoid HBM round-trips, so it walks one (batch, head) and one 128-token chunk at
-a time — 4 heads x 32 chunks = 128 sequential steps at seq 4096. The torch path
-folds every `(head, chunk)` pair into one batch dim and issues batched matmuls,
-256 instances at once, which is what the Tensor Engine wants. **The rank-3 rewrite
-done earlier for compiler reasons is what exposes that parallelism**, so it turned
-out to matter for a second reason.
+(4 heads, one rank, seq 1024. Both kernels are *correct*: output within 1.2e-05 of
+the torch reference, final state within 2.5e-06.)
 
-The reference's newer *multihead* kernel batches head groups and is its default for
-text — but it is the variant it documents as numerically unstable on vision
-embeddings, and it would have to beat this one by ~10x merely to draw level with
-torch. Not attempted for that reason.
+**Note the reference does use a Neumann series** — on 32x32 leaves, inside a
+hierarchical blocked scheme. That is not the same thing as the full-matrix
+repeated-squaring this port rejected in `_strictly_lower_inverse`: at 64x64
+unmasked, `|A^16|` reaches 2.7e6 and the product loses every digit (0.57 absolute
+error). Confined to a 32x32 leaf the same trick costs about 1.2e-3 — measured with
+this checkpoint's weights, against 1.2e-7 for elimination — which the recurrence
+then damps to 1.2e-05 end to end. Both statements are true and the earlier wording
+here, which said flatly that Neumann "is not usable", was too broad.
+
+**Why the fused kernel still loses.** Not the inverse any more — the serial
+structure. Each kernel is one launch per `(batch, head)` and walks chunks with
+`sequential_range`, because its design goal is keeping the 128x128 state in SBUF
+across chunks. The torch path folds every `(head, chunk)` pair into one batch
+dimension and issues batched matmuls, so its serial region holds only four small
+matmuls per chunk. HF's factorisation is what permits that:
+`v_new = T @ v_beta - (T @ (k_beta * e^g)) @ state` keeps both `T` applications
+free of `state`, so they hoist out of the loop; the kernels solve
+`(I - A) v_new = rhs(state)` instead, which pins the solve inside it.
+
+The reference's *multihead* variant batches head groups — the missing ~4x, which
+could plausibly close the remaining 2.3x. It is also the variant it documents as
+numerically unstable on real vision embeddings, so this port does not use it.
+
+**One hypothesis tested and refuted.** If leaf Neumann were the cause of that
+instability, vision embeddings should produce a worse-conditioned `A`. Measured
+with the real tower's output fed into layer 0: they do not — `|A_leaf^8|` is 4907
+on vision against 7027 on text, and the leaf-Neumann error is 1.17e-3 against
+1.27e-3. The reason is that `k` is L2-normalised, so `A` is nearly invariant to
+input magnitude, even though the vision embeddings themselves are 10x larger in RMS
+(0.152 vs 0.015). That independently corroborates the reference's own observation
+that random vectors at the same std decode cleanly, and leaves its hazard still
+unexplained.
 
 ### TTFT is 63% fixed overhead, so the model was never the main cost
 

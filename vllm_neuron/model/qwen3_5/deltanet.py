@@ -210,61 +210,76 @@ def _nki_chunk_gated_delta_rule(
     beta: torch.Tensor,
     initial_state: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The same recurrence, on the vendored NKI kernel. **Off by default.**
+    """The same recurrence, on a vendored NKI kernel. **Off by default.**
 
-    Kept because the measurement is the useful part, and because a future kernel
-    would start here. Measured with ``probe_nki_deltanet.py`` (4 heads, one rank):
+    Two variants are vendored, differing only in how they apply the in-chunk
+    ``(I - A)^-1``. Measured with ``probe_nki_deltanet.py``, 4 heads on one rank,
+    seq 1024, against the torch path at 0.81 ms/call:
 
-        seq 1024:  torch 0.99 ms   nki  9.72 ms   (0.10x)
-        seq 4096:  torch 2.95 ms   nki 37.51 ms   (0.08x)
+    | variant | inverse | ms | vs torch |
+    |---|---|---|---|
+    | ``fused`` (default) | Neumann by power-doubling on 32x32 leaves, then Schur composition 32 -> 64 -> 128 | 1.86 | 0.43x |
+    | ``legacy`` | forward substitution: 128 sequential steps, each a full 128x128x128 matmul with all but one row masked away | 9.74 | 0.08x |
 
-    It is *correct* — output agrees with the torch reference to 1.2e-05 and the
-    final state to 2.5e-06 — just slow, and no better at longer sequences, so it
-    is not launch overhead.
+    Both are *correct* — output within 1.2e-05 of the torch reference, final state
+    within 2.5e-06.
 
-    The reason is algorithmic, not a bug in the kernel. Two differences compound.
+    So the inverse algorithm is most of the story: the hierarchical one is 5.2x
+    faster than forward substitution. What remains is the serial structure. Each
+    kernel is one launch per ``(batch, head)`` and walks chunks with
+    ``sequential_range`` — 4 heads x 8 chunks = 32 sequential chunk steps at seq
+    1024 — because its design goal is keeping the 128x128 state in SBUF across
+    chunks. The torch path instead folds every ``(head, chunk)`` pair into one
+    batch dimension and issues *batched* matmuls (64 instances at once), so its
+    serial region holds only four small matmuls per chunk. The rank-3 rewrite done
+    earlier for compiler reasons is what exposes that, so it mattered twice.
 
-    **The in-chunk triangular inverse.** Both paths must apply ``(I - A)^-1`` for a
-    strictly lower-triangular 128x128 (or 64x64) ``A``. This kernel does classical
-    forward substitution: ``P_MAX`` sequential steps, and because NKI wants static
-    shapes each step issues a *full* ``A^T @ v_new`` matmul and then masks all but
-    one row of the result (see ``nki_deltanet.py``, the ``nl.static_range(P_MAX)``
-    loop). So it spends 128 dense 128x128x128 matmuls to extract 128 rows. The
-    torch path uses the blocked elimination in ``_strictly_lower_inverse``: 12
-    batched matmuls in 6 dependent rounds, no wasted rows. Roughly 40x the
-    arithmetic, in 16384 sequential ops against 12 batched ones at seq 4096.
+    HF's factorisation is what allows the hoisting:
+    ``v_new = T @ v_beta - (T @ (k_beta * e^g)) @ state`` keeps both applications
+    of ``T`` free of ``state``, so they can be computed for every chunk before the
+    sequential loop. The kernels solve ``(I - A) v_new = rhs(state)`` with state on
+    the right-hand side — same algebra, but it pins the solve inside the loop.
 
-    **Where that inverse sits relative to the state recurrence.** HF's factorisation
-    — which the torch path follows — writes
-    ``v_new = T @ v_beta - (T @ (k_beta * e^g)) @ state``, so both applications of
-    ``T`` are computed for *every* chunk before the sequential loop starts, batched
-    over all ``(head, chunk)`` pairs. The kernel instead solves
-    ``(I - A) v_new = v_beta - (k_beta * e^g) @ state`` with ``state`` on the
-    right-hand side, which is algebraically the same but forces the solve *inside*
-    the serial loop. The torch loop is then left with only four small matmuls per
-    chunk (the state carry); the kernel's carries 128 large ones.
+    The reference's *multihead* variant in ``nki_deltanet_fused.py`` batches head
+    groups, which is the missing factor of ~4 and could plausibly close the
+    remaining 2.3x. It is also the variant the reference documents as numerically
+    unstable on real vision embeddings, and this port has working VL, so it is not
+    used. Worth noting for anyone who tries: the leaf-Neumann inverse carries about
+    1.2e-3 absolute error with this checkpoint's weights (against 1.2e-7 for the
+    blocked elimination in ``_strictly_lower_inverse``), yet end-to-end output
+    still lands within 1.2e-05 — the recurrence damps it. And measured on real
+    vision embeddings from the tower, ``A`` is *not* worse conditioned than on text
+    (``|A_leaf^8|`` 4907 vs 7027), because ``k`` is L2-normalised so ``A`` is
+    nearly invariant to input magnitude. That matches the reference's own note that
+    random vectors at the same std decode cleanly, and means the instability is
+    still unexplained — it is not simply the leaf Neumann blowing up.
 
-    That is the cost of its design goal: keeping the state in SBUF across chunks to
-    avoid HBM round-trips means walking one (batch, head) and one chunk at a time,
-    so the expensive part lands in the serial region. Note the kernel is *not*
-    inefficient per operation — it does ~40x the arithmetic for ~13x the time, so
-    its dense matmuls and SBUF residency are doing real work. The algorithm it
-    implements is simply the wrong one for this hardware at these sizes.
+    Finally, the ceiling: model compute is ~28 ms of a ~109 ms TTFT, so even a free
+    delta rule takes only about 20% off. That, not the kernel, is where the gap to
+    the reference's 42.2 ms lives.
 
-    The reference's own newer *multihead* kernel batches head groups and is its
-    default for text, but it is the one it documents as numerically unstable on
-    vision embeddings, and it would have to beat this by ~10x merely to draw level
-    with torch. Note also the ceiling: model compute is ~28 ms of a ~109 ms TTFT,
-    so even a free delta rule would only take about 20% off.
-
-    Contract (the reference's "legacy_direct" mode): ``query`` arrives
+        Contract (the reference's "legacy_direct" mode): ``query`` arrives
     L2-normalised, this function applies the ``1/sqrt(dk)`` scale, ``key`` is
     L2-normalised, ``g`` is RAW per-token log-decay (the kernel does its own
     cumsum), ``beta`` is ``sigmoid(b)``.
     """
     from vllm_neuron.nki.nki_hop import wrap_nki
 
-    from .nki_deltanet import CHUNK_SIZE, deltanet_fused_chunked_fwd
+    # Two vendored variants; they differ only in the in-chunk (I - A)^-1.
+    #   "fused"  hierarchical: Neumann on 32x32 leaves + Schur composition to 128,
+    #            and it normalises q/k and applies the query scale in-kernel
+    #   "legacy" forward substitution, 128 sequential full matmuls; caller
+    #            normalises and scales
+    variant = os.environ.get("VLLM_NEURON_QWEN35_NKI_VARIANT", "fused")
+    if variant == "fused":
+        from .nki_deltanet_fused import CHUNK_SIZE, deltanet_fused_chunked_fwd
+    elif variant == "legacy":
+        from .nki_deltanet import CHUNK_SIZE, deltanet_fused_chunked_fwd
+    else:
+        raise ValueError(
+            f"VLLM_NEURON_QWEN35_NKI_VARIANT must be 'fused' or 'legacy', "
+            f"got {variant!r}"
+        )
 
     b, h, t, dk = query.shape
     dv = value.shape[-1]
@@ -272,9 +287,13 @@ def _nki_chunk_gated_delta_rule(
     bh = b * h
 
     # (B, H, T, d) -> (B*H, T, d); g/beta -> (B*H, T, 1) as the kernel wants.
-    # The 1/sqrt(dk) query scale is applied here because the torch body applies it
-    # internally too — callers pass unscaled queries to either path.
-    query_f = (query * (dk**-0.5)).reshape(bh, t, dk).float().contiguous()
+    # The legacy kernel wants the 1/sqrt(dk) query scale applied by the caller (the
+    # torch body applies it internally too, so callers pass unscaled queries to
+    # every path). The fused kernel applies both the l2-norm and the scale itself,
+    # so it gets the query unscaled. Its re-normalisation of an already-normalised
+    # q/k is a ~5e-7 no-op, which the probe confirms.
+    scaled = query if variant == "fused" else query * (dk**-0.5)
+    query_f = scaled.reshape(bh, t, dk).float().contiguous()
     key_f = key.reshape(bh, t, dk).float().contiguous()
     value_f = value.reshape(bh, t, dv).float().contiguous()
     g_f = g.reshape(bh, t).unsqueeze(-1).float().contiguous()

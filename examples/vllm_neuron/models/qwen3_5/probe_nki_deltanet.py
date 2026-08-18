@@ -46,6 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dim", type=int, default=128)
     parser.add_argument("--time", type=int, default=10)
     parser.add_argument("--tol", type=float, default=5e-2)
+    parser.add_argument(
+        "--variants",
+        default="fused,legacy",
+        help="comma-separated NKI variants to measure against torch",
+    )
     return parser.parse_args()
 
 
@@ -65,13 +70,14 @@ def make_inputs(args):
     )
 
 
-def run(args, use_nki: bool):
+def run(args, use_nki: bool, variant: str = "fused"):
     """Compile and run the delta rule one way; return (output, state, ms)."""
     import vllm_neuron  # noqa: F401
     from vllm_neuron.compile.backend import compile as neuron_compile
     from vllm_neuron.model.qwen3_5 import deltanet as dn
 
     os.environ["VLLM_NEURON_QWEN35_ENABLE_NKI"] = "1" if use_nki else "0"
+    os.environ["VLLM_NEURON_QWEN35_NKI_VARIANT"] = variant
     cpu_args = make_inputs(args)
     device_args = tuple(a.to(DEVICE) for a in cpu_args)
 
@@ -107,12 +113,26 @@ def main() -> int:
     )
 
     torch_out, torch_state, torch_ms = run(args, use_nki=False)
-    print(f"  torch  {torch_ms:8.2f} ms/call")
-    nki_out, nki_state, nki_ms = run(args, use_nki=True)
-    print(f"  nki    {nki_ms:8.2f} ms/call   speedup {torch_ms / nki_ms:.2f}x\n")
+    print(f"  torch   {torch_ms:8.2f} ms/call   (reference)")
 
-    ok = report("output", nki_out, torch_out, args.tol)
-    ok &= report("final state", nki_state, torch_state, args.tol)
+    ok = True
+    for variant in args.variants.split(","):
+        variant = variant.strip()
+        if not variant:
+            continue
+        try:
+            out, state, ms = run(args, use_nki=True, variant=variant)
+        except Exception as exc:
+            print(f"  {variant:6s}  FAILED: {str(exc).splitlines()[0][:90]}")
+            ok = False
+            continue
+        print(
+            f"  {variant:6s}  {ms:8.2f} ms/call   "
+            f"{'speedup' if ms < torch_ms else 'slowdown'} "
+            f"{torch_ms / ms:.2f}x"
+        )
+        ok &= report(f"{variant}: output", out, torch_out, args.tol)
+        ok &= report(f"{variant}: final state", state, torch_state, args.tol)
 
     print("\n" + ("AGREES" if ok else "DISAGREES — do not ship"))
     return 0 if ok else 1

@@ -489,6 +489,83 @@ The batch-4 TTFT spread (109 -> 412 ms) is prefills serialising: one prefill
 graph per forward, so request *n* waits for the *n-1* before it. Aggregate
 throughput still scales 1.8x from batch 1 to batch 4.
 
+## VL: working, by reusing Qwen3-VL's vision tower
+
+`examples/vllm_neuron/models/qwen3_5/run_vl.py` describes an image correctly on
+device. With the `cherry_blossom` asset at 224x224 (a 14x14 patch grid, 196 raw
+-> 49 merged tokens):
+
+> "This is a vibrant, vertically oriented photograph that captures a striking
+> contrast between natural beauty and urban architecture. **Foreground:** The
+> image is dominated by branches of cherry blossom trees (sakura) in full
+> bloom..."
+
+That is the asset described accurately, monument included — the tower is
+perceiving the image, not confabulating from the prompt.
+
+### The vision half is reused, not reimplemented
+
+Upstream, HF's `Qwen3_5VisionModel` is literally `Qwen3VLVisionModel` with the
+deepstack mergers deleted (`modular_qwen3_5.py:437`), the checkpoint's
+`model.visual.*` tensor names are identical, and every attribute the plugin's
+Qwen3-VL encoder reads off a vision config already exists on
+`Qwen3_5VisionConfig`. So `vl.py` reuses:
+
+| reused | from |
+|---|---|
+| the ViT itself and its weight loading | `qwen3_vl/vision_encoder_bf16.py` |
+| `embed_multimodal` (packing + encoder cache) | `qwen3_vl/model_bf16.py` |
+| `build_vision_synthetic_inputs` (warmup) | same |
+| `merge_vision_embeds`, `mrope`, packing/preprocessing utils | `qwen3_vl/utils/` |
+
+`embed_multimodal` and `build_vision_synthetic_inputs` are taken as plain function
+references because their whole contract is `self.visual`,
+`self.config.vision_config` and `self._vision_captures`. Subclassing the Qwen3-VL
+*model* would drag in its text decoder, which is the one part Qwen3.5 does not
+share. `deepstack_visual_indexes` is empty, so the encoder builds no deepstack
+mergers and cache rows are exactly `out_hidden_size` wide; the text model raises
+if a deepstack tensor ever appears.
+
+### Text-only and VL are two different classes, on purpose
+
+The factory picks by whether the runner supplied a `VisionNeuronConfig`, which it
+does exactly when the engine was configured for images or video (the platform
+skips vision bucket resolution when every `limit_mm_per_prompt` count is 0, and
+without that dict the runner leaves it None). A text-only launch therefore pays
+neither the tower's weights nor its compile time.
+
+### Protocol classmethods belong on the factory
+
+`get_vision_token_merge_factor` and `get_max_pixels_token_count` must live on the
+**factory**, because `vision_utils` resolves them through the model *registry* and
+the registry holds the factory. With them only on the VL class the lookup falls
+back to a merge factor of 1, which sizes the encoder cache blocks 4x too large
+and dies at graph capture with
+
+    aten::index_put, xla_shape=bf16[65,256,2048]
+
+— the cache rows (256) not matching the encoder's merged output (64). It reads
+like a vision bug and is not one. The same applies to
+`get_mamba_state_shape_from_config`, already on the factory for the same reason.
+
+### What the CPU vision check can and cannot say
+
+`check_vision_vs_hf.py` establishes: all 297 vision parameters load from Qwen3.5's
+checkpoint, no deepstack mergers are built, 62/64 merged tokens are closest to
+their own HF row, magnitude ratio 1.000. It deliberately does **not** assert
+numerical equality — the vision attention runs on NKI kernels and
+`can_run_kernel("cpu")` is False, so off-device it takes a fallback whose
+arithmetic differs op-for-op (the first block already differs by 4e-3, compounding
+over 24 blocks to ~1e-1). That is a property of running kernel code on CPU, not
+evidence about Qwen3.5. Numerical validation of the vision path belongs on device.
+
+## Longer contexts
+
+The text stack compiles and matches CPU on device at **seq 2048 and 4096**, not
+just 1024, in both phases (`probe_device_model.py --seq N`). Compile time grows
+noticeably at 4096 — the chunked recurrence unrolls 64 chunks per DeltaNet layer
+and the attention score matrix is `[heads, 4096, 4096]`.
+
 ## Status
 
 - [x] Branch, checkpoint, reference clone
@@ -503,6 +580,9 @@ throughput still scales 1.8x from batch 1 to batch 4.
       prompts exact, no first-token mismatches (reference bar: 66%, 3/5)
 - [x] Latency at TP=4 — decode beats the reference (TPOT 3.72 vs 4.75 ms),
       prefill is 2.6x slower (TTFT 108.9 vs 42.2 ms)
-- [ ] NKI kernel port — purely a prefill/TTFT win now; decode needs nothing
-- [ ] Longer contexts (only max_model_len 1024 has been run) and larger batches
-- [ ] VL stage
+- [x] Longer contexts — device-verified at seq 2048 and 4096
+- [x] **VL stage** — image described correctly on device
+- [ ] VL accuracy against HF, and VL latency (TTFT will be dominated by the tower)
+- [ ] NKI kernel port — purely a prefill/TTFT win; decode needs nothing
+- [ ] Video input, multi-image, and larger batches
+- [ ] Push the branch

@@ -263,6 +263,9 @@ class Qwen3_5VisionConfig:
     out_hidden_size: int
     deepstack_visual_indexes: tuple[int, ...]
     torch_dtype: torch.dtype
+    # The plugin's vision encoder reads bucket/block settings off this; attached
+    # by ``Qwen3_5Config.from_configs``.
+    neuron_config: object | None = None
 
     @classmethod
     def from_hf(cls, vision_cfg: PretrainedConfig) -> Qwen3_5VisionConfig:
@@ -339,16 +342,25 @@ class Qwen3_5Config:
         text_neuron_config: object | None = None,
         vision_neuron_config: object | None = None,
         *,
-        include_vision: bool = False,
+        include_vision: bool | None = None,
     ) -> Qwen3_5Config:
         """Entry point used by the factory: HF config plus the runner's NeuronConfigs.
 
-        ``include_vision`` defaults to False because this port is text-only for
-        now; the ViT tower is parsed but not built, and a request carrying image
-        or video data is rejected by the factory rather than silently ignored.
+        The vision tower is built only when the runner supplied a
+        ``VisionNeuronConfig``, which it does exactly when the engine was
+        configured to serve images or video. A text-only launch therefore pays
+        neither the tower's weights nor its compile time. (The runner only
+        creates that config when ``additional_config["vision_neuron_config"]``
+        exists, and the platform only creates *that* when some modality has a
+        non-zero per-prompt limit.) Pass ``include_vision`` explicitly to
+        override, which the vision checks do.
         """
+        if include_vision is None:
+            include_vision = vision_neuron_config is not None
         config = cls.from_hf(hf_config, include_vision=include_vision)
         config.text_config.neuron_config = text_neuron_config
         config.neuron_config = text_neuron_config
         config.vision_neuron_config = vision_neuron_config
+        if config.vision_config is not None:
+            config.vision_config.neuron_config = vision_neuron_config
         return config

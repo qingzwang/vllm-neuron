@@ -51,9 +51,24 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         text_neuron_config: NeuronConfig | None,
         vision_neuron_config: VisionNeuronConfig | None,
     ) -> nn.Module:
-        from .model import Qwen3_5ForCausalLM
+        # The runner only builds a VisionNeuronConfig when the engine was
+        # configured to serve images or video: the platform skips vision bucket
+        # resolution when every ``limit_mm_per_prompt`` count is 0, and without
+        # that dict the runner leaves this None. So it is the signal for "vision
+        # is wanted", and a text-only launch pays neither the tower's weights nor
+        # its compile time.
+        if vision_neuron_config is None:
+            from .model import Qwen3_5ForCausalLM
 
-        return Qwen3_5ForCausalLM.from_configs(
+            return Qwen3_5ForCausalLM.from_configs(
+                hf_config,
+                text_neuron_config=text_neuron_config,
+                vision_neuron_config=None,
+            )
+
+        from .vl import Qwen3_5VLForConditionalGeneration
+
+        return Qwen3_5VLForConditionalGeneration.from_configs(
             hf_config,
             text_neuron_config=text_neuron_config,
             vision_neuron_config=vision_neuron_config,
@@ -101,11 +116,5 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
             vllm_config.cache_config.mamba_ssm_cache_dtype,
         )
 
-    # No vision guard here on purpose. There is no signal at construction time
-    # that distinguishes "the user configured vision" from "the checkpoint merely
-    # has a vision_config": the runner auto-derives a VisionNeuronConfig with
-    # num_vision_tokens_buckets for every such checkpoint, so both an
-    # `is not None` check and a bucket check reject a plain text-only launch.
-    # The text-only model simply does not implement ``embed_multimodal`` or
-    # ``SupportsVisionWarmup``, so a request carrying an image fails loudly
-    # rather than being answered from the text alone.
+    # Vision support is selected in ``_select_implementation`` above, not guarded
+    # here: the two implementations differ only in whether the tower exists.

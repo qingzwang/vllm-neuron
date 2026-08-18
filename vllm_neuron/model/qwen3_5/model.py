@@ -614,6 +614,8 @@ class Qwen3_5TextModel(nn.Module):
         rotary_position_ids: torch.Tensor | None,
         attn_metadata: dict,
         rank: torch.Tensor | None = None,
+        vision_embedding_blocks: tuple[torch.Tensor, ...] | None = None,
+        vision_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         first = self.layers[0].mixer_name
         is_prefill = (
@@ -624,6 +626,34 @@ class Qwen3_5TextModel(nn.Module):
         hidden_states = self.embed_tokens(
             input_ids, scatter_tokens=is_prefill and SEQUENCE_PARALLEL, rank=rank
         )
+
+        # Vision embeddings are scattered in at the placeholder token positions,
+        # from the on-device encoder cache blocks. Prefill only — decode carries
+        # no vision input. Reuses Qwen3-VL's helper because the merge is identical;
+        # it returns no deepstack tensor here since this checkpoint has
+        # ``deepstack_visual_indexes: []``, so the cache rows are exactly
+        # ``out_hidden_size`` wide rather than a "fat" concatenation.
+        if (
+            is_prefill
+            and vision_embedding_blocks is not None
+            and vision_positions is not None
+        ):
+            from vllm_neuron.model.qwen3_vl.utils.merge_vision_embeds import (
+                merge_vision_embeddings,
+            )
+
+            hidden_states, deepstack = merge_vision_embeddings(
+                hidden_states,
+                vision_embedding_blocks,
+                vision_positions,
+                rank=self.rank if SEQUENCE_PARALLEL else 0,
+            )
+            if deepstack is not None:
+                raise NotImplementedError(
+                    "Qwen3.5 has no deepstack levels, but the encoder cache rows "
+                    f"are wider than hidden_size ({hidden_states.shape[-1]}); the "
+                    "vision config and the cache layout disagree."
+                )
         position_embeddings = self.rotary_emb(
             rotary_position_ids if rotary_position_ids is not None else positions,
             dtype=self.config.torch_dtype,
@@ -767,12 +797,10 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
         spec_decode_metadata=None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
-        # Accepted and ignored. The runner passes these for any checkpoint whose
-        # HF config has a vision_config, which this one does even though the
-        # tower is not implemented yet; refusing them would block a text-only
-        # launch. Requests carrying images are rejected at the frontend instead —
-        # see the limit_mm_per_prompt in examples/.../qwen3_5/run.py. Consuming
-        # them is the VL stage's job.
+        # Present for any checkpoint whose HF config has a vision_config, which
+        # this one does. Ignored by the text-only class (no tower is built, so
+        # nothing ever populates them) and consumed by the VL subclass in
+        # ``vl.py``; the text model scatters them into the token embeddings.
         vision_embedding_blocks: tuple[torch.Tensor, ...] | None = None,
         vision_positions: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -798,6 +826,8 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
             rotary_position_ids,
             attn_metadata,
             rank=rank,
+            vision_embedding_blocks=vision_embedding_blocks,
+            vision_positions=vision_positions,
         )
 
         hidden_states = torch.index_select(hidden_states, 0, sampling_positions)
@@ -905,7 +935,13 @@ class Qwen3_5ForCausalLM(nn.Module, SupportsMRoPE):
         # mapping key is wrong stays at its uninitialised ``torch.empty`` value
         # and the model generates fluent garbage with no error anywhere. Check
         # explicitly instead.
-        expected = {name for name, _ in self.named_parameters()}
+        # Only the text parameters: a VL model's ``visual.*`` weights are loaded
+        # afterwards by the tower's own loader, on the vision TP group.
+        expected = {
+            name
+            for name, _ in self.named_parameters()
+            if not name.startswith("visual.")
+        }
         unfilled = sorted(expected - set(rank_sharded))
         if unfilled:
             raise RuntimeError(

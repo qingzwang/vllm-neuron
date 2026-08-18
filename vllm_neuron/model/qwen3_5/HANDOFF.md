@@ -669,6 +669,72 @@ pure quadratic would give), spine 5.33x. So the balance barely shifts with conte
 length and **the DeltaNet NKI port is the right optimisation across the range**,
 targeting ~72-78% of prefill. Decode still needs nothing.
 
+## The NKI port: correct, slower, and not where the time is
+
+Two results, both worth keeping.
+
+### The kernel works and loses to torch
+
+The reference's legacy single-head fused kernel is vendored verbatim at
+`nki_deltanet.py` and wired behind `VLLM_NEURON_QWEN35_ENABLE_NKI=1` (opt **in**;
+torch ships). `probe_nki_deltanet.py`, 4 heads on one rank:
+
+| | torch | nki | |
+|---|---|---|---|
+| seq 1024 | 0.99 ms | 9.72 ms | 0.10x |
+| seq 4096 | 2.95 ms | 37.51 ms | 0.08x |
+
+It is *correct* — output within 1.2e-05 of the torch reference, final state within
+2.5e-06. It is a design mismatch, not a bug, and not launch overhead (the ratio
+gets worse with length). The kernel keeps the 128x128 state in SBUF across chunks
+to avoid HBM round-trips, so it walks one (batch, head) and one 128-token chunk at
+a time — 4 heads x 32 chunks = 128 sequential steps at seq 4096. The torch path
+folds every `(head, chunk)` pair into one batch dim and issues batched matmuls,
+256 instances at once, which is what the Tensor Engine wants. **The rank-3 rewrite
+done earlier for compiler reasons is what exposes that parallelism**, so it turned
+out to matter for a second reason.
+
+The reference's newer *multihead* kernel batches head groups and is its default for
+text — but it is the variant it documents as numerically unstable on vision
+embeddings, and it would have to beat this one by ~10x merely to draw level with
+torch. Not attempted for that reason.
+
+### TTFT is 63% fixed overhead, so the model was never the main cost
+
+Measured engine TTFT against prefill bucket size, batch 1:
+
+| prefill bucket | TTFT | marginal |
+|---|---|---|
+| 512 | 89.20 ms | — |
+| 1024 | 108.90 ms | 0.0385 ms/token |
+| 2048 | 149.85 ms | 0.0400 ms/token |
+
+Linear, and the implied intercept agrees to +-1 ms from all three points:
+
+    TTFT ~= 69 ms fixed + 0.039 ms/token
+
+So at seq 1024 the ~109 ms TTFT decomposes roughly as
+
+| | ms | share |
+|---|---|---|
+| fixed per-request overhead | ~69 | 63% |
+| model compute (one rank, from `probe_device_model --time`) | ~28 | 26% |
+| collectives (the residual) | ~12 | 11% |
+
+and the DeltaNet's ~22 ms is **20% of TTFT**, not the 78% the earlier "share of
+model compute" figure might suggest. Read the two numbers together: the delta rule
+dominates *compute*, and compute does not dominate *TTFT*.
+
+That reframes the comparison with the reference's 42.2 ms. Most of our gap is the
+69 ms fixed term — vLLM's per-request path (scheduling, CPU-side slot-mapping /
+block-table / mRoPE construction and the transfers to device, NEFF launch,
+sampling, AsyncLLM IPC) — not the mixers, and the reference measures under NxDI's
+own harness rather than this one. **Anyone chasing TTFT should profile that fixed
+term first;** there is more there than in any kernel.
+
+Decode is unaffected by all of this and already beats the reference (TPOT 3.72 vs
+4.75 ms).
+
 ## Status
 
 - [x] Branch, checkpoint, reference clone
@@ -688,6 +754,9 @@ targeting ~72-78% of prefill. Decode still needs nothing.
 - [x] VL accuracy against HF, and VL latency — the tower costs ~3 ms, not the
       TTFT dominance that was expected
 - [x] Video input, multi-image, batches up to 8
-- [ ] NKI kernel port — purely a prefill/TTFT win; decode needs nothing
+- [x] NKI kernel port — done, and it *loses* to the batched torch path (0.10x);
+      vendored and off by default, with the measurement recorded
+- [ ] Profile the ~69 ms fixed per-request overhead, which is 63% of TTFT and the
+      real gap to the reference — bigger than anything left in the model
 - [x] Contexts to 8192, VL at batch > 1, images to 672x672
 - [ ] Push the branch

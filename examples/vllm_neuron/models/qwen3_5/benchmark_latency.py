@@ -49,6 +49,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-tokens", type=int, default=1024)
     parser.add_argument("--output-tokens", type=int, default=128)
     parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument(
+        "--vision-bucket",
+        type=int,
+        default=0,
+        help="non-zero switches to a single-image prompt and builds the VL model, "
+        "so TTFT then includes the vision tower",
+    )
+    parser.add_argument("--image-size", type=int, default=224)
     return parser.parse_args()
 
 
@@ -61,6 +69,28 @@ def build_prompt(model_path: str, num_tokens: int, salt: int) -> str:
     text = f"Note {salt}. " + FILLER * (num_tokens // 20 + 4)
     ids = tokenizer(text, add_special_tokens=False).input_ids[:num_tokens]
     return tokenizer.decode(ids)
+
+
+def build_vl_prompt(model_path: str, image_size: int):
+    """A single-image chat prompt. One item, so the vision bucket stays small."""
+    from transformers import AutoProcessor
+    from vllm.assets.image import ImageAsset
+
+    processor = AutoProcessor.from_pretrained(model_path)
+    image = ImageAsset("cherry_blossom").pil_image.resize((image_size, image_size))
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {"type": "text", "text": "Describe this image in detail."},
+            ],
+        }
+    ]
+    prompt = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    return {"prompt": prompt, "multi_modal_data": {"image": [image]}}
 
 
 async def one_round(engine, prompts, sampling_params, request_offset: int):
@@ -105,7 +135,7 @@ async def main_async(args) -> None:
         max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
         enable_prefix_caching=False,
-        limit_mm_per_prompt={"image": 0, "video": 0},
+        limit_mm_per_prompt={"image": 1 if args.vision_bucket else 0, "video": 0},
         additional_config={
             "neuron_config": {
                 "quantization": "bf16",
@@ -115,6 +145,18 @@ async def main_async(args) -> None:
                 # See run.py: the runner's default breaks codegen for this model.
                 "hlo2tensorizer_options": "",
             },
+            # Supplying this at all is what selects the VL implementation, so a
+            # zero bucket means "text-only" rather than "vision with no budget".
+            **(
+                {
+                    "vision_neuron_config": {
+                        "num_vision_tokens_buckets": [args.vision_bucket],
+                        "vision_attention_block_size": args.vision_bucket,
+                    }
+                }
+                if args.vision_bucket
+                else {}
+            ),
         },
     )
     engine = AsyncLLM.from_engine_args(engine_args)
@@ -123,11 +165,15 @@ async def main_async(args) -> None:
         max_tokens=args.output_tokens, min_tokens=args.output_tokens, temperature=0.0
     )
 
+    mode = (
+        f"vision, one {args.image_size}x{args.image_size} image"
+        if args.vision_bucket
+        else f"text-only, input_tokens={args.input_tokens}"
+    )
     print(
         f"model={args.model}\n"
-        f"tp={args.tensor_parallel_size} batch={args.max_num_seqs} "
-        f"input_tokens={args.input_tokens} output_tokens={args.output_tokens} "
-        f"iterations={args.iterations}\n"
+        f"tp={args.tensor_parallel_size} batch={args.max_num_seqs} {mode} "
+        f"output_tokens={args.output_tokens} iterations={args.iterations}\n"
     )
 
     ttfts: list[float] = []
@@ -137,10 +183,18 @@ async def main_async(args) -> None:
     total_out = 0
 
     for iteration in range(args.iterations + 1):
-        prompts = [
-            build_prompt(args.model, args.input_tokens, salt=iteration * 100 + i)
-            for i in range(args.max_num_seqs)
-        ]
+        if args.vision_bucket:
+            # The same image every time: TTFT here is dominated by the tower, and
+            # prefix caching is off so nothing is reused between rounds.
+            prompts = [
+                build_vl_prompt(args.model, args.image_size)
+                for _ in range(args.max_num_seqs)
+            ]
+        else:
+            prompts = [
+                build_prompt(args.model, args.input_tokens, salt=iteration * 100 + i)
+                for i in range(args.max_num_seqs)
+            ]
         started = time.perf_counter()
         results = await one_round(engine, prompts, sampling_params, iteration)
         wall = time.perf_counter() - started

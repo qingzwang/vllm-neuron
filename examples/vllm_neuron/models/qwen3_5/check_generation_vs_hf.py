@@ -50,6 +50,12 @@ PROMPTS = [
 
 DEFAULT_JSON = "/tmp/qwen35_generation.json"
 
+# One image prompt for --vl. Kept to a single item so the vision bucket stays
+# small: at 224x224 with patch 16 this is a 14x14 grid, 196 raw tokens.
+VL_QUESTION = "Describe this image in detail."
+VL_IMAGE_ASSET = "cherry_blossom"
+VL_IMAGE_SIZE = 224
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -59,7 +65,133 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json", default=DEFAULT_JSON)
     parser.add_argument("--tensor-parallel-size", type=int, default=4)
     parser.add_argument("--max-model-len", type=int, default=1024)
+    parser.add_argument(
+        "--vl",
+        action="store_true",
+        help="compare a single-image prompt instead of the text-only set",
+    )
+    parser.add_argument("--vision-bucket", type=int, default=256)
     return parser.parse_args()
+
+
+def build_vl_prompt(model_path: str):
+    """The chat prompt and the PIL image, from the model's own processor.
+
+    Both sides go through the same ``AutoProcessor``, which is also what vLLM's
+    frontend uses for this architecture — so the pixel values and the placeholder
+    expansion match, and a divergence means the model, not preprocessing.
+    """
+    from transformers import AutoProcessor
+    from vllm.assets.image import ImageAsset
+
+    processor = AutoProcessor.from_pretrained(model_path)
+    image = ImageAsset(VL_IMAGE_ASSET).pil_image.resize(
+        (VL_IMAGE_SIZE, VL_IMAGE_SIZE)
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image"}, {"type": "text", "text": VL_QUESTION}],
+        }
+    ]
+    prompt = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    return processor, prompt, image
+
+
+def run_neuron_vl(args) -> None:
+    from vllm import LLM, SamplingParams
+
+    _processor, prompt, image = build_vl_prompt(args.model)
+    llm = LLM(
+        model=args.model,
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_model_len,
+        max_num_seqs=1,
+        tensor_parallel_size=args.tensor_parallel_size,
+        enable_prefix_caching=False,
+        limit_mm_per_prompt={"image": 1, "video": 0},
+        additional_config={
+            "neuron_config": {
+                "quantization": "bf16",
+                "num_batched_tokens_buckets": [args.max_model_len],
+                "num_seqs_buckets": [1],
+                "on_device_sampling_config": {"all_greedy": True},
+                "hlo2tensorizer_options": "",
+            },
+            "vision_neuron_config": {
+                "num_vision_tokens_buckets": [args.vision_bucket],
+                "vision_attention_block_size": args.vision_bucket,
+            },
+        },
+    )
+    outputs = llm.generate(
+        [{"prompt": prompt, "multi_modal_data": {"image": [image]}}],
+        SamplingParams(max_tokens=args.tokens, temperature=0.0),
+    )
+    payload = {
+        "tokens": args.tokens,
+        "vl": True,
+        "results": [
+            {
+                "prompt": VL_QUESTION,
+                "token_ids": list(outputs[0].outputs[0].token_ids),
+                "text": outputs[0].outputs[0].text,
+            }
+        ],
+    }
+    with open(args.json, "w") as handle:
+        json.dump(payload, handle, indent=2)
+    print(f"wrote {args.json}")
+    print(f"  {VL_QUESTION!r} -> {payload['results'][0]['text']!r}")
+
+
+def run_hf_vl_and_compare(args) -> int:
+    """HF's own VL generation on CPU, against the device's tokens."""
+    import torch
+    from transformers import AutoModelForImageTextToText
+
+    with open(args.json) as handle:
+        payload = json.load(handle)
+    if not payload.get("vl"):
+        raise SystemExit(f"{args.json} was written by the text-only side; rerun "
+                         f"--side neuron --vl")
+
+    processor, prompt, image = build_vl_prompt(args.model)
+    model = AutoModelForImageTextToText.from_pretrained(
+        args.model, dtype=torch.float32
+    ).eval()
+
+    inputs = processor(text=[prompt], images=[image], return_tensors="pt")
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=args.tokens,
+            min_new_tokens=args.tokens,
+            do_sample=False,
+            temperature=None,
+            top_p=None,
+            top_k=None,
+        )
+    hf_ids = generated[0, inputs["input_ids"].shape[1] :].tolist()[: args.tokens]
+    device_ids = payload["results"][0]["token_ids"][: args.tokens]
+
+    tokenizer = processor.tokenizer
+    matched = sum(a == b for a, b in zip(device_ids, hf_ids))
+    prefix = 0
+    for a, b in zip(device_ids, hf_ids):
+        if a != b:
+            break
+        prefix += 1
+    print(f"comparing {len(hf_ids)} greedy tokens for a single-image prompt\n")
+    print(f"  prefix {prefix}, {matched}/{len(hf_ids)} tokens matched")
+    print(f"  neuron: {tokenizer.decode(device_ids)!r}")
+    print(f"  hf    : {tokenizer.decode(hf_ids)!r}")
+    if prefix == 0:
+        print("\nFIRST TOKEN WRONG — the vision merge or prefill is wrong, not rounding")
+        return 1
+    return 0
 
 
 def run_neuron(args) -> None:
@@ -180,9 +312,9 @@ def run_hf_and_compare(args) -> int:
 def main() -> int:
     args = parse_args()
     if args.side == "neuron":
-        run_neuron(args)
+        (run_neuron_vl if args.vl else run_neuron)(args)
         return 0
-    return run_hf_and_compare(args)
+    return (run_hf_vl_and_compare if args.vl else run_hf_and_compare)(args)
 
 
 if __name__ == "__main__":

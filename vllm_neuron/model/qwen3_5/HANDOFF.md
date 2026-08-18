@@ -99,7 +99,7 @@ So the work splits into:
 2. **The model** — 18 DeltaNet layers, 6 gated-GQA layers, partial interleaved
    mRoPE, tied embeddings.
 3. **Kernels** — port the DeltaNet NKI kernels from the reference (see map
-   below).
+   below). *Done and measured: they lose to torch. See "Two kernels vendored".*
 4. **Bring-up at TP=4** and numerical validation against HF.
 
 ## Constraints specific to this box
@@ -277,25 +277,29 @@ remembering when the NKI port lands: the kernel has to be stable in this same
 way, and a "clever" series expansion will pass a random-input test and fail on
 real weights.
 
-### Deliberately deferred
+### Known limits of the shipped configuration
 
-- **No NKI kernels yet.** The delta rule is torch. The chunked prefill is
-  matmul-heavy so it should map reasonably, but this is the first thing to
-  measure. `nki_deltanet.py` (recurrent step) is the simplest starting point;
-  the fused multihead kernel is the one that breaks on vision embeddings later.
-- **Attention runs in torch too**, because `head_dim` 256 exceeds the flash
-  kernel's `MAX_HEAD_DIM` of 128 and the decode megakernel fuses a QKV
-  projection and full-width RoPE that do not match this layer's gate and partial
-  rotary. Only 6 of 24 layers.
+- **Both mixers run in torch, on purpose.** Attention because `head_dim` 256
+  exceeds the flash kernel's `MAX_HEAD_DIM` of 128 and the decode megakernel
+  fuses a QKV projection and full-width RoPE that do not match this layer's gate
+  and partial rotary. The delta rule because the vendored NKI kernels *lose* to
+  the batched torch path — see "Two kernels vendored" below, which is the measured
+  answer to the "port the kernels" item that this section used to list as
+  outstanding.
 - **Padded decode rows** read and write the *last* state block, chosen because
   `slot_mapping` is `-1` there and that is where `index_put_`'s negative-index
-  wrap already sends the attention path's padded writes. Verify at bring-up that
-  the last mamba block is not also handed to a live sequence.
+  wrap already sends the attention path's padded writes. Still worth confirming
+  the last mamba block is never also handed to a live sequence — nothing observed,
+  but nothing proves it either.
 - **No prefix caching / chunked prefill.** Prefill starts from a zero state,
   which matches what the attention path already assumes (its prefill is plain
   causal flash attention with no prefix).
 - **Speculative decode** raises: the DeltaNet decode path wants one token per
   request, and multi-token decode needs the recurrence stepped per draft token.
+- **One `num_seqs_bucket` per engine.** Not this port's constraint — passing
+  several batch-size buckets to one engine hangs on the first request for other
+  models on this box too — but it is why the benchmarks below measure each batch
+  size in a separate process.
 
 ## Bring-up: working at TP=4
 

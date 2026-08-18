@@ -95,8 +95,6 @@ def build_vl_prompt(model_path: str, image_size: int):
 
 async def one_round(engine, prompts, sampling_params, request_offset: int):
     """Run ``prompts`` concurrently; return per-request (ttft, tpot, e2e, tokens)."""
-    from vllm.inputs import TokensPrompt  # noqa: F401  (documents the API)
-
     async def stream(index: int, prompt: str):
         start = time.perf_counter()
         first_at = None

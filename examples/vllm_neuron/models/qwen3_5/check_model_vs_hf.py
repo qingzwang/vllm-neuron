@@ -50,42 +50,6 @@ class _SingleRankGroup:
     device_group = None
 
 
-class _GlooTPGroup:
-    """The slice of vLLM's ``GroupCoordinator`` the model uses, over gloo.
-
-    Semantics deliberately match vLLM's: ``all_gather`` and ``reduce_scatter``
-    return new tensors, ``all_reduce`` sums in place (the plugin's models rely on
-    that and ignore the return value).
-    """
-
-    def __init__(self, world_size: int, rank: int):
-        import torch.distributed as dist
-
-        self.world_size = world_size
-        self.rank_in_group = rank
-        self.device_group = dist.group.WORLD
-
-    def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        import torch.distributed as dist
-
-        parts = [torch.empty_like(tensor) for _ in range(self.world_size)]
-        dist.all_gather(parts, tensor.contiguous())
-        return torch.cat(parts, dim=dim)
-
-    def reduce_scatter(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        import torch.distributed as dist
-
-        summed = tensor.contiguous().clone()
-        dist.all_reduce(summed, op=dist.ReduceOp.SUM)
-        return summed.chunk(self.world_size, dim=dim)[self.rank_in_group].contiguous()
-
-    def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        import torch.distributed as dist
-
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        return tensor
-
-
 def init_single_rank_distributed() -> None:
     """A world of one, on gloo.
 

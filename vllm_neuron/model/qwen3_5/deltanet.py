@@ -30,8 +30,6 @@ stored transposed (``[in_features, out_features]``) so a forward pass is
 
 from __future__ import annotations
 
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,11 +42,11 @@ from vllm_neuron.utils.weight_loader import (
 )
 
 from .config import Qwen3_5TextConfig
-
-
-# Mirrors ``model.SEQUENCE_PARALLEL``; read from the environment rather than
-# imported because ``model`` imports this module, not the other way round.
-SEQUENCE_PARALLEL = os.environ.get("VLLM_NEURON_QWEN35_DISABLE_SP") != "1"
+from .flags import (
+    SEQUENCE_PARALLEL,
+    nki_delta_rule_enabled,
+    nki_delta_rule_variant,
+)
 
 # Chunk length for the prefill recurrence. 64 is what HF's reference kernel
 # uses, and the UT-transform inverse below assumes a power of two.
@@ -286,21 +284,16 @@ def _nki_chunk_gated_delta_rule(
     """
     from vllm_neuron.nki.nki_hop import wrap_nki
 
-    # Two vendored variants; they differ only in the in-chunk (I - A)^-1.
-    #   "fused"  hierarchical: Neumann on 32x32 leaves + Schur composition to 128,
-    #            and it normalises q/k and applies the query scale in-kernel
-    #   "legacy" forward substitution, 128 sequential full matmuls; caller
+    # The two vendored variants differ only in the in-chunk (I - A)^-1:
+    #   "fused"  hierarchical — Neumann on 32x32 leaves + Schur composition to
+    #            128; normalises q/k and applies the query scale in-kernel
+    #   "legacy" forward substitution, 128 sequential full matmuls; the caller
     #            normalises and scales
-    variant = os.environ.get("VLLM_NEURON_QWEN35_NKI_VARIANT", "fused")
+    variant = nki_delta_rule_variant()
     if variant == "fused":
         from .nki_deltanet_fused import CHUNK_SIZE, deltanet_fused_chunked_fwd
-    elif variant == "legacy":
-        from .nki_deltanet import CHUNK_SIZE, deltanet_fused_chunked_fwd
     else:
-        raise ValueError(
-            f"VLLM_NEURON_QWEN35_NKI_VARIANT must be 'fused' or 'legacy', "
-            f"got {variant!r}"
-        )
+        from .nki_deltanet import CHUNK_SIZE, deltanet_fused_chunked_fwd
 
     b, h, t, dk = query.shape
     dv = value.shape[-1]
@@ -360,9 +353,7 @@ def _can_use_nki_delta_rule(query: torch.Tensor, value: torch.Tensor) -> bool:
     the sequence padded to a multiple of 128. Everything else falls back to torch,
     which is the reference implementation the CPU checks validate.
     """
-    # Opt **in**, not out. Measured on device, the kernel is numerically right but
-    # much slower than the torch path — see ``_nki_chunk_gated_delta_rule``.
-    if os.environ.get("VLLM_NEURON_QWEN35_ENABLE_NKI") != "1":
+    if not nki_delta_rule_enabled():
         return False
     from vllm_neuron.nki.nki_hop import can_run_kernel
 
@@ -778,7 +769,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         than ``count``) come out zero on their own: the shift pushes the one-hot
         off the front. That matches a sequence starting from a cold state.
         """
-        length = rows_in.shape[0]
         real = is_real.to(rows_in.dtype)
         # 1 at t == L - 1. F.pad supplies the r[T] == 0 the difference needs.
         onehot_last = real - F.pad(real[1:], (0, 1))

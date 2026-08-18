@@ -22,13 +22,14 @@ is a silent-wrong-output hazard rather than a crash:
   ``THWTHW...`` rather than laid out in chunks.
 
 ``head_dim`` is 256, above the flash-attention kernel's ``MAX_HEAD_DIM`` of 128,
-so the 6 attention layers run in torch rather than on the kernel. That is the
-expected performance ceiling for this model and is why they are only 6 of 24.
+so the 6 attention layers run in torch rather than on the kernel. That was
+*expected* to be the performance ceiling; measured, it is not — torch attention is
+6-8% of prefill, because at TP=4 there are only 2 query heads per rank so the
+``[2, seq, seq]`` score matrix is cheap. See HANDOFF, "Where prefill time actually
+goes".
 """
 
 from __future__ import annotations
-
-import os
 
 import torch
 import torch.nn as nn
@@ -49,27 +50,9 @@ from vllm_neuron.utils.weight_loader import (
 
 from .config import Qwen3_5Config, Qwen3_5TextConfig
 from .deltanet import Qwen3_5GatedDeltaNet
+from .flags import ABLATE_MIXERS, SEQUENCE_PARALLEL
 
 HF_TEXT_PREFIX = "model.language_model"
-
-# Sequence parallelism: the embedding scatters tokens across ranks and each
-# mixer/MLP all-gathers on entry and reduce-scatters on exit. Setting
-# VLLM_NEURON_QWEN35_DISABLE_SP=1 keeps the full sequence on every rank and
-# all-reduces instead — mathematically equivalent, just more memory and
-# bandwidth. Kept as a bisection tool: SP is the one part of this model the CPU
-# checks cannot exercise (they force world_size=1), so toggling it separates
-# "the collectives are misplaced" from every other hypothesis in one run.
-SEQUENCE_PARALLEL = os.environ.get("VLLM_NEURON_QWEN35_DISABLE_SP") != "1"
-
-# Bisection tool. VLLM_NEURON_QWEN35_ABLATE_MIXERS drops mixers so a reduced
-# model can be compared between device and CPU; the output is meaningless text
-# either way, only the agreement matters. Values: "all" (or "1") drops every
-# mixer, leaving embed -> (residual + MLP) x 24 -> norm -> lm_head, which
-# isolates the "spine" that the per-layer CPU checks cannot cover at TP>1;
-# "delta" and "attn" drop one mixer kind to say which of the two is at fault.
-ABLATE_MIXERS = os.environ.get("VLLM_NEURON_QWEN35_ABLATE_MIXERS", "")
-if ABLATE_MIXERS == "1":
-    ABLATE_MIXERS = "all"
 
 LINEAR_ATTENTION = "linear_attention"
 

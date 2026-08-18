@@ -17,6 +17,21 @@ Each probe reports one of:
     WRONG  compiled, but disagrees with CPU  -> a codegen miscompile
     FAIL   did not compile                   -> the error is printed
 
+What it has caught, so that the probes are not mistaken for busywork:
+
+* ``Tensor.split(sizes, dim=-1)`` compiles and returns unrelated data (relative
+  error 1.4) while ``t[..., a:b]``, ``torch.chunk`` and reshape-then-index are all
+  exact. This was the model's actual bug — all 18 DeltaNet layers were wrong.
+* A data-dependent ``index_select`` (index from a device-side ``sum``) also
+  miscompiles, which is why ``_tail_rows`` selects by arithmetic instead.
+* A rank-5 ``permute`` crashes the compiler outright (``NCC_IBTN006``, a
+  ``pftranspose`` whose copy fails backend verification).
+
+Two harness gotchas worth knowing: ``expand(...).contiguous()`` is unsupported on
+device tensors (build on CPU, then move), and a module's rotary embedding cannot
+run eagerly on device (``Expected self.dtype() == dst.dtype()``), so precompute
+``cos``/``sin`` on CPU.
+
 Usage (needs the device free — stop any engine first):
 
     NEURON_SKIP_EFA_AFFINITY=1 VLLM_CACHE_ROOT=/mnt/nvme/cache/vllm \

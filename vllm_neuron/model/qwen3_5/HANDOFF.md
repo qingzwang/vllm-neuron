@@ -566,6 +566,70 @@ just 1024, in both phases (`probe_device_model.py --seq N`). Compile time grows
 noticeably at 4096 — the chunked recurrence unrolls 64 chunks per DeltaNet layer
 and the attention score matrix is `[heads, 4096, 4096]`.
 
+## Test results
+
+### VL accuracy vs HF
+
+`check_generation_vs_hf.py --vl`, 32 greedy tokens, one 224x224 image, device
+bf16 against HF float32 on CPU: **prefix 12, 16/32 tokens matched**. The
+divergence is a synonym choice, not a different reading of the image:
+
+    neuron: "...a striking contrast between natural beauty and urban
+             architecture. **Foreground:** The image is dominated by branches of"
+    hf    : "...a striking juxtaposition of nature and urban architecture. The
+             composition is dominated by delicate pink cherry blossoms (sak"
+
+Both sides go through the same `AutoProcessor` — which is also what vLLM's
+frontend uses for this architecture — so pixel values and placeholder expansion
+match and a divergence means the model, not preprocessing. Agreement is lower
+than text-only's 69% because the tower adds 24 more layers of bf16 error ahead of
+the decoder. What matters is the prefix being 12 and not 0.
+
+### Latency at TP=4
+
+896-token prompt (or one image) + 128 output tokens, `AsyncLLM` streaming,
+median of 3 rounds after a discarded warmup:
+
+| | batch 1 | batch 4 | batch 8 | VL, 1 image | reference TP=4 |
+|---|---|---|---|---|---|
+| TTFT | **108.9 ms** | 262 ms | 457 ms | **111.7 ms** | 42.2 ms |
+| TPOT | **3.72 ms** | 6.23 ms | 8.90 ms | **3.71 ms** | 4.75 ms |
+| decode/stream | 268.7 t/s | 160.5 t/s | 112.4 t/s | 269.5 t/s | 210 t/s |
+| aggregate | 268.7 t/s | 482.6 t/s | **640.7 t/s** | — | — |
+
+Three things to take from this:
+
+* **Decode beats the reference** (TPOT 3.72 vs 4.75 ms) and **prefill is 2.6x
+  slower** (108.9 vs 42.2 ms) — the split this document predicted before anything
+  ran. The NKI port is purely a TTFT win; decode needs nothing.
+* **The vision tower costs about 3 ms.** VL TTFT is 111.7 vs 108.9 ms text-only,
+  because TTFT is set by the padded text prefill bucket. That is the opposite of
+  InternVL, where vision dominated — so NKI remains the right target for VL too.
+* Throughput scales sublinearly (1.00 / 1.80 / 2.38x at batch 1/4/8) and TTFT
+  spreads badly with batch (108 -> 804 ms at batch 8) because prefills serialise:
+  one prefill graph per forward, so request *n* waits for *n-1*.
+
+### Feature coverage, all on device
+
+| | result |
+|---|---|
+| text, seq 1024 / 2048 / 4096 | works (2048/4096 device-verified via `probe_device_model.py`) |
+| batch 1 / 4 / 8 | works |
+| one image | described correctly |
+| two images | **both** described correctly and distinctly — cherry blossoms with a tower, then "a small, dark-colored SUV parked on a city street, with a prominent red STOP sign" |
+| video, 4 frames | "A baby wearing glasses sits on a bed and reads a book... holding the book with both hands and turning the pages" |
+
+Two sizing traps, both in configuration rather than model code:
+
+* `vision_attention_block_size` is **per block** and one block holds exactly one
+  item (`ffd_pack_images(..., one_item_per_block=True)`), while
+  `num_vision_tokens_buckets` is the **total** budget and caps blocks per request.
+  Setting them equal works for one image and fails for two.
+* A video is packed per temporal group and **`mm_processor_kwargs["max_pixels"]`
+  does not reach the video processor** — `baby_reading` still reported 440
+  embedding tokens with `max_pixels=65536`. Size block/bucket for the native grid
+  instead: 4 frames needed `block_size=1024, bucket=2048`.
+
 ## Status
 
 - [x] Branch, checkpoint, reference clone
@@ -582,7 +646,9 @@ and the attention score matrix is `[heads, 4096, 4096]`.
       prefill is 2.6x slower (TTFT 108.9 vs 42.2 ms)
 - [x] Longer contexts — device-verified at seq 2048 and 4096
 - [x] **VL stage** — image described correctly on device
-- [ ] VL accuracy against HF, and VL latency (TTFT will be dominated by the tower)
+- [x] VL accuracy against HF, and VL latency — the tower costs ~3 ms, not the
+      TTFT dominance that was expected
+- [x] Video input, multi-image, batches up to 8
 - [ ] NKI kernel port — purely a prefill/TTFT win; decode needs nothing
-- [ ] Video input, multi-image, and larger batches
+- [ ] Contexts beyond 4096, and VL at batch > 1
 - [ ] Push the branch

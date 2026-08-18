@@ -25,6 +25,13 @@ Sizing, which has two independent knobs:
 Setting the two equal works for one image and fails for two with "Vision block
 truncation: request has more cached blocks than max_vision_blocks_per_request=1".
 
+A **video** is packed per temporal group (``temporal_patch_size`` frames each), not
+per frame, and ``mm_processor_kwargs["max_pixels"]`` does not reach the video
+processor — so the block has to be sized for the video's native grid. Measured:
+``baby_reading`` at 4 frames needs ``--vision-block-size 1024 --vision-bucket
+2048``; 256/1024 fails with "produces 440 embedding tokens, which exceeds the
+maximum supported by the compiled vision encoder (256)".
+
 Usage:
 
     NEURON_SKIP_EFA_AFFINITY=1 VLLM_CACHE_ROOT=/mnt/nvme/cache/vllm \
@@ -41,6 +48,7 @@ os.environ.setdefault("VLLM_NEURON_COMPILATION_TIMEOUT", "2400")
 
 QUESTION = "Describe this image in detail."
 MULTI_QUESTION = "Compare these two images. What is different about them?"
+VIDEO_QUESTION = "Describe what happens in this video."
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,8 +81,55 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="one block is allocated per image, so the bucket scales with this",
     )
+    parser.add_argument(
+        "--video-frames",
+        type=int,
+        default=0,
+        help="non-zero switches to a video prompt. A video is packed per FRAME, so "
+        "the block size must hold one frame and the bucket must hold every frame.",
+    )
+    parser.add_argument(
+        "--max-pixels",
+        type=int,
+        default=0,
+        help="per-image pixel cap passed to the HF processor; raw tokens per item "
+        "are max_pixels / patch_size^2. NOTE this does *not* reach the video "
+        "processor — measured: baby_reading still produced 440 embedding tokens "
+        "with max_pixels=65536 set. Size the block/bucket for the video's native "
+        "grid instead.",
+    )
     parser.add_argument("--max-tokens", type=int, default=64)
     return parser.parse_args()
+
+
+def build_video_input(model_path: str, num_frames: int):
+    """A single-video chat prompt.
+
+    vLLM's video parser wants ``(frames, metadata)`` together — the metadata drives
+    the per-frame timestamp tokens, and the resulting placeholder span is
+    non-contiguous, which exercises the is_embed-aware position mapping.
+    """
+    from transformers import AutoProcessor
+    from vllm.assets.video import VideoAsset
+
+    processor = AutoProcessor.from_pretrained(model_path)
+    asset = VideoAsset("baby_reading", num_frames=num_frames)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video"},
+                {"type": "text", "text": VIDEO_QUESTION},
+            ],
+        }
+    ]
+    prompt = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    return VIDEO_QUESTION, {
+        "prompt": prompt,
+        "multi_modal_data": {"video": (asset.np_ndarrays, asset.metadata)},
+    }
 
 
 def build_input(model_path: str, image_size: int, num_images: int):
@@ -105,11 +160,14 @@ def main() -> None:
     args = parse_args()
     from vllm import LLM, SamplingParams
 
-    # One block per image, so the total budget scales with the item count.
-    bucket = args.vision_bucket or args.num_images * args.vision_block_size
+    is_video = args.video_frames > 0
+    # One block per item, and a video's items are its frames.
+    items = args.video_frames if is_video else args.num_images
+    bucket = args.vision_bucket or items * args.vision_block_size
     print(
-        f"vision: {args.num_images} image(s), block_size="
+        f"vision: {items} {'frame' if is_video else 'image'}(s), block_size="
         f"{args.vision_block_size}, bucket={bucket}"
+        + (f", max_pixels={args.max_pixels}" if args.max_pixels else "")
     )
 
     llm = LLM(
@@ -119,7 +177,15 @@ def main() -> None:
         max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tensor_parallel_size,
         enable_prefix_caching=False,
-        limit_mm_per_prompt={"image": args.num_images, "video": 0},
+        **(
+            {"mm_processor_kwargs": {"max_pixels": args.max_pixels}}
+            if args.max_pixels
+            else {}
+        ),
+        limit_mm_per_prompt={
+            "image": 0 if is_video else args.num_images,
+            "video": 1 if is_video else 0,
+        },
         additional_config={
             "neuron_config": {
                 "quantization": "bf16",
@@ -138,7 +204,12 @@ def main() -> None:
         },
     )
 
-    question, inputs = build_input(args.model, args.image_size, args.num_images)
+    if is_video:
+        question, inputs = build_video_input(args.model, args.video_frames)
+    else:
+        question, inputs = build_input(
+            args.model, args.image_size, args.num_images
+        )
     outputs = llm.generate(
         [inputs], SamplingParams(max_tokens=args.max_tokens, temperature=0.0)
     )

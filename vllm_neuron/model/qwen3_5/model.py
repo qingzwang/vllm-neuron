@@ -404,31 +404,45 @@ class Qwen3_5Attention(nn.Module):
         q, k, v, gate = self._qkv(hidden_states, cos, sin)
         self._write_kv(k, v, metadata)
 
-        # Gather this batch's pages: [reqs, blocks, kv_heads, block_size, dim]
-        # -> [reqs, kv_heads, ctx, dim].
+        # Gather this batch's pages straight into the layout attention wants:
+        # [reqs * query_heads, ctx, dim].
+        #
+        # The obvious route — index the cache with the block table, then
+        # ``permute(0, 2, 1, 3, 4)`` to bring the KV-head dim in front of the
+        # block dim — **crashes neuronx-cc**. It emits a rank-5 transpose whose
+        # copy fails backend verification ("NCC_IBTN006 ... pftranspose ...
+        # 'start_addr_active_channels'") and takes the compiler process down with
+        # it. Confirmed with ``probe_device_ops.py``: attention prefill compiles
+        # and matches CPU, decode kills the process.
+        #
+        # So flatten the cache to [blocks * kv_heads, block_size, dim] and gather
+        # rows by an index computed per (request, query head). That removes the
+        # rank-5 permute *and* the ``repeat_interleave`` that expanded KV heads up
+        # to query heads — the index names each query head's KV head directly —
+        # and everything downstream is rank 3.
         blocks = block_table.to(torch.long)
         nkh = self.num_kv_heads_per_rank
         nh = self.num_heads_per_rank
-        k_ctx = self.k_cache[blocks].permute(0, 2, 1, 3, 4).reshape(
-            num_reqs, nkh, -1, self.head_dim
-        )
-        v_ctx = self.v_cache[blocks].permute(0, 2, 1, 3, 4).reshape(
-            num_reqs, nkh, -1, self.head_dim
-        )
-        ctx_len = k_ctx.shape[2]
-
-        # Fold (request, head) into one batch dim so the attention matmuls stay
-        # rank 3. The NxDI reference had to do the same — neuronx-cc fails
-        # codegen on rank-4 attention weights ("NCC_INLA001: Expected 2D tensor
-        # but got 4D AP").
         rows = num_reqs * nh
+        num_blocks, block_size = self.k_cache.shape[0], self.k_cache.shape[2]
+        ctx_len = blocks.shape[1] * block_size
+
+        # After reshaping [blocks, kv_heads, ...] to [blocks * kv_heads, ...],
+        # the row for (block b, kv head h) is exactly ``b * nkh + h``.
+        kv_of_query_head = (
+            torch.arange(nh, device=blocks.device) // self.num_kv_groups
+        )
+        gather_rows = (
+            blocks.unsqueeze(1) * nkh + kv_of_query_head.view(1, nh, 1)
+        ).reshape(-1)
+
+        def gather(cache: torch.Tensor) -> torch.Tensor:
+            flat = cache.reshape(num_blocks * nkh, block_size, self.head_dim)
+            return flat[gather_rows].reshape(rows, ctx_len, self.head_dim)
+
+        k_ctx = gather(self.k_cache)
+        v_ctx = gather(self.v_cache)
         q = q.transpose(0, 1).reshape(rows, 1, self.head_dim)
-        k_ctx = k_ctx.repeat_interleave(self.num_kv_groups, dim=1).reshape(
-            rows, ctx_len, self.head_dim
-        )
-        v_ctx = v_ctx.repeat_interleave(self.num_kv_groups, dim=1).reshape(
-            rows, ctx_len, self.head_dim
-        )
 
         scores = (q.float() @ k_ctx.float().transpose(-1, -2)) * self.scaling
         # Everything at or before this token's position is visible; the rest of

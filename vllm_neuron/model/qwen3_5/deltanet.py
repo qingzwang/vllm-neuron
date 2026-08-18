@@ -538,7 +538,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         qkv = hidden_states @ self.in_proj_qkv_weight
         z = hidden_states @ self.in_proj_z_weight
         ba = hidden_states @ self.in_proj_ba_weight
-        b, a = ba.split((self.num_v_heads, self.num_v_heads), dim=-1)
+        # Plain slices, not ``Tensor.split``: ``split(sizes, dim=-1)`` silently
+        # miscompiles on Neuron. Verified with ``probe_device_ops.py`` — the
+        # device result is unrelated to the CPU one (relative error 1.2-1.4)
+        # while ``t[..., a:b]``, ``torch.chunk`` and reshape-then-index are all
+        # exact. This was the model's actual bug.
+        num_v = self.num_v_heads
+        b, a = ba[..., :num_v], ba[..., num_v:]
 
         beta = b.float().sigmoid()
         # ``-exp(A_log) * softplus(a + dt_bias)`` is <= 0, so ``exp(g)`` in the
@@ -567,6 +573,43 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             out = out + padded[tap : tap + num_tokens] * self.conv1d_weight[:, tap]
         return out
 
+    @staticmethod
+    def _tail_rows(
+        rows_in: torch.Tensor, is_real: torch.Tensor, count: int
+    ) -> torch.Tensor:
+        """The last ``count`` real rows of ``rows_in``, without dynamic indexing.
+
+        The obvious implementation — count the real tokens, then
+        ``index_select`` at ``L - count .. L - 1`` — **silently miscompiles on
+        Neuron**. Measured with ``probe_device_ops.py``: the device result is
+        unrelated to the CPU one (relative error 1.5) while compiling without
+        complaint. The index is data-dependent (it comes from a device-side
+        ``sum``), and that is the part the compiler gets wrong.
+
+        So select by *arithmetic* instead. With ``r[t] = 1`` for ``t < L``,
+        ``r[t] - r[t+1]`` is a one-hot at ``t == L - 1``; shifting that left by
+        ``k`` moves it to ``t == L - 1 - k``. Stacking the shifts gives a
+        ``[count, T]`` selector matrix, and one matmul picks the rows. Every
+        index is a compile-time constant.
+
+        Rows that would fall before the start of the sequence (a prompt shorter
+        than ``count``) come out zero on their own: the shift pushes the one-hot
+        off the front. That matches a sequence starting from a cold state.
+        """
+        length = rows_in.shape[0]
+        real = is_real.to(rows_in.dtype)
+        # 1 at t == L - 1. F.pad supplies the r[T] == 0 the difference needs.
+        onehot_last = real - F.pad(real[1:], (0, 1))
+        selector = torch.stack(
+            [
+                F.pad(onehot_last[count - 1 - j :], (0, count - 1 - j))
+                if count - 1 - j
+                else onehot_last
+                for j in range(count)
+            ]
+        )
+        return selector @ rows_in
+
     def _split_heads(
         self, mixed: torch.Tensor, leading: tuple[int, ...]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -576,7 +619,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         more value heads than key heads (not the case for the 2B checkpoint,
         where both are 16, but the 27B sibling has 48 value heads).
         """
-        q, k, v = mixed.split(self.qkv_split, dim=-1)
+        # Plain slices rather than ``Tensor.split`` — see ``_project``.
+        key_dim, value_dim = self.key_dim, self.value_dim
+        q = mixed[..., :key_dim]
+        k = mixed[..., key_dim : 2 * key_dim]
+        v = mixed[..., 2 * key_dim : 2 * key_dim + value_dim]
         q = q.reshape(*leading, self.num_k_heads, self.head_k_dim)
         k = k.reshape(*leading, self.num_k_heads, self.head_k_dim)
         v = v.reshape(*leading, self.num_v_heads, self.head_v_dim)
@@ -678,11 +725,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # the *pre*-conv q/k/v at the last ``kernel - 1`` real positions; where
         # the prompt is shorter than the window the missing (negative) slots
         # stay zero, matching a sequence that started from a cold state.
-        state_len = self.conv_kernel_size - 1
-        num_real = is_real.to(torch.int32).sum()
-        rows = num_real - state_len + torch.arange(state_len, device=device)
-        keep = (rows >= 0).to(qkv.dtype).unsqueeze(-1)
-        new_conv_state = qkv.index_select(0, rows.clamp(min=0).to(torch.long)) * keep
+        new_conv_state = self._tail_rows(qkv, is_real, self.conv_kernel_size - 1)
 
         indices = self.state_indices(metadata, 1)
         self.conv_state.index_copy_(

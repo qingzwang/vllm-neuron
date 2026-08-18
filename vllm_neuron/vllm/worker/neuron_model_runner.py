@@ -1275,7 +1275,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         self.compile_options = {}
 
         # FIXME: -O1 and mac-threshold are temporary until NKI adds MAC count estimates for kernels.
-        hlo2tensorizer_opts = "--modular-flow-mac-threshold=10"
+        # A model can opt out via neuron_config.hlo2tensorizer_options: the
+        # threshold only exists for NKI kernels, and it makes neuronx-cc fail
+        # codegen on some pure-torch graphs (Qwen3.5's decode graph raises
+        # NCC_IBTN006 with it, and compiles cleanly without it).
+        override = getattr(self.neuron_config, "hlo2tensorizer_options", None)
+        hlo2tensorizer_opts = (
+            "--modular-flow-mac-threshold=10" if override is None else override
+        )
         # The unsafe fp8 cast flag is only needed on Trn2 where kernels use
         # legacy nl.float8_e4m3 (max=240). Trn3 supports OCP e4m3fn natively.
         from vllm_neuron.compile.platform import get_platform_target
@@ -1286,15 +1293,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         if not has_fp8:
             has_fp8 = getattr(self.neuron_config, "quantization", None) == "fp8"
         if has_fp8 and get_platform_target() not in ("trn3", "trn3pre"):
-            hlo2tensorizer_opts += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
+            hlo2tensorizer_opts = (
+                f"{hlo2tensorizer_opts} --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
+            ).strip()
         # vLLM optimization levels map 1:1 onto neuronx-cc optlevels (CHRS-721).
         self.compile_options["compiler_args"] = [
             "--auto-cast=none",
             "--verbose=35",
             f"-O{self.vllm_config.optimization_level.value}",
-            f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}",
             "--internal-backend-options=--enable-verifier=false",
         ]
+        if hlo2tensorizer_opts:
+            self.compile_options["compiler_args"].insert(
+                -1, f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}"
+            )
         logger.info(
             "neuronx-cc optlevel -O%s (from vLLM optimization_level)",
             self.vllm_config.optimization_level.value,

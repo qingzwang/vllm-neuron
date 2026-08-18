@@ -68,6 +68,13 @@ def main() -> None:
                 "num_batched_tokens_buckets": [args.prefill_bucket],
                 "num_seqs_buckets": [args.max_num_seqs],
                 "on_device_sampling_config": {"all_greedy": True},
+                # No extra hlo2tensorizer options. The runner's default
+                # --modular-flow-mac-threshold=10 exists only for NKI kernels,
+                # which this model has none of, and it makes neuronx-cc fail
+                # codegen on the decode graph (NCC_IBTN006: a pftranspose whose
+                # copy fails backend verification). Verified by recompiling the
+                # cached HLO by hand: fails with the flag, succeeds without it.
+                "hlo2tensorizer_options": "",
             },
         },
     )

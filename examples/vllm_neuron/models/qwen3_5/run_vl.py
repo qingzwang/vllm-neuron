@@ -15,9 +15,18 @@ Sizing, which has two independent knobs:
 
 * ``vision_attention_block_size`` is the **per-block** size, and one block holds
   exactly one item (the packer uses ``one_item_per_block=True``), so it must be at
-  least a single image's raw (pre-merge) token count ``T*H*W``. A 224x224 image at
-  patch 16 is a 14x14 grid = 196 raw tokens -> 49 merged, so 256 is enough. Bigger
-  blocks cost compile time and wasted compute.
+  least a single image's raw (pre-merge) token count ``T*H*W``. Note the *processor*
+  decides that count, not ``--image-size``: it re-resizes to satisfy its own pixel
+  bounds and the merge multiple. Measured for ``cherry_blossom``:
+
+      fed size            grid        raw    merged   needs block >=
+      224x224             1,16,16     256    64       256
+      336x336             1,20,20     400    100      512
+      448x448             1,28,28     784    196      1024
+      672x672             1,42,42     1764   441      2048
+      native 1770x1180    1,74,110    8140   2035     8192
+
+  Bigger blocks cost compile time and wasted compute, so size to the workload.
 * ``num_vision_tokens_buckets`` is the **total** budget across items, and it caps
   blocks per request at ``bucket / merge_factor / cache_block_size``. Two images
   therefore need ``bucket >= 2 * block_size``.
@@ -28,9 +37,11 @@ truncation: request has more cached blocks than max_vision_blocks_per_request=1"
 A **video** is packed per temporal group (``temporal_patch_size`` frames each), not
 per frame, and ``mm_processor_kwargs["max_pixels"]`` does not reach the video
 processor — so the block has to be sized for the video's native grid. Measured:
-``baby_reading`` at 4 frames needs ``--vision-block-size 1024 --vision-bucket
-2048``; 256/1024 fails with "produces 440 embedding tokens, which exceeds the
-maximum supported by the compiled vision encoder (256)".
+``baby_reading`` is 640x360 per frame, so 4 frames pair into 2 temporal groups of
+880 raw tokens each (a 40x22 grid) = 440 merged total, and it needs
+``--vision-block-size 1024 --vision-bucket 2048``. 256/1024 fails with "produces
+440 embedding tokens, which exceeds the maximum supported by the compiled vision
+encoder (256)".
 
 Usage:
 

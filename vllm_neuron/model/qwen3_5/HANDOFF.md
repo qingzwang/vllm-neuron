@@ -114,9 +114,11 @@ So the work splits into:
 - **`head_dim` is 256 but the plugin's attention kernel caps at 128.**
   `functional/attention/attention_cte.py` sets `MAX_HEAD_DIM = 128` and
   `_can_use_flash_attention_kernel` returns False above it, so the 6 full
-  attention layers will fall back to torch. On InternVL, materialising the
-  `s x s` attention matrix cost 12.1x on the vision encoder — so verify this
-  early and expect it to set the perf ceiling. Only 6 of 24 layers are affected.
+  attention layers fall back to torch. This was predicted to set the perf ceiling
+  by analogy with InternVL (12.1x on its vision encoder). **Measured, it does
+  not** — torch attention is 6-8% of prefill; see "Where prefill time actually
+  goes" below. With only 2 query heads per rank at TP=4 the `[2, seq, seq]` score
+  matrix is cheap.
 - Per-sequence DeltaNet state is small (19.6 MB at TP=1, ~4.9 MB/rank at TP=4),
   so state memory is not a concern at this scale.
 
@@ -570,7 +572,8 @@ and the attention score matrix is `[heads, 4096, 4096]`.
 
 ### VL accuracy vs HF
 
-`check_generation_vs_hf.py --vl`, 32 greedy tokens, one 224x224 image, device
+`check_generation_vs_hf.py --vl`, 32 greedy tokens, one image fed at 224x224
+(which the processor turns into a 16x16 grid = 256 raw / 64 merged tokens), device
 bf16 against HF float32 on CPU: **prefix 12, 16/32 tokens matched**. The
 divergence is a synonym choice, not a different reading of the image:
 
@@ -613,11 +616,15 @@ Three things to take from this:
 
 | | result |
 |---|---|
-| text, seq 1024 / 2048 / 4096 | works (2048/4096 device-verified via `probe_device_model.py`) |
+| text, seq 1024 / 2048 / 4096 / 8192 | works (2048+ device-verified via `probe_device_model.py`) |
 | batch 1 / 4 / 8 | works |
-| one image | described correctly |
+| one image, 256 raw / 64 merged tokens | described correctly |
 | two images | **both** described correctly and distinctly — cherry blossoms with a tower, then "a small, dark-colored SUV parked on a city street, with a prominent red STOP sign" |
-| video, 4 frames | "A baby wearing glasses sits on a bed and reads a book... holding the book with both hands and turning the pages" |
+| video, 4 frames (640x360, 440 merged tokens) | "A baby wearing glasses sits on a bed and reads a book... holding the book with both hands and turning the pages" |
+| image at 448x448 (784 raw / 196 merged) | richer description: "clusters of small, delicate flowers and slender green stems ... vivid, clear blue sky" |
+| image at 672x672 (1764 raw / 441 merged) | richer again: "upward-looking photograph ... dense canopy ... branches, dark brown and slender, crisscross the frame" |
+| VL at batch 2 | works — TTFT 160 ms, TPOT 5.05 ms, 317.6 tok/s aggregate |
+| text, seq 8192 | works (device-verified, both phases) |
 
 Two sizing traps, both in configuration rather than model code:
 
@@ -629,6 +636,38 @@ Two sizing traps, both in configuration rather than model code:
   does not reach the video processor** — `baby_reading` still reported 440
   embedding tokens with `max_pixels=65536`. Size block/bucket for the native grid
   instead: 4 frames needed `block_size=1024, bucket=2048`.
+
+## Where prefill time actually goes — and it is not what this doc predicted
+
+Measured with `probe_device_model.py --time N` plus the ablation switch, 24
+layers, TP=4 shapes, bf16 (collectives excluded, so these are one rank's compute
+rather than engine TTFT — the *ratios* are the point):
+
+| | seq 1024 | seq 4096 |
+|---|---|---|
+| all mixers on | 27.79 ms | 147.27 ms |
+| mixers off (embed + MLP + norms + head) | 4.76 ms | 25.35 ms |
+| attention ablated -> **DeltaNet cost** | **21.70 ms** (78%) | **92.35 ms** (72%) |
+| DeltaNet ablated -> **attention cost** | **1.81 ms** (6.5%) | **10.59 ms** (8%) |
+| per layer | 1.21 ms delta / 0.30 ms attn | 5.13 / 1.77 |
+
+**This contradicts what the "Constraints specific to this box" section above
+predicted.** That section reasoned that because `head_dim` is 256 and the flash
+kernel caps at `MAX_HEAD_DIM = 128`, the 6 torch-fallback attention layers would
+set the performance ceiling — citing InternVL, where materialising an `s x s`
+score matrix cost 12.1x. It is wrong for this model: torch attention is only
+6-8% of prefill. The pure-torch chunked delta rule is ~3/4 of it, in 18 layers.
+
+The reason the analogy failed: only 2 query heads per rank at TP=4, so the
+`[2, seq, seq]` score matrix is small, while the delta rule runs a 12-matmul
+blocked inverse plus a per-chunk carried recurrence over `seq/64` chunks in each
+of 18 layers.
+
+Scaling 1024 -> 4096 (4x tokens): DeltaNet 4.26x (roughly linear, as a linear-
+attention kernel should be), attention 5.85x (super-linear but far from the 16x a
+pure quadratic would give), spine 5.33x. So the balance barely shifts with context
+length and **the DeltaNet NKI port is the right optimisation across the range**,
+targeting ~72-78% of prefill. Decode still needs nothing.
 
 ## Status
 
@@ -650,5 +689,5 @@ Two sizing traps, both in configuration rather than model code:
       TTFT dominance that was expected
 - [x] Video input, multi-image, batches up to 8
 - [ ] NKI kernel port — purely a prefill/TTFT win; decode needs nothing
-- [ ] Contexts beyond 4096, and VL at batch > 1
+- [x] Contexts to 8192, VL at batch > 1, images to 672x672
 - [ ] Push the branch

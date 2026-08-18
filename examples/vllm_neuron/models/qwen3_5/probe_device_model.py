@@ -52,6 +52,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tol", type=float, default=5e-2)
     parser.add_argument(
+        "--time",
+        type=int,
+        default=0,
+        help="after checking correctness, run the compiled graph this many times "
+        "and report mean wall time. Combine with "
+        "VLLM_NEURON_QWEN35_ABLATE_MIXERS to attribute prefill cost to the two "
+        "mixer kinds.",
+    )
+    parser.add_argument(
         "--state-views",
         action="store_true",
         help="allocate the DeltaNet state as offset views into one raw buffer per "
@@ -266,10 +275,31 @@ def run_phase(args, phase: str, dtype: torch.dtype) -> str:
         try:
             compiled = torch.compile(call, backend=neuron_compile, dynamic=False)
             outputs["got"] = compiled(*moved)
+            compiled_call, compiled_args = compiled, moved
         except Exception as exc:
             lines = str(exc).strip().splitlines()
             print(f"  FAIL   {phase}: {lines[0][:120] if lines else type(exc).__name__}")
             return "FAIL"
+
+    if args.time:
+        import time as _time
+
+        # One untimed call first: the compiled graph is already built by the
+        # correctness run above, but the first execution still pays warm-up.
+        compiled_call(*compiled_args).cpu()
+        started = _time.perf_counter()
+        for _ in range(args.time):
+            # Sync every iteration: the Neuron runtime queue is shallow and
+            # unsynchronised submissions fail with "Execution Queue Full". The
+            # device->host copy is therefore included, but it is a few MB against
+            # a ~100 ms graph.
+            compiled_call(*compiled_args).cpu()
+        elapsed = (_time.perf_counter() - started) * 1000.0 / args.time
+        ablate = os.environ.get("VLLM_NEURON_QWEN35_ABLATE_MIXERS", "") or "none"
+        print(
+            f"  TIME   {phase}: {elapsed:8.2f} ms/call "
+            f"(layers={args.layers}, seq={args.seq}, ablate={ablate})"
+        )
 
     ref = outputs["ref"].float()
     got = outputs["got"].cpu().float()

@@ -431,6 +431,64 @@ matmul — exact, kept for simplicity, but the output did not change), compiler
 downcasting (`--auto-cast=none` is passed), packed prefills, weight-loading
 completeness, and the offset state views.
 
+## Measured: accuracy and latency at TP=4
+
+### Accuracy vs HF (`check_generation_vs_hf.py`)
+
+32 greedy tokens per prompt, device bf16 against HF float32 on CPU:
+
+    prefix 9    9/32    'The capital of France is'
+    EXACT      32/32    'I am gonna keep counting forever, 1 2 3 4 5'
+    EXACT      32/32    'def fibonacci(n):'
+    prefix 6    6/32    'Once upon a time, there was a'
+    EXACT      32/32    'The three primary colours are'
+
+    total 111/160 tokens (69.4%), 3/5 prompts exact
+
+Slightly ahead of the reference port's published bar (53/80 = 66%, 3/5 exact).
+**No first-token mismatches**, and both divergences are the benign kind — a
+matching prefix then a coin flip:
+
+* `' Paris.\nA. True\nB. '` then `True` (ours) vs `False` (HF)
+* `' little boy named Tom. Tom '` then `loved to play with his toys` vs
+  `was very curious`
+
+That is what bf16 against an independent float32 implementation looks like: the
+two agree until a near-tie, and greedy decoding then amplifies the difference. A
+mismatch on the *first* token would be a bug instead, which is why the script
+fails loudly on that case specifically.
+
+### Latency (`benchmark_latency.py`)
+
+896-token prompt + 128 output tokens (1024 total, the whole `max_model_len`),
+median of 3 rounds after a discarded warmup round, `AsyncLLM` streaming so TTFT
+is the true time to first token:
+
+| | batch 1 | batch 4 | reference, TP=4 |
+|---|---|---|---|
+| TTFT | **108.9 ms** | 262 ms mean (109 min / 412 max) | 42.2 ms |
+| TPOT | **3.72 ms** | 6.23 ms | 4.75 ms |
+| E2E | 581.7 ms | 1053.5 ms | — |
+| decode, per stream | 268.7 tok/s | 160.5 tok/s | 210 tok/s |
+| decode, aggregate | 268.7 tok/s | **482.6 tok/s** | — |
+
+So **decode is already faster than the reference** — TPOT 3.72 ms against
+4.75 ms, 268.7 tok/s against 210 — and **prefill is 2.6x slower**. That split is
+exactly the ceiling this document predicted before any of it ran, and it says
+where the NKI port would pay:
+
+* The 6 attention layers run in torch because `head_dim` 256 exceeds the flash
+  kernel's `MAX_HEAD_DIM` of 128, so prefill materialises a
+  `[heads, 1024, 1024]` score matrix per layer. On InternVL the same problem cost
+  12.1x on a vision encoder.
+* The chunked delta rule is pure torch where the reference uses NKI. Decode does
+  not care (a single recurrent step is tiny and memory-bound, which is why decode
+  wins), but prefill does all the chunked matmul work.
+
+The batch-4 TTFT spread (109 -> 412 ms) is prefills serialising: one prefill
+graph per forward, so request *n* waits for the *n-1* before it. Aggregate
+throughput still scales 1.8x from batch 1 to batch 4.
+
 ## Status
 
 - [x] Branch, checkpoint, reference clone
@@ -441,10 +499,10 @@ completeness, and the offset state views.
 - [x] Text decoder, factory, registry entry
 - [x] Boots, compiles and generates at TP=4
 - [x] **Correct text-only output at TP=4**
-- [ ] Latency measurement, and comparison against the reference's TP=4 numbers
-      (TTFT 42.2 ms, TPOT 4.75 ms, 210 tok/s at seq_len 1024)
-- [ ] Accuracy cross-check against HF on device (the CPU stack matches exactly;
-      the reference's own bar is 53/80 greedy tokens, 3/5 prompts exact)
-- [ ] NKI kernel port — a performance item, not a correctness one
-- [ ] Batch > 1 decode, and longer contexts
+- [x] Accuracy cross-check against HF on device — 69.4% greedy tokens, 3/5
+      prompts exact, no first-token mismatches (reference bar: 66%, 3/5)
+- [x] Latency at TP=4 — decode beats the reference (TPOT 3.72 vs 4.75 ms),
+      prefill is 2.6x slower (TTFT 108.9 vs 42.2 ms)
+- [ ] NKI kernel port — purely a prefill/TTFT win now; decode needs nothing
+- [ ] Longer contexts (only max_model_len 1024 has been run) and larger batches
 - [ ] VL stage

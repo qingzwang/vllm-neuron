@@ -54,10 +54,6 @@ SEQUENCE_PARALLEL = os.environ.get("VLLM_NEURON_QWEN35_DISABLE_SP") != "1"
 # uses, and the UT-transform inverse below assumes a power of two.
 _CHUNK_SIZE = 64
 
-# Matches ``vllm.v1.core.block_pool``'s sentinel: the runner writes -1 into
-# ``slot_mapping`` for padded batch rows.
-_PAD_SLOT_ID = -1
-
 
 # ---------------------------------------------------------------------------
 # Weight loaders

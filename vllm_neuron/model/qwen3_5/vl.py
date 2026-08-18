@@ -29,11 +29,7 @@ from __future__ import annotations
 
 import torch
 
-from vllm_neuron.model.interfaces import (
-    SupportsMaxPixels,
-    SupportsSpatialMerge,
-    SupportsVisionWarmup,
-)
+from vllm_neuron.model.interfaces import SupportsVisionWarmup
 from vllm_neuron.model.qwen3_vl.model_bf16 import (
     Qwen3VLForConditionalGeneration as _Qwen3VL,
 )
@@ -44,12 +40,7 @@ from .config import Qwen3_5Config
 from .model import Qwen3_5ForCausalLM
 
 
-class Qwen3_5VLForConditionalGeneration(
-    Qwen3_5ForCausalLM,
-    SupportsVisionWarmup,
-    SupportsSpatialMerge,
-    SupportsMaxPixels,
-):
+class Qwen3_5VLForConditionalGeneration(Qwen3_5ForCausalLM, SupportsVisionWarmup):
     """The text-only model plus a vision tower and the multimodal entry points."""
 
     def __init__(self, config: Qwen3_5Config):
@@ -74,15 +65,10 @@ class Qwen3_5VLForConditionalGeneration(
     embed_multimodal = _Qwen3VL.embed_multimodal
     build_vision_synthetic_inputs = _Qwen3VL.build_vision_synthetic_inputs
 
-    @classmethod
-    def get_vision_token_merge_factor(cls, hf_config) -> int:
-        """Raw vision tokens that collapse into one embedding token."""
-        return hf_config.vision_config.spatial_merge_size**2
-
-    @classmethod
-    def get_max_pixels_token_count(cls, hf_config, max_pixels: int) -> int:
-        """A ``max_pixels`` cap expressed as a raw (pre-merge) token count."""
-        return max_pixels // (hf_config.vision_config.patch_size**2)
+    # ``get_vision_token_merge_factor`` / ``get_max_pixels_token_count`` live on
+    # the *factory* in ``factory.py``, because ``vision_utils`` resolves them
+    # through the registry and the registry holds the factory. They are not
+    # duplicated here.
 
     # ── mRoPE with real vision grids ─────────────────────────────────────
 

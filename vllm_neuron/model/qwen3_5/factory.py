@@ -2,10 +2,12 @@
 """Factory for Qwen3.5, registered under the checkpoint's HF architecture name.
 
 The checkpoint declares ``Qwen3_5ForConditionalGeneration``, so vLLM's frontend
-supplies the config and the multimodal processor for free and only *execution*
-is replaced here. This port implements the text decoder; the ViT tower is not
-built yet, so the validation below rejects a vision request outright rather than
-dropping the image and answering from the text alone.
+supplies the config and the multimodal processor for free and only *execution* is
+replaced here.
+
+Two implementations sit behind this: the text-only decoder (``model.py``) and the
+vision-language model (``vl.py``). Which one is built depends on whether the
+runner supplied a ``VisionNeuronConfig`` — see ``_select_implementation``.
 """
 
 from __future__ import annotations
@@ -13,11 +15,21 @@ from __future__ import annotations
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from vllm_neuron.model.interfaces import SupportsMaxPixels, SupportsSpatialMerge
 from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
 
 
-class Qwen3_5ForConditionalGeneration(nn.Module):
-    """Validates the config, then builds the text-only implementation."""
+class Qwen3_5ForConditionalGeneration(
+    nn.Module, SupportsSpatialMerge, SupportsMaxPixels
+):
+    """Selects the text-only or the vision-language implementation.
+
+    The spatial-merge and max-pixels classmethods have to live **here**, not on
+    the implementation: ``vision_utils`` resolves them through the *registry*,
+    which holds this factory. Putting them only on the VL class silently yields a
+    merge factor of 1, which mis-sizes the encoder cache blocks by 4x and fails
+    at graph capture with an ``aten::index_put`` lowering error.
+    """
 
     def __init__(
         self,
@@ -118,3 +130,15 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
 
     # Vision support is selected in ``_select_implementation`` above, not guarded
     # here: the two implementations differ only in whether the tower exists.
+
+    @classmethod
+    def get_vision_token_merge_factor(cls, hf_config: PretrainedConfig) -> int:
+        """Raw vision tokens that collapse into one embedding token."""
+        return hf_config.vision_config.spatial_merge_size**2
+
+    @classmethod
+    def get_max_pixels_token_count(
+        cls, hf_config: PretrainedConfig, max_pixels: int
+    ) -> int:
+        """A ``max_pixels`` cap expressed as a raw (pre-merge) token count."""
+        return max_pixels // (hf_config.vision_config.patch_size**2)

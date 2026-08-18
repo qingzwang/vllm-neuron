@@ -202,6 +202,118 @@ def _strictly_lower_inverse(a: torch.Tensor, size: int) -> torch.Tensor:
     return inv
 
 
+def _nki_chunk_gated_delta_rule(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The same recurrence, on the vendored NKI kernel. **Off by default.**
+
+    Kept because the measurement is the useful part, and because a future kernel
+    would start here. Measured with ``probe_nki_deltanet.py`` (4 heads, one rank):
+
+        seq 1024:  torch 0.99 ms   nki  9.72 ms   (0.10x)
+        seq 4096:  torch 2.95 ms   nki 37.51 ms   (0.08x)
+
+    It is *correct* — output agrees with the torch reference to 1.2e-05 and the
+    final state to 2.5e-06 — just slow, and no better at longer sequences, so it
+    is not launch overhead.
+
+    The reason is a design mismatch rather than a bug. This kernel is built to keep
+    the 128x128 state in SBUF across chunks and avoid HBM round-trips, so it walks
+    one (batch, head) and one 128-token chunk at a time: 4 heads x 32 chunks = 128
+    sequential steps at seq 4096. The torch path instead folds every
+    (head, chunk) pair into one batch dimension and issues *batched* matmuls — 256
+    instances at once — which is what this hardware's Tensor Engine wants. Trading
+    memory traffic for parallelism is the wrong trade here.
+
+    The reference's own newer *multihead* kernel batches head groups and is its
+    default for text, but it is the one it documents as numerically unstable on
+    vision embeddings, and it would have to beat this by ~10x merely to draw level
+    with torch. Note also the ceiling: model compute is ~28 ms of a ~109 ms TTFT,
+    so even a free delta rule would only take about 20% off.
+
+    Contract (the reference's "legacy_direct" mode): ``query`` arrives
+    L2-normalised, this function applies the ``1/sqrt(dk)`` scale, ``key`` is
+    L2-normalised, ``g`` is RAW per-token log-decay (the kernel does its own
+    cumsum), ``beta`` is ``sigmoid(b)``.
+    """
+    from vllm_neuron.nki.nki_hop import wrap_nki
+
+    from .nki_deltanet import CHUNK_SIZE, deltanet_fused_chunked_fwd
+
+    b, h, t, dk = query.shape
+    dv = value.shape[-1]
+    device = query.device
+    bh = b * h
+
+    # (B, H, T, d) -> (B*H, T, d); g/beta -> (B*H, T, 1) as the kernel wants.
+    # The 1/sqrt(dk) query scale is applied here because the torch body applies it
+    # internally too — callers pass unscaled queries to either path.
+    query_f = (query * (dk**-0.5)).reshape(bh, t, dk).float().contiguous()
+    key_f = key.reshape(bh, t, dk).float().contiguous()
+    value_f = value.reshape(bh, t, dv).float().contiguous()
+    g_f = g.reshape(bh, t).unsqueeze(-1).float().contiguous()
+    beta_f = beta.reshape(bh, t).unsqueeze(-1).float().contiguous()
+    state_f = initial_state.reshape(bh, dk, dv).float().contiguous()
+
+    # The kernel's three constant masks, shared across launches. Built with torch
+    # ops on ``device`` rather than from the kernel module's numpy helpers: a
+    # ``torch.tensor(numpy_array)`` inside the traced graph produces a CPU tensor,
+    # and the mixed-device call then fails to dispatch with "could not find kernel
+    # for HigherOrderOperator nki_kernel_wrapper at dispatch key PrivateUse1".
+    ones = torch.ones(CHUNK_SIZE, CHUNK_SIZE, dtype=torch.float32, device=device)
+    lower_mask = ones.tril(-1)  # strict lower triangle
+    lower_mask_diag = ones.tril(0)  # lower triangle including the diagonal
+    identity = torch.eye(CHUNK_SIZE, dtype=torch.float32, device=device)
+
+    kernel = wrap_nki(deltanet_fused_chunked_fwd)
+    outputs, states = [], []
+    for i in range(bh):
+        out_i, state_i = kernel(
+            query_f[i],
+            key_f[i],
+            value_f[i],
+            g_f[i],
+            beta_f[i],
+            state_f[i],
+            lower_mask,
+            identity,
+            lower_mask_diag,
+        )
+        outputs.append(out_i)
+        states.append(state_i)
+
+    output = torch.stack(outputs, dim=0).reshape(b, h, t, dv)
+    final_state = torch.stack(states, dim=0).reshape(b, h, dk, dv)
+    return output, final_state
+
+
+def _can_use_nki_delta_rule(query: torch.Tensor, value: torch.Tensor) -> bool:
+    """Whether the vendored kernel's fixed geometry matches this call.
+
+    The kernel hard-codes ``P_MAX = CHUNK_SIZE = k_dim = v_dim = 128`` and needs
+    the sequence padded to a multiple of 128. Everything else falls back to torch,
+    which is the reference implementation the CPU checks validate.
+    """
+    # Opt **in**, not out. Measured on device, the kernel is numerically right but
+    # much slower than the torch path — see ``_nki_chunk_gated_delta_rule``.
+    if os.environ.get("VLLM_NEURON_QWEN35_ENABLE_NKI") != "1":
+        return False
+    from vllm_neuron.nki.nki_hop import can_run_kernel
+
+    if not can_run_kernel(query):
+        return False
+
+    from .nki_deltanet import CHUNK_SIZE, P_MAX
+
+    _b, _h, t, dk = query.shape
+    return dk == P_MAX and value.shape[-1] == P_MAX and t % CHUNK_SIZE == 0
+
+
 def chunk_gated_delta_rule(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -213,8 +325,14 @@ def chunk_gated_delta_rule(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunked gated delta rule for prefill.
 
+    The torch body below is the shipped path. ``VLLM_NEURON_QWEN35_ENABLE_NKI=1``
+    switches to the vendored NKI kernel, which is correct but ~10x slower — see
+    ``_nki_chunk_gated_delta_rule`` for the numbers and why.
+
     Args:
-        query, key: ``[B, H, T, head_k_dim]``, already L2-normalised.
+        query, key: ``[B, H, T, head_k_dim]``, already L2-normalised. Note this
+            function applies the ``1/sqrt(head_k_dim)`` query scale itself, so
+            callers pass unscaled queries either way.
         value: ``[B, H, T, head_v_dim]``.
         g: ``[B, H, T]`` log decay per token (<= 0).
         beta: ``[B, H, T]`` update strength in (0, 1).
@@ -229,6 +347,13 @@ def chunk_gated_delta_rule(
     per-chunk state carry is left as a Python loop over ``T / chunk_size``,
     which is a compile-time constant here because ``T`` is bucketed.
     """
+    # On device, hand this to the NKI kernel; the torch body below stays the
+    # reference implementation and the CPU checks keep validating it.
+    if _can_use_nki_delta_rule(query, value):
+        return _nki_chunk_gated_delta_rule(
+            query, key, value, g, beta, initial_state
+        )
+
     b, h, t, dk = query.shape
     dv = value.shape[-1]
     if t % chunk_size:

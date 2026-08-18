@@ -295,140 +295,141 @@ real weights.
 - **Speculative decode** raises: the DeltaNet decode path wants one token per
   request, and multi-token decode needs the recurrence stepped per draft token.
 
-## Bring-up: it runs, and the output is wrong
+## Bring-up: working at TP=4
 
-`examples/vllm_neuron/models/qwen3_5/run.py` boots, compiles, warms up both KV
-cache groups on all 4 ranks and generates, exit 0. **Generation is wrong from the
-first token** — "The capital of France is" → " most". By the rule below, first-token
-divergence is a bug, not bf16 noise.
+`examples/vllm_neuron/models/qwen3_5/run.py` generates correct text:
 
-Five plumbing fixes were needed to get that far; the first two are the
-interesting ones and both are corrections to what an earlier version of this
-document claimed.
+    'The capital of France is'            -> ' Paris.'
+    'I am gonna keep counting forever...' -> ' 6 7 8 9 10 11 12 13 14 15 16 17'
+    'def fibonacci(n):'                   -> a correct recursive base-case chain
+    'Once upon a time, there was a'       -> ' little boy named Tom. Tom loved...'
+
+Getting there took five plumbing fixes and then two genuine bugs that only exist
+on the device. The plumbing first, briefly:
 
 1. **vLLM's hybrid page-size alignment never runs on the Neuron path.**
    `Platform._align_hybrid_block_size` grows the attention block size until its
    page is at least the state page, then pads the state page to match — but vLLM
    gates it on `_find_non_ssm_backend` finding one of *its own* attention
    backends, and this platform registers none. Without it startup dies in
-   `unify_kv_cache_spec_page_size`, because a DeltaNet state page is 271360
-   bytes per rank and that factors as `1024 * 5 * 53`, so no sane block size
-   divides it. `Platform.update_block_size_for_backend` now calls vLLM's helper
-   directly with a stub backend supplying the one method it reads. Effect at
-   TP=4: **block_size 32 → 288**, `mamba_page_size_padded` None → 294912, 8.68%
-   state padding. Call vLLM's implementation rather than copying the arithmetic:
-   the same helper sizes the pages the planner allocates.
-2. **Neuron device tensors reject vLLM's state layout.** Its `gpu_model_runner`
-   strides each state tensor so the block dim steps by a whole page; the runtime
-   answers "Detected non-contiguous slicing for requested Device Tensor". The
-   runner now lays the states out one after another so each is contiguous. Sound
-   only because nothing outside the model reads them — the page size is
-   unchanged so the planner's accounting holds, and the per-block state-copy
-   hooks are inactive at `mamba_cache_mode == "none"`.
+   `unify_kv_cache_spec_page_size`: a DeltaNet state page is 271360 bytes per
+   rank, which factors as `1024 * 5 * 53`, so no sane block size divides it.
+   `update_block_size_for_backend` now calls vLLM's helper directly with a stub
+   backend. Effect at TP=4: **block_size 32 -> 288**, state page padded 8.68%.
+2. **Neuron device tensors reject vLLM's state layout** (its `gpu_model_runner`
+   strides the block dim by a whole page). The runner now lays the states out
+   contiguously one after another. Sound only because nothing outside the model
+   reads them and `mamba_cache_mode` is `"none"`.
 3. Vision bucket resolution ran for a text-only launch of a vision-capable
-   checkpoint and then failed validating a 2048 vision block against a 1024 text
-   `max_model_len`. Now skipped when every `limit_mm_per_prompt` count is 0. Note
-   those counts are `BaseDummyOptions` objects, not ints.
+   checkpoint; now skipped when every `limit_mm_per_prompt` count is 0. Those
+   counts are `BaseDummyOptions` objects, not ints.
 4. vLLM derives `uses_mrope` from the HF config and then *requires* the
    `SupportsMRoPE` protocol, so even a text-only port must implement it.
-5. The runner passes `vision_embedding_blocks`/`vision_positions` to any model
-   whose HF config has a `vision_config`. Accepted and ignored.
+5. `load_weights` asserts every parameter received a tensor — the loader has to
+   be `strict=False`, so a wrong mapping key would otherwise leave a parameter at
+   its uninitialised `torch.empty` value and produce fluent garbage.
 
-### What is ruled out, with evidence
+### Probe on the device, do not guess through the engine
 
-- **Both layer kinds.** Bit-exact or ~1e-7 against HF on CPU in float32,
-  including TP=4 through the real weight loaders. See the check scripts above.
-- **Weight loading completeness.** All 320 referenced checkpoint keys exist, and
-  `load_weights` now raises if any parameter got no tensor — it does not fire.
-  This mattered to check: the loader must be `strict=False` (it does not know
-  about buffers like rotary `inv_freq`), so a wrong mapping key would leave a
-  parameter at its uninitialised `torch.empty` value and produce exactly this
-  symptom with no error anywhere.
-- **Compiler downcasting.** The runner passes `--auto-cast=none`, so the float32
-  delta rule stays float32. This mattered because the in-chunk matrix has a
-  dynamic range that bf16 could not survive (see the Neumann note above).
-- **Packed prefills.** The DeltaNet padding mask and the attention causal mask
-  both assume one sequence per prefill forward. That assumption is safe: the
-  Qwen3-VL decoder next door makes it too (plain causal `NF.flash_attention`,
-  no segmentation) and works.
+An engine run costs ~9 minutes and only ever reports "the whole model is wrong".
+Two probes replaced that with seconds-long, op-level answers, and they are the
+reason the bugs below were found at all:
 
-### Localised: the spine is correct on device, a mixer is not
-
-Bisected with the ablation switch in `model.py`
-(`VLLM_NEURON_QWEN35_ABLATE_MIXERS`), comparing the *same reduced model* between
-device and CPU. Output text is meaningless under ablation; only the agreement
-matters. CPU references come from a short driver over
-`check_model_vs_hf.build_ours`.
-
-| experiment | result |
+| script | what it does |
 |---|---|
-| SP disabled (`VLLM_NEURON_QWEN35_DISABLE_SP=1`) | **same first tokens** as SP on -> the collectives are not the bug |
-| depthwise `F.conv1d` -> unrolled taps, `cumsum` -> matmul | output unchanged (2 of 4 prompts byte-identical) -> those ops were not wrong |
-| all mixers ablated | device **matches CPU**: prompt 1 `'atches'` exactly, prompt 3 `'icals'` = CPU's #2 in a near-tie (bf16 vs fp32) |
-| DeltaNet ablated, attention kept | **does not compile** (`neuronx-cc` 70) |
-| attention ablated, DeltaNet kept | **does not compile** (`neuronx-cc` 70) |
+| `probe_device_ops.py` | Hands the plugin's own `vllm_neuron.compile.backend.compile` to `torch.compile`, puts inputs on `neuron:0`, and diffs one function or module against CPU. Reports `OK` / `WRONG` (compiles but disagrees) / `FAIL` (does not compile). |
+| `probe_device_model.py` | The same for a whole `Qwen3_5TextModel`, scalable by `--layers`, `--tp`, `--dtype`, `--head` and `--state-views`, so model-level and scale-dependent codegen problems reproduce cheaply. |
 
-So embedding, MLP, norms, the vocab-sharded LM head, the sampler and every
-collective are **correct on device**, and the fault is inside a mixer. Note only
-"all mixers on" and "all mixers off" compile, so the two mixer kinds cannot be
-separated by ablation — bisect by *simplifying* a mixer instead, adding pieces
-back on top of the known-good ablated model (e.g. keep the DeltaNet's
-projections, conv and output stage but set `core = v` to remove the recurrence).
+This is the same trick as the CPU checks — compare against a reference you trust
+— but with the compiler in the loop. Reach for it first next time.
 
-Ranked suspects inside the DeltaNet prefill, which is where the first token is
-decided (the state write cannot matter until decode):
+Two harness gotchas worth knowing: `expand(...).contiguous()` is unsupported on
+device tensors (build block tables on CPU, then move), and the rotary module
+cannot run eagerly on device (`Expected self.dtype() == dst.dtype()`), so
+precompute `cos`/`sin` on CPU.
 
-1. **`_strictly_lower_inverse`** — 6 dependent rounds of masked batched matmuls
-   over `[1, 4, 16, 64, 64]`. Already made its identity operand contiguous
-   rather than an `expand_as` broadcast view, untested on device.
-2. **The 16-iteration chunk loop** carrying `state` — long dependent chain of
-   batched matmuls.
-3. **The `is_real` padding mask**, derived from `positions`. Worth noting *no
-   other model in this plugin reads `positions` during prefill* (Qwen3-VL uses it
-   only in decode), so the runner's prefill `positions` have never been exercised
-   before. Print them from inside the graph to confirm they are `0..L-1` then
-   frozen.
-4. Extreme dynamic range: `g` reaches -4.6 per token, so the in-chunk cumsum
-   reaches -297 and `exp` underflows to 0. Fine in float32 (CPU agrees), but
-   worth confirming the device really keeps these tensors in float32 rather than
-   demoting them despite `--auto-cast=none`.
+### Bug 1: `Tensor.split(sizes, dim=-1)` silently miscompiles
 
-### Conclusion: the pure-torch chunked DeltaNet is not viable on Neuron
+The symptom was perfect: per-stage diffing showed the padding mask, the
+projections and the post-conv activations all matching to ~1e-6, and then `q`
+and `v` wrong by relative error 1.2-1.3, with `beta`/`g` wrong too. The one thing
+those had in common was a last-dim `.split()`.
 
-Following the reference's TP/Neuron notes closed this out. `modeling_qwen35.py`
-line 3114 documents that it had to collapse attention to `(B*H, S, d)` because
-neuronx-cc fails codegen on rank-4 attention weights (`NCC_INLA001: Expected 2D
-tensor but got 4D AP`), and line 1912 says its own PyTorch `_chunk_forward`
-"can hit neuronx-cc codegen ICE NCC_INLA001 with these DeltaNet dimensions" —
-which is why `USE_NKI_FUSED` defaults to **1** and the torch path exists only
-for debugging. That is exactly the code this port started from.
+Probed the alternatives directly:
 
-Measured here, both pure-torch formulations of the chunked delta rule fail, in
-opposite ways:
+| form | device vs CPU |
+|---|---|
+| `t.split((512, 512, 512), -1)[1]` | **rel 1.4** |
+| `t[..., 512:1024]` | exact |
+| `torch.chunk(t, 3, dim=-1)[1]` | exact |
+| `t.reshape(N, 3, 512)[:, 1]` | exact |
 
-| formulation | compiles | correct |
-|---|---|---|
-| rank 5, `[b, h, chunks, chunk, dim]` | yes | **no** — garbage from the first token |
-| rank 3, `[b*h*chunks, chunk, dim]` (the reference's documented remedy) | **no** — `neuronx-cc` 70 | exact on CPU |
+Both uses were in the DeltaNet — the q/k/v split and the fused `b|a` split — so
+all 18 layers were affected. Now plain slices. **Do not use `Tensor.split` in
+device code in this plugin.**
 
-Both are numerically exact on CPU against HF (~1e-7), so this is a compiler
-limit, not a maths bug. **HEAD carries the rank-3 form, so it does not currently
-compile**; the rank-5 form is one `git revert` of the rank-3 commit away if you
-want a device-runnable (but wrong) build to keep bisecting with.
+### Bug 2: the runner's `--modular-flow-mac-threshold=10` breaks codegen
 
-The fix is therefore the same one the reference took: **port the NKI kernel**.
-That was already on the plan as a performance item; it turns out to be a
-correctness prerequisite. Start from `src/nki_kernels/nki_deltanet.py`
-(recurrent step — simplest, and enough to validate decode) before
-`nki_deltanet_fused.py` (the reference's default prefill path), and remember the
-fused *multihead* variant is the one that breaks on vision embeddings in the VL
-stage.
+The decode graph failed with `NCC_IBTN006`: a `pftranspose` whose `Copy` fails
+the `start_addr_active_channels` assertion. Isolated *without the engine* by
+recompiling the cached HLO by hand — the failed compile leaves its `graph.hlo`
+and the exact `command.txt` under `$VLLM_CACHE_ROOT/neuron/compile_cache/<hash>/`
+(the failing directory is the one with no `.neff`):
 
-Everything around the kernel is ready and verified, which is the good news: the
-spine is proven correct on device, both mixers are exact on CPU including at
-TP=4 through the real loaders, and `check_{deltanet,attention,model}_vs_hf.py`
-will validate an NKI kernel the moment it lands — swap it in behind
-`chunk_gated_delta_rule` and re-run them.
+| flags | result |
+|---|---|
+| as the runner passes them | fails, exit 70 |
+| `-O2` instead of `-O1` | compiles |
+| `-O1`, no internal options | compiles |
+| `-O1` + `--modular-flow-mac-threshold=10` alone | **fails** |
+| `-O1` + `--enable-verifier=false` alone | compiles |
+
+The runner passes that threshold unconditionally, with a FIXME saying it is only
+needed until NKI kernels report MAC counts — and this model has no NKI kernels.
+So `NeuronConfig.hlo2tensorizer_options` now overrides those extra options;
+`""` means none, and `run.py` sets it. Default behaviour for every other model is
+unchanged. Note this had to be added in **two** places: the dataclass field *and*
+`from_dict`'s explicit whitelist, which silently drops unknown keys.
+
+### Two more device-only hazards, same probes
+
+- **Data-dependent `index_select` miscompiles.** The conv-state tail was gathered
+  at `L - 3 .. L - 1` with `L` from a device-side `sum`. Replaced by `_tail_rows`,
+  which selects by arithmetic: `r[t] - r[t+1]` is a one-hot at the last real
+  token, and shifting it builds a static `[count, T]` selector applied with one
+  matmul. Every index is a compile-time constant, and prompts shorter than the
+  window zero-fill for free.
+- **Rank-5 `permute` is what emitted the bad `pftranspose`.** Decode attention
+  used to index the cache with the block table and then permute to move the
+  KV-head dim in front of the block dim. It now flattens the cache to
+  `[blocks * kv_heads, block_size, dim]` and gathers rows by an index computed per
+  (request, query head) — dropping both the permute and the `repeat_interleave`
+  that expanded KV heads to query heads.
+
+### The rank-3 rewrite, and what it was not
+
+The delta rule is written entirely at rank 3 — `(b, h)` and the chunk index fold
+into one batch dim, chunks are taken by `unbind` rather than sliced out of a
+rank-5 tensor. That followed the reference's note at `modeling_qwen35.py:3114`
+that it had to collapse attention to `(B*H, S, d)` to avoid
+`NCC_INLA001: Expected 2D tensor but got 4D AP`.
+
+Worth being honest: this was **not** the bug. The rank-5 form also compiled and
+was also wrong, for the `split` reason above. The rewrite is kept because it is
+good practice on this compiler and marginally simpler, not because it fixed
+anything. The reference's warning that its PyTorch `_chunk_forward` "can hit
+neuronx-cc codegen ICE with these DeltaNet dimensions" did not reproduce here
+once the real bugs were out of the way — **the pure-torch chunked delta rule
+compiles and runs correctly on Neuron.** The NKI port is back to being a
+performance item.
+
+### Also not the bug, ruled out with evidence
+
+Sequence parallelism (disabling it changed nothing), the grouped depthwise
+`F.conv1d` and `torch.cumsum` (replaced with unrolled taps and a triangular
+matmul — exact, kept for simplicity, but the output did not change), compiler
+downcasting (`--auto-cast=none` is passed), packed prefills, weight-loading
+completeness, and the offset state views.
 
 ## Status
 
@@ -439,8 +440,11 @@ will validate an NKI kernel the moment it lands — swap it in behind
 - [x] Gated GQA layer with partial interleaved mRoPE (`model.py`)
 - [x] Text decoder, factory, registry entry
 - [x] Boots, compiles and generates at TP=4
-- [x] Spine (embed / MLP / norms / head / sampler / collectives) verified on device
-- [ ] **Correct output** — wrong from the first token; localised to a mixer
-- [ ] **NKI kernel port** — now a correctness prerequisite, not just perf
-- [ ] Latency measurement
+- [x] **Correct text-only output at TP=4**
+- [ ] Latency measurement, and comparison against the reference's TP=4 numbers
+      (TTFT 42.2 ms, TPOT 4.75 ms, 210 tok/s at seq_len 1024)
+- [ ] Accuracy cross-check against HF on device (the CPU stack matches exactly;
+      the reference's own bar is 53/80 greedy tokens, 3/5 prompts exact)
+- [ ] NKI kernel port — a performance item, not a correctness one
+- [ ] Batch > 1 decode, and longer contexts
 - [ ] VL stage

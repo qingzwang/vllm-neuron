@@ -222,13 +222,34 @@ def _nki_chunk_gated_delta_rule(
     final state to 2.5e-06 — just slow, and no better at longer sequences, so it
     is not launch overhead.
 
-    The reason is a design mismatch rather than a bug. This kernel is built to keep
-    the 128x128 state in SBUF across chunks and avoid HBM round-trips, so it walks
-    one (batch, head) and one 128-token chunk at a time: 4 heads x 32 chunks = 128
-    sequential steps at seq 4096. The torch path instead folds every
-    (head, chunk) pair into one batch dimension and issues *batched* matmuls — 256
-    instances at once — which is what this hardware's Tensor Engine wants. Trading
-    memory traffic for parallelism is the wrong trade here.
+    The reason is algorithmic, not a bug in the kernel. Two differences compound.
+
+    **The in-chunk triangular inverse.** Both paths must apply ``(I - A)^-1`` for a
+    strictly lower-triangular 128x128 (or 64x64) ``A``. This kernel does classical
+    forward substitution: ``P_MAX`` sequential steps, and because NKI wants static
+    shapes each step issues a *full* ``A^T @ v_new`` matmul and then masks all but
+    one row of the result (see ``nki_deltanet.py``, the ``nl.static_range(P_MAX)``
+    loop). So it spends 128 dense 128x128x128 matmuls to extract 128 rows. The
+    torch path uses the blocked elimination in ``_strictly_lower_inverse``: 12
+    batched matmuls in 6 dependent rounds, no wasted rows. Roughly 40x the
+    arithmetic, in 16384 sequential ops against 12 batched ones at seq 4096.
+
+    **Where that inverse sits relative to the state recurrence.** HF's factorisation
+    — which the torch path follows — writes
+    ``v_new = T @ v_beta - (T @ (k_beta * e^g)) @ state``, so both applications of
+    ``T`` are computed for *every* chunk before the sequential loop starts, batched
+    over all ``(head, chunk)`` pairs. The kernel instead solves
+    ``(I - A) v_new = v_beta - (k_beta * e^g) @ state`` with ``state`` on the
+    right-hand side, which is algebraically the same but forces the solve *inside*
+    the serial loop. The torch loop is then left with only four small matmuls per
+    chunk (the state carry); the kernel's carries 128 large ones.
+
+    That is the cost of its design goal: keeping the state in SBUF across chunks to
+    avoid HBM round-trips means walking one (batch, head) and one chunk at a time,
+    so the expensive part lands in the serial region. Note the kernel is *not*
+    inefficient per operation — it does ~40x the arithmetic for ~13x the time, so
+    its dense matmuls and SBUF residency are doing real work. The algorithm it
+    implements is simply the wrong one for this hardware at these sizes.
 
     The reference's own newer *multihead* kernel batches head groups and is its
     default for text, but it is the one it documents as numerically unstable on

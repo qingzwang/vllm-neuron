@@ -699,6 +699,27 @@ this checkpoint's weights, against 1.2e-7 for elimination — which the recurren
 then damps to 1.2e-05 end to end. Both statements are true and the earlier wording
 here, which said flatly that Neumann "is not usable", was too broad.
 
+**There is no library on either side.** The "torch" path is not eager PyTorch:
+dynamo traces it to an FX graph (336 `matmul` nodes for this function), the
+plugin's backend lowers it to HLO, and *neuronx-cc* — the same compiler that
+builds the NKI kernels — emits a NEFF for the same Tensor Engine. Counting the
+in-chunk inverse plus its application exactly, per 128 tokens of one head:
+
+| | inverse FLOPs | vs torch | time vs torch | achieved throughput |
+|---|---|---|---|---|
+| torch | 16.8 MFLOP | 1.00x | 1.00x | 1.00x |
+| `fused` | 7.9 MFLOP | **0.47x** | 2.30x | **0.20x** |
+| `legacy` | 536.9 MFLOP | **32x** | 12.02x | **2.66x** |
+
+So the two kernels lose for opposite reasons, and neither is "torch has a faster
+library":
+
+* `legacy` loses on **arithmetic** — 32x the FLOPs, while achieving 2.7x *better*
+  hardware utilisation than the torch path. A well-engineered kernel running a
+  wasteful algorithm.
+* `fused` loses on **utilisation** — it does less than half the arithmetic and
+  still takes 2.3x the time, so it reaches a fifth of the throughput.
+
 **Why the fused kernel still loses.** Not the inverse any more — the serial
 structure. Each kernel is one launch per `(batch, head)` and walks chunks with
 `sequential_range`, because its design goal is keeping the 128x128 state in SBUF

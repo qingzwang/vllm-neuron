@@ -224,17 +224,38 @@ def _nki_chunk_gated_delta_rule(
     Both are *correct* — output within 1.2e-05 of the torch reference, final state
     within 2.5e-06.
 
-    So the inverse algorithm is most of the story: the hierarchical one is 5.2x
-    faster than forward substitution. What remains is the serial structure. Each
-    kernel is one launch per ``(batch, head)`` and walks chunks with
-    ``sequential_range`` — 4 heads x 8 chunks = 32 sequential chunk steps at seq
-    1024 — because its design goal is keeping the 128x128 state in SBUF across
-    chunks. The torch path instead folds every ``(head, chunk)`` pair into one
-    batch dimension and issues *batched* matmuls (64 instances at once), so its
-    serial region holds only four small matmuls per chunk. The rank-3 rewrite done
-    earlier for compiler reasons is what exposes that, so it mattered twice.
+    **There is no library involved on either side.** The torch path is not eager
+    PyTorch: dynamo traces it to an FX graph (336 ``matmul`` nodes for this
+    function), which the plugin's backend lowers to HLO and hands to *neuronx-cc*,
+    the same compiler that builds the NKI kernels, running on the same Tensor
+    Engine. No BLAS, no hand-tuned library. So the difference is entirely in what
+    the two express, and it is not the same difference for the two variants.
 
-    HF's factorisation is what allows the hoisting:
+    Counting the in-chunk inverse and its application exactly, per 128 tokens of
+    one head:
+
+    | | inverse FLOPs | vs torch | time vs torch | achieved throughput |
+    |---|---|---|---|---|
+    | torch | 16.8 MFLOP | 1.00x | 1.00x | 1.00x |
+    | ``fused`` | 7.9 MFLOP | **0.47x** | 2.30x | **0.20x** |
+    | ``legacy`` | 536.9 MFLOP | **32x** | 12.02x | **2.66x** |
+
+    Two different failure modes, and neither is "torch has a faster library":
+
+    * ``legacy`` loses on **arithmetic**. Forward substitution issues a full
+      128x128x128 matmul per row and keeps one row, so 32x the work. Its hardware
+      utilisation is actually 2.7x *better* than the torch path's — it is a
+      well-engineered kernel executing a wasteful algorithm.
+    * ``fused`` loses on **utilisation**. Its hierarchical inverse is genuinely
+      cheaper than the blocked elimination — less than half the FLOPs — and it
+      still takes 2.3x the time, i.e. it reaches only a fifth of the throughput.
+      That is serialisation: one launch per ``(batch, head)`` walking chunks with
+      ``sequential_range``, so 4 launches x 8 chunks = 32 dependent steps at seq
+      1024, each too small to fill the engine. The torch graph puts the same work
+      into a handful of matmuls batched over all 64 ``(head, chunk)`` pairs, which
+      is what lets the compiler keep the Tensor Engine busy.
+
+        HF's factorisation is what allows the hoisting:
     ``v_new = T @ v_beta - (T @ (k_beta * e^g)) @ state`` keeps both applications
     of ``T`` free of ``state``, so they can be computed for every chunk before the
     sequential loop. The kernels solve ``(I - A) v_new = rhs(state)`` with state on

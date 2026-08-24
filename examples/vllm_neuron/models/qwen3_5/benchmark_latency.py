@@ -20,6 +20,26 @@ Usage:
     NEURON_CC_FLAGS="--temp-dir=/tmp/neuroncc_tmp" \
     PYTHONPATH=/mnt/nvme/vllm-neuron PATH=$V/bin:$PATH $V/bin/python \
       benchmark_latency.py --max-num-seqs 1 --input-tokens 1024 --output-tokens 128
+
+Every request gets a *unique* image (a salted 4x4 corner), because vLLM caches
+multimodal encoder outputs by image hash and re-sending one identical image
+measures that cache instead of the tower — it understated the vision cost by 7-40x
+before this was fixed. ``--reuse-image`` restores the old behaviour deliberately.
+
+``--vision-bucket`` sets the per-block size as well (one image, one block), so it
+is also the knob for the resolution sweep in HANDOFF's "Latency vs image
+resolution". Pin ``--max-model-len`` across the whole sweep, or the text prefill
+bucket moves under you and swamps the vision difference:
+
+    for size,block in 224,256  512,1024  768,2304  1024,4096; do
+      ... benchmark_latency.py --max-model-len 2048 --max-num-seqs 1 \
+            --image-size ${size} --vision-bucket ${block} --output-tokens 128
+    done
+
+Baseline the same sweep against ``--input-tokens 1024`` with no ``--vision-bucket``
+(text-only, so no tower at all) to get the absolute vision cost. Note
+``--input-tokens`` must leave room for ``--output-tokens`` inside
+``--max-model-len``, or the request is rejected before the engine runs.
 """
 
 from __future__ import annotations
@@ -57,6 +77,13 @@ def parse_args() -> argparse.Namespace:
         "so TTFT then includes the vision tower",
     )
     parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument(
+        "--reuse-image",
+        action="store_true",
+        help="send the byte-identical image every round, so vLLM's multimodal "
+        "cache can serve it and the tower is skipped. Measures the cache, not the "
+        "encoder — use it only to quantify that difference",
+    )
     return parser.parse_args()
 
 
@@ -71,13 +98,28 @@ def build_prompt(model_path: str, num_tokens: int, salt: int) -> str:
     return tokenizer.decode(ids)
 
 
-def build_vl_prompt(model_path: str, image_size: int):
-    """A single-image chat prompt. One item, so the vision bucket stays small."""
+def build_vl_prompt(model_path: str, image_size: int, salt: int | None = None):
+    """A single-image chat prompt. One item, so the vision bucket stays small.
+
+    ``salt`` makes the image unique, the way ``build_prompt`` makes the text
+    unique. This matters more than it looks: vLLM caches multimodal *encoder
+    outputs* keyed by a hash of the image, so re-sending one identical image every
+    round measures the cache rather than the tower, and reports a vision cost far
+    below the truth. A 4x4 block of pixels is enough to change the hash while
+    leaving the token count — and therefore the compute — identical.
+    """
     from transformers import AutoProcessor
     from vllm.assets.image import ImageAsset
 
     processor = AutoProcessor.from_pretrained(model_path)
     image = ImageAsset("cherry_blossom").pil_image.resize((image_size, image_size))
+    if salt is not None:
+        image = image.copy()
+        for dx in range(4):
+            for dy in range(4):
+                image.putpixel(
+                    (dx, dy), ((salt * 37 + dx * 11 + dy * 7) % 256, 0, 0)
+                )
     messages = [
         {
             "role": "user",
@@ -182,11 +224,16 @@ async def main_async(args) -> None:
 
     for iteration in range(args.iterations + 1):
         if args.vision_bucket:
-            # The same image every time: TTFT here is dominated by the tower, and
-            # prefix caching is off so nothing is reused between rounds.
+            # A unique image per request unless asked otherwise. Turning
+            # ``--reuse-image`` on measures the multimodal cache instead of the
+            # tower, which is occasionally what you want to know.
             prompts = [
-                build_vl_prompt(args.model, args.image_size)
-                for _ in range(args.max_num_seqs)
+                build_vl_prompt(
+                    args.model,
+                    args.image_size,
+                    salt=None if args.reuse_image else iteration * 100 + i,
+                )
+                for i in range(args.max_num_seqs)
             ]
         else:
             prompts = [

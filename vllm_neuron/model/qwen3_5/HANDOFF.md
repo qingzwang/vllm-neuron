@@ -609,12 +609,113 @@ Three things to take from this:
 * **Decode beats the reference** (TPOT 3.72 vs 4.75 ms) and **prefill is 2.6x
   slower** (108.9 vs 42.2 ms) — the split this document predicted before anything
   ran. The NKI port is purely a TTFT win; decode needs nothing.
-* **The vision tower costs about 3 ms.** VL TTFT is 111.7 vs 108.9 ms text-only,
-  because TTFT is set by the padded text prefill bucket. That is the opposite of
-  InternVL, where vision dominated — so NKI remains the right target for VL too.
+* **The VL column here is wrong — it measured a cache, not the tower.** It reads
+  111.7 vs 108.9 ms text-only, i.e. "the tower costs 3 ms", because this harness
+  used to re-send one identical image every round and vLLM served the encoder
+  output from its multimodal cache. Re-measured with a unique image per request,
+  the tower costs ~15 ms at this size and 176 ms at 1024x1024. See "Latency vs
+  image resolution" below; the TPOT figure is unaffected, since decode never runs
+  the tower.
 * Throughput scales sublinearly (1.00 / 1.80 / 2.38x at batch 1/4/8) and TTFT
   spreads badly with batch (108 -> 804 ms at batch 8) because prefills serialise:
   one prefill graph per forward, so request *n* waits for *n-1*.
+
+### Latency vs image resolution — and the multimodal cache that hid it
+
+**Read the warning first: the earlier version of this section, and the "tower
+costs ~3 ms" claim above it, were both wrong, and wrong in the same way.**
+`benchmark_latency.py` used to send one byte-identical image every round while
+salting only the text. vLLM caches multimodal encoder *outputs* keyed by a hash of
+the image, so every measured round after the warmup was served from that cache and
+never ran the tower at all. The vision cost came out 7-40x too low. The harness now
+salts a 4x4 corner of pixels per request, which changes the hash and leaves the
+token count — and therefore the compute — untouched; `--reuse-image` restores the
+old behaviour if you actually want to measure the cache.
+
+The size of the mistake, at 1024x1024:
+
+| | TTFT |
+|---|---|
+| unique image per request | **325.23 ms** |
+| identical image reused | 164.21 ms |
+
+What tipped it off was the reference's own VL benchmark (`run_vl_benchmark.py` on
+the `qwen3.5-2b-hybrid-deltanet` branch), which reports a TP=4 end-to-end TTFT of
+488 ms at 1024x1024 against the 172 ms I had published. A 16x disagreement on a
+number that is mostly one ViT should never have been written down as a finding.
+
+Corrected sweep. Batch 1, one image, 128 output tokens, unique image per request,
+median of 3 rounds after a discarded warmup. `max_model_len` is pinned at 2048 for
+**every** row including the text-only baseline, so the fixed overhead and the text
+prefill bucket cancel and what is left is the vision half:
+
+| fed size | grid | raw | merged | block | TTFT | TPOT | vision cost |
+|---|---|---|---|---|---|---|---|
+| *text-only, no tower* | — | — | — | — | *148.96 ms* | *3.98 ms* | *baseline* |
+| 224x224 | 1,16,16 | 256 | 64 | 256 | **163.80 ms** | 3.97 ms | +14.8 ms |
+| 512x512 | 1,32,32 | 1024 | 256 | 1024 | **183.36 ms** | 3.99 ms | +34.4 ms |
+| 768x768 | 1,48,48 | 2304 | 576 | 2304 | **232.32 ms** | 4.00 ms | +83.4 ms |
+| 1024x1024 | 1,64,64 | 4096 | 1024 | 4096 | **325.23 ms** | 3.99 ms | +176.3 ms |
+
+So resolution matters a great deal: the tower goes from 10% of TTFT at 224x224 to
+54% at 1024x1024. Fitting the tight-block rows,
+
+    vision cost ~= 9.7 ms + 18.6 us/token + 5.39 us per 1000 token^2
+
+which predicts the held-out 2304-token row at 81.1 ms against 83.4 measured. At
+4096 tokens the quadratic term alone is 90 ms, **51% of the vision cost** — the
+encoder's attention, and the reason this curve steepens. Extrapolating to
+2048x2048 (16384 raw) gives roughly 1.7 s, so the reference's decision to tile
+that case into four 4096-patch blocks is not optional.
+
+**TPOT stays flat at 3.97-4.00 ms** at every resolution, which is the one thing the
+broken measurement also got right, and for a sound reason: decode never re-runs the
+tower.
+
+#### The compiled block size dominates, not the image
+
+The oversized-block controls are where the practical advice lives, and the effect
+is far bigger than the ~5 ms I originally reported:
+
+| control | block | raw | TTFT | vision cost | vs tight block |
+|---|---|---|---|---|---|
+| 512x512 in an oversized block | 4096 | 1024 | 289.25 ms | +140.3 ms | **4.08x** |
+| 768x768 in an oversized block | 4096 | 2304 | 306.05 ms | +157.1 ms | **1.88x** |
+
+A 4x oversized block costs 4.08x, and a 1.78x oversized block costs 1.88x — the
+tower pays for the whole padded block almost as if it were real content. Splitting
+the two terms at block 4096 gives
+
+    cost at block 4096 ~= 128 ms + 11.7 us per *real* token
+
+so 128 of the 176 ms at 1024x1024 is the block, not the picture. Hence:
+**size `vision_attention_block_size` to the image you actually send.** For a
+512x512 image, a tight 1024 block instead of 4096 saves 106 ms of TTFT — far more
+than anything left to win in the text decoder. Non-power-of-two blocks are fine;
+2304 compiled and ran.
+
+#### Against the reference
+
+Their `run_vl_benchmark.py` at TP=4, end-to-end, versus this port:
+
+| image | reference | here | |
+|---|---|---|---|
+| 512x512 | 126 ms | 183 ms | 1.46x slower here |
+| 1024x1024 | 488 ms | 325 ms | 1.50x faster here |
+
+Do not read the crossover as a win. The two are not strictly comparable, and the
+comparison that *is* clean goes the other way: their standalone TP=4 vision encoder
+is **101 ms** at 1024x1024 against the 176 ms of vision cost measured here, so
+their encoder is the faster one. This port's end-to-end number only overtakes at
+1024x1024 because these rows carry a pinned 2048 text bucket (a ~149 ms baseline,
+where their text prefill is far cheaper — 42.2 ms at seq 1024, and they quote
+~17.6 ms at TP=8 for short prompts). Two consequences: the vision encoder is now a
+real optimisation target, and any future comparison should be cost-against-cost,
+not total-against-total.
+
+Caveats: every row is one image at batch 1, so nothing here measures several large
+images in one request, where the block cost is paid per block. And the 2048x2048
+case the reference tiles has not been run at all here.
 
 ### Feature coverage, all on device
 
@@ -800,12 +901,21 @@ Decode is unaffected by all of this and already beats the reference (TPOT 3.72 v
       prefill is 2.6x slower (TTFT 108.9 vs 42.2 ms)
 - [x] Longer contexts — device-verified at seq 2048 and 4096
 - [x] **VL stage** — image described correctly on device
-- [x] VL accuracy against HF, and VL latency — the tower costs ~3 ms, not the
-      TTFT dominance that was expected
+- [x] VL accuracy against HF, and VL latency — but the first latency pass measured
+      the multimodal cache instead of the tower; see the correction below
 - [x] Video input, multi-image, batches up to 8
 - [x] NKI kernel port — done, and it *loses* to the batched torch path (0.10x);
       vendored and off by default, with the measurement recorded
 - [ ] Profile the ~69 ms fixed per-request overhead, which is 63% of TTFT and the
       real gap to the reference — bigger than anything left in the model
 - [x] Contexts to 8192, VL at batch > 1, images to 672x672
-- [ ] Push the branch
+- [x] Latency vs image resolution — swept 224 to 1024x1024 with a unique image per
+      request; TPOT is flat, but vision costs +176 ms at 1024x1024 (54% of TTFT) and
+      an oversized `vision_attention_block_size` multiplies that by up to 4x
+- [ ] Speed up the vision encoder — the reference's standalone TP=4 encoder is
+      101 ms at 1024x1024 against 176 ms of vision cost here, so it is now a real
+      target rather than the "~3 ms" the broken measurement suggested
+- [ ] 2048x2048, which the reference handles by tiling into four 4096-patch blocks
+- [x] Push the branch
+- [ ] Several *large* images in one request — the per-block cost should scale with
+      the block count, but only single-image blocks have been measured

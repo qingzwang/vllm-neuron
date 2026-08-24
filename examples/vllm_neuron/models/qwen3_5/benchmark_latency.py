@@ -78,6 +78,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument(
+        "--vision-tp",
+        type=int,
+        default=0,
+        help="vision encoder TP degree. 0 leaves it at the plugin default, which "
+        "resolve_tp_dp() turns into tp=1/dp=world_size — an *unsharded* encoder, so "
+        "with one image per request three of four ranks idle. Set 4 to shard it",
+    )
+    parser.add_argument(
         "--reuse-image",
         action="store_true",
         help="send the byte-identical image every round, so vLLM's multimodal "
@@ -192,6 +200,14 @@ async def main_async(args) -> None:
                     "vision_neuron_config": {
                         "num_vision_tokens_buckets": [args.vision_bucket],
                         "vision_attention_block_size": args.vision_bucket,
+                        # Left unset, resolve_tp_dp() picks tp=1/dp=world_size:
+                        # the encoder is replicated per rank and a single-image
+                        # request uses one rank. tp_size=4 shards heads and MLP.
+                        **(
+                            {"tp_size": args.vision_tp, "dp_size": 1}
+                            if args.vision_tp
+                            else {}
+                        ),
                     }
                 }
                 if args.vision_bucket

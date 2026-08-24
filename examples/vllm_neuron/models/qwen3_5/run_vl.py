@@ -109,6 +109,13 @@ def parse_args() -> argparse.Namespace:
         "with max_pixels=65536 set. Size the block/bucket for the video's native "
         "grid instead.",
     )
+    parser.add_argument(
+        "--vision-tp",
+        type=int,
+        default=0,
+        help="vision encoder TP degree; 0 keeps the plugin default (tp=1, i.e. an "
+        "unsharded encoder). 4 shards it and roughly halves vision latency",
+    )
     parser.add_argument("--max-tokens", type=int, default=64)
     return parser.parse_args()
 
@@ -211,6 +218,13 @@ def main() -> None:
             "vision_neuron_config": {
                 "num_vision_tokens_buckets": [bucket],
                 "vision_attention_block_size": args.vision_block_size,
+                # Unset, resolve_tp_dp() picks tp=1/dp=world_size and the encoder
+                # runs replicated, so a single-image request uses one rank.
+                **(
+                    {"tp_size": args.vision_tp, "dp_size": 1}
+                    if args.vision_tp
+                    else {}
+                ),
             },
         },
     )

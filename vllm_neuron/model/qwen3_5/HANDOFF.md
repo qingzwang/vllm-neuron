@@ -694,24 +694,65 @@ so 128 of the 176 ms at 1024x1024 is the block, not the picture. Hence:
 than anything left to win in the text decoder. Non-power-of-two blocks are fine;
 2304 compiled and ran.
 
+#### The encoder was running unsharded — `vision_neuron_config.tp_size`
+
+The single biggest win found so far, and it is a configuration default rather than
+anything in this port's code. `VisionNeuronConfig.resolve_tp_dp` reads:
+
+    Both at default (1) -> tp_size=1, dp_size=world_size
+
+So leaving both unset — which every script here did, and which the numbers above
+were measured with — gives **tp=1, dp=4**: the vision encoder is *replicated* on
+each rank with all 16 heads, and vision data-parallelism splits work per *item*, so
+a one-image request has three of four ranks idle. Setting `tp_size: 4, dp_size: 1`
+shards heads, MLP and merger as `vision_encoder_bf16.py` already supports:
+
+| 1024x1024 | default (tp=1, dp=4) | `tp_size=4` | |
+|---|---|---|---|
+| TTFT | 325.23 ms | **230.40 ms** | −95 ms, −29% |
+| vision cost | +176.3 ms | **+81.4 ms** | **2.17x faster** |
+
+| 512x512 | default | `tp_size=4` | |
+|---|---|---|---|
+| TTFT | 183.36 ms | 179.65 ms | −3.7 ms |
+| vision cost | +34.4 ms | +30.7 ms | 1.12x |
+
+2.17x rather than 4x, because sharding adds two all-reduces per layer over 24
+layers; the reference measured a comparable 3.05x (308 -> 101 ms standalone). The
+win is worth little at 512x512, where vision is a small share of TTFT, and large
+wherever the image is big.
+
+Output stays correct — the same image description either way, differing only in
+wording, which is what a changed reduction order does to bf16:
+
+    tp=4:    "...juxtaposition of nature and urban architecture against a clear
+              blue sky... dominated by an abundance of delicate pink"
+    default: "...juxtaposition of nature and urban architecture under a clear
+              blue sky... dominated by delicate, pink cherry blossom (sakura)"
+
+This is deliberately *not* forced on in the model code, because the default is the
+right one for a different workload: with several images in flight, `dp` encodes
+several items concurrently, while `tp` only makes each one faster. Rule of thumb —
+**`tp_size=4` for single-image latency, the `dp` default for many-image
+throughput.** `run_vl.py` and `benchmark_latency.py` both take `--vision-tp`.
+
 #### Against the reference
 
 Their `run_vl_benchmark.py` at TP=4, end-to-end, versus this port:
 
-| image | reference | here | |
+| image | reference | here, vision tp=1 | here, vision tp=4 |
 |---|---|---|---|
-| 512x512 | 126 ms | 183 ms | 1.46x slower here |
-| 1024x1024 | 488 ms | 325 ms | 1.50x faster here |
+| 512x512 | 126 ms | 183 ms | 180 ms |
+| 1024x1024 | 488 ms (318 ms with text at TP=8) | 325 ms | **230 ms** |
 
-Do not read the crossover as a win. The two are not strictly comparable, and the
-comparison that *is* clean goes the other way: their standalone TP=4 vision encoder
-is **101 ms** at 1024x1024 against the 176 ms of vision cost measured here, so
-their encoder is the faster one. This port's end-to-end number only overtakes at
-1024x1024 because these rows carry a pinned 2048 text bucket (a ~149 ms baseline,
-where their text prefill is far cheaper — 42.2 ms at seq 1024, and they quote
-~17.6 ms at TP=8 for short prompts). Two consequences: the vision encoder is now a
-real optimisation target, and any future comparison should be cost-against-cost,
-not total-against-total.
+The cost-against-cost comparison is the honest one, and it is what motivated the
+sharding fix: their standalone TP=4 encoder is **101 ms** at 1024x1024, against
+176 ms of vision cost here at tp=1 — their encoder was the faster one — and 81 ms
+after sharding, which now leads. Note these rows carry a pinned 2048 text bucket (a
+~149 ms baseline) where their text prefill is far cheaper (42.2 ms at seq 1024, and
+they quote ~17.6 ms at TP=8 for short prompts), so the end-to-end columns flatter
+this port at large images and theirs at small ones. Compare vision cost to vision
+cost, not total to total.
 
 Caveats: every row is one image at batch 1, so nothing here measures several large
 images in one request, where the block cost is paid per block. And the 2048x2048
@@ -912,9 +953,9 @@ Decode is unaffected by all of this and already beats the reference (TPOT 3.72 v
 - [x] Latency vs image resolution — swept 224 to 1024x1024 with a unique image per
       request; TPOT is flat, but vision costs +176 ms at 1024x1024 (54% of TTFT) and
       an oversized `vision_attention_block_size` multiplies that by up to 4x
-- [ ] Speed up the vision encoder — the reference's standalone TP=4 encoder is
-      101 ms at 1024x1024 against 176 ms of vision cost here, so it is now a real
-      target rather than the "~3 ms" the broken measurement suggested
+- [x] Speed up the vision encoder — it was running *unsharded* (`resolve_tp_dp`
+      defaults to tp=1/dp=world_size); `vision_neuron_config.tp_size=4` cuts vision
+      cost 2.17x and TTFT 29% at 1024x1024, beating the reference's 101 ms encoder
 - [ ] 2048x2048, which the reference handles by tiling into four 4096-patch blocks
 - [x] Push the branch
 - [ ] Several *large* images in one request — the per-block cost should scale with

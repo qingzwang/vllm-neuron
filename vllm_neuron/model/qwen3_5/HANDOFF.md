@@ -829,45 +829,56 @@ on CPU every call, which is also most of the 119 ms prep — where this port use
 number for this port has *not* been measured; the tower is fused into the text
 graph, so isolating it needs a separate harness.
 
-#### What the reference's glue actually does
+#### Why the reference is slow at VL: it cannot use its own fast kernel
 
-The 264 ms of "VL orchestration" attributed here earlier **did not exist**. It was
-an artefact of assuming the reference's VL text prefill costs what its standalone
-text smoke test costs at bucket 2048 (90.6 ms). Profiling one prefill
-(`probe_nxdi_glue.py`, cProfile over `generate(max_new_tokens=1)`) shows the text
-call is 368 ms, and nothing is unaccounted for:
+Not glue, in the end. **The reference's VL path is forced onto a DeltaNet prefill
+kernel 4.3x slower than the one it uses for text-only**, and that single fact is
+about half its VL TTFT. From its README:
 
-| ms | what |
-|---|---|
-| **368.0** | text CTE forward |
-| 101.1 | vision graph, device |
-| 85.0 | `patch_embed` as a **CPU `torch.conv3d`** |
-| 14.0 | pos-embed interpolate (11) + mask build (3), both grid-only |
-| 7.0 | mRoPE (`get_rope_index` is only ~1 ms), vision scatter, misc |
+> `QWEN36_DELTANET_CTE_IMPL=legacy_direct` — the fused-multihead DeltaNet NKI kernel
+> (the default) is numerically unstable on real vision embeddings and produces
+> degenerate output (repeated tokens); the legacy-direct kernel is stable
 
-Sums to 575 ms. So the glue is three things, in order of size:
+`run_vl_benchmark.py` and `run_vl_smoke.py` both set it; `run_text_smoke.py` does
+not. So every VL number is measured with the slow kernel and every text-only number
+with the fast one. Measured here, same prompt, same bucket, identical output text:
 
-1. **The text half runs at the wrong bucket.** Their code pads `vision_embeddings`
-   and `vision_mask` to `text_config.neuron_config.seq_len`, which is the *maximum*
-   (4096), not the bucket the 1048 real tokens need. Measured text-only: 90.6 ms at
-   bucket 2048 against 173.8 ms at 4096, so **~83 ms is thrown away** on bucket
-   over-selection.
-2. **~194 ms of VL-specific cost inside the text call**, beyond text-only at the
-   same 4096 bucket. Not decomposed; the obvious suspect is the padded
-   `vision_embeddings` — 4096 x 2048 bf16 is 16 MB copied to device per request —
-   plus the injection itself.
-3. **99 ms of CPU work that belongs on the device**: an 85 ms `conv3d` patch
-   embedding, plus 14 ms of grid-only work that could simply be cached.
+| CTE kernel | bucket 2048 | bucket 4096 |
+|---|---|---|
+| `current` (fused NKI) | 90.6 ms | 173.8 ms |
+| `legacy_direct` | **374.2 ms** | **745.2 ms** |
+| ratio | 4.13x | 4.29x |
 
-Almost none of this needs one graph to fix — (1) is a bucket-selection bug, (3) is
-moving `patch_embed` into the *existing* vision graph and memoising three helpers.
+The 368 ms text call in the VL profile is `legacy_direct` at bucket 2048 — standalone
+it measures 374.2 ms, a 1.7% match. So of their 575.1 ms at 1024x1024, **~284 ms
+(49%) is the kernel fallback alone.** Were their fused kernel stable on vision
+embeddings they would be at roughly 292 ms, against 230.4 ms here.
 
-**Correcting the claim made here earlier:** "strip their glue and they land at
-191.7 ms and beat this port" assumed text = 90.6 ms. With text measured at 368 ms,
-fixing the CPU work and the bucket still leaves ~386 ms, well behind the 230.4 ms
-here. They only reach ~192 ms if the unexplained 194 ms goes too. So the lead here
-is more robust than that correction feared — but it is still a lead over an
-integration, and the 194 ms is unidentified, so do not treat it as settled.
+**This supersedes two claims made in this document earlier, both wrong:** there is no
+"~83 ms wasted on bucket over-selection" — the VL path correctly selects bucket 2048
+— and the "194 ms of undecomposed VL-specific cost" was this kernel, not a data
+transfer.
+
+Why this port does not pay it is the whole argument for the algorithm in
+`_strictly_lower_inverse`. Three different ways to invert `(I - A)`:
+
+| | algorithm | exact? | dependent steps at chunk 64 |
+|---|---|---|---|
+| HF reference, NxDI `legacy_direct` | forward substitution | yes | **63** |
+| NxDI `current` | Neumann on 32x32 leaves + Schur | **no** | ~5 |
+| **here** | blocked elimination / recursive doubling | yes | **6**, 2 batched matmuls each |
+
+The blocked form is the same elimination as forward substitution, restructured to
+`log2(size)` dependent steps instead of `size - 1`. It keeps exactness *and* gets
+log depth, so it is stable on vision embeddings **and** fast — this port never faces
+the trade the reference is stuck with. Consistent with the per-inverse FLOP counts
+measured earlier: legacy 536.9 MFLOP per 128 tokens/head against 16.8 here (32x),
+while their fused does 7.9 (0.47x) and buys that with the numerical fragility.
+
+Note the root cause of *their* instability is still unknown. An earlier hypothesis
+here — that vision embeddings are worse conditioned, so leaf-Neumann blows up — was
+tested and **refuted**: `|A_leaf^8|` is 4907 on vision against 7027 on text, i.e.
+vision is *better* conditioned, because `k` is L2-normalised either way.
 
 #### The one number worth taking from all of this
 
@@ -1091,9 +1102,11 @@ Decode is unaffected by all of this and already beats the reference (TPOT 3.72 v
       defaults to tp=1/dp=world_size); `vision_neuron_config.tp_size=4` cuts vision
       cost 2.17x and TTFT 29% at 1024x1024
 - [x] Run the reference on this box rather than quoting its README — cloned at
-      `/mnt/nvme/nxdi_ref`, TP=4: this port is 2.50x faster end-to-end at
-      1024x1024, entirely on the vision side (5.95x), while its text prefill is
-      1.64x *slower* than the reference's
+      `/mnt/nvme/nxdi_ref`, TP=4: this port is 2.50x faster end-to-end at 1024x1024,
+      and the root cause is found — VL forces the reference onto a DeltaNet prefill
+      kernel 4.3x slower than its own default, because the fast one is unstable on
+      vision embeddings. That is 49% of its VL TTFT; this port's exact
+      blocked-elimination inverse has no such fallback
 - [ ] **Kill the 69 ms fixed per-request overhead — the highest-value item left,
       and now precisely bounded.** The reference's text prefill fits
       `9.9 ms + 39.9 us/token` against ours at `69 ms + 39.0 us/token`: the

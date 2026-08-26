@@ -778,16 +778,56 @@ checks that the split is real: the implied text cost at bucket 512 (119.9 − 30
 text-only TTFT is *not* flat with bucket size (30.9 ms at 512, 90.6 ms at 2048),
 contrary to the README's claim, which is measured here directly.
 
-Why the encoder differs is partly visible and partly not. Visible: this port runs
-the tower sharded TP=4 *inside the same compiled graph* as the text model, with
-`NF.flash_attention` and block packing. Theirs is a separately compiled artifact
-(`compile_vision_encoder_tp.py` -> `--vision-compiled-dir`) invoked per request
-through a Python wrapper. Not visible: their README quotes a **101 ms** standalone
-TP=4 encoder at 1024x1024, against the 484.5 ms of integrated vision cost measured
-here, so ~380 ms is glue rather than encoder — but separating the two would need
-instrumentation inside their wrapper, which has not been done. **Do not quote the
-5.95x as an encoder-vs-encoder result**; it is integrated-path against
-integrated-path.
+#### One graph or two, and the encoder with the glue removed
+
+**NxDI compiles the two halves separately.** From
+`NeuronQwen35VLForCausalLM`'s own docstring: *"Separate compilation/loading of
+vision encoder and text decoder"* — `compile_vision_encoder_tp.py` emits
+`bucket_<N>/tp_*.pt`, `parallel_model_load` restores it, and
+`NeuronQwen35VLForCausalLM` composes the two in Python. This port instead runs the
+tower inside the same compiled graph as the text model.
+
+Timing their vision path at two nested levels (`/tmp/nxdi_ve_probe.py`, median of
+5 after a warmup) separates encoder from glue. L1 is the raw traced graph
+(`_TPVisionAdapter.__call__` on pre-built inputs), L2 adds
+`wrapper.forward`'s CPU prep:
+
+| | 512x512 (1024 patches) | 1024x1024 (4096 patches) |
+|---|---|---|
+| L1 raw graph, device only | 15.0 ms | **101.1 ms** |
+| L2 + wrapper prep | 41.9 ms | 220.1 ms |
+| prep alone | 26.9 ms | 119.0 ms |
+
+L1 at 4096 patches reproduces their README's "101 ms standalone TP=4 encoder"
+exactly, which is good evidence L1 is the number that claim refers to. Their
+1024x1024 TTFT of 575.1 ms therefore decomposes as:
+
+| ms | share | |
+|---|---|---|
+| 101.1 | 18% | vision graph, device |
+| 119.0 | 21% | wrapper prep — patch-embed, RoPE, a 4096x4096 bf16 mask built per call, pad, merge |
+| 90.6 | 16% | text prefill, bucket 2048 |
+| 264.4 | 46% | VL orchestration left over: mRoPE, embedding injection, `generate()` setup |
+
+**So 383 ms of their 575 ms — 67% — is glue, and only 101 ms is the encoder.** That
+is the real answer to "why is this port faster end-to-end", and it is an
+integration cost, not a modelling one.
+
+Encoder against encoder, with their glue removed and none of ours removed:
+
+| 4096 patches | |
+|---|---|
+| NxDI, device graph only | 101.1 ms |
+| this port, *all* vision-related work (CPU preprocessing + graph + scatter) | **81.4 ms** |
+
+So this port is at least 1.24x faster even measured against their glue-free number,
+and by more than that graph-to-graph, since 81.4 ms still carries preprocessing.
+The likely cause is visible in their `_forward_attention`: it is plain PyTorch over
+an explicit `(1, 1, bucket, bucket)` mask — 33 MB of bf16 at bucket 4096, rebuilt
+on CPU every call, which is also most of the 119 ms prep — where this port uses
+`NF.flash_attention` and never materialises a full score matrix. A graph-to-graph
+number for this port has *not* been measured; the tower is fused into the text
+graph, so isolating it needs a separate harness.
 
 The practical read for this port: the text prefill is the gap worth closing, and
 69 ms of its 89-149 ms is the fixed per-request overhead already flagged below.

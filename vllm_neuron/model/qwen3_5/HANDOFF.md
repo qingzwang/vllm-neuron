@@ -829,6 +829,49 @@ on CPU every call, which is also most of the 119 ms prep — where this port use
 number for this port has *not* been measured; the tower is fused into the text
 graph, so isolating it needs a separate harness.
 
+#### Could the reference remove its glue? Mostly yes — and then it would win
+
+Asked directly, because it decides whether the 2.50x lead here is real or borrowed.
+
+**Fusing the two halves into one graph is not the answer, and NxDI does not do it
+even in its own supported path.** `NeuronBaseForImageToText` keeps `self.text_models`
+and `self.vision_models` as separate lists behind separate `ModelBuilder`s, so the
+framework's unit of compilation is one NEFF per `ModelWrapper`. A single
+pixel_values -> logits trace would fight per-half bucketing, per-half TP degree and
+the CTE/TKG split that only applies to the text side.
+
+It also is not necessary. Breaking the 119 ms of wrapper prep into components
+(`/tmp/nxdi_prep_split.py`, 1024x1024, 6 CPU threads) shows it is not the mask or
+the RoPE, as first guessed, but a matmul running on the host:
+
+| component | ms | fix |
+|---|---|---|
+| `patch_embed`, CPU, 4096x1536 -> 1024 | **86.0** | move into the *existing* vision graph |
+| `fast_pos_embed_interpolate` | 15.2 | grid-only, cacheable |
+| attention mask build | 9.8 | grid-only, cacheable |
+| `rot_pos_emb` | 0.1 | grid-only, cacheable |
+| sum | 111.1 | (measured prep: 119) |
+
+So ~111 ms is addressable without changing the two-graph structure at all — extend
+the vision graph's inputs to `pixel_values` and memoise the three grid-only helpers.
+The remaining 264 ms of orchestration has *not* been decomposed; that would need
+profiling inside their `generate()` (mRoPE, embedding injection, per-call setup).
+
+The uncomfortable conclusion:
+
+| 1024x1024 | |
+|---|---|
+| their device work only (101.1 vision graph + 90.6 text prefill) | **191.7 ms** |
+| this port, measured end to end | 230.4 ms |
+
+**If the reference removed all of its glue it would land near 192 ms and beat this
+port by 1.20x**, because its text prefill is 90.6 ms against our 149.0. The 2.50x
+measured lead is a lead over their *integration*, not over their model. Ours has
+overhead too — the 81.4 ms vision figure includes vLLM's CPU preprocessing, and
+69 ms of the text side is fixed per-request cost — but it is much smaller, and it is
+what the comparison is actually measuring. Treat the text prefill as the thing to
+fix, not the win as banked.
+
 The practical read for this port: the text prefill is the gap worth closing, and
 69 ms of its 89-149 ms is the fixed per-request overhead already flagged below.
 
@@ -1038,9 +1081,12 @@ Decode is unaffected by all of this and already beats the reference (TPOT 3.72 v
       `/mnt/nvme/nxdi_ref`, TP=4: this port is 2.50x faster end-to-end at
       1024x1024, entirely on the vision side (5.95x), while its text prefill is
       1.64x *slower* than the reference's
-- [ ] Close the text-prefill gap, which is now the measured weak half: 149 ms at
-      bucket 2048 against the reference's 90.6 ms, and 69 ms of it is the fixed
-      per-request overhead below
+- [ ] **Close the text-prefill gap — the highest-value item left.** 149 ms at bucket
+      2048 against the reference's 90.6 ms, and 69 ms of ours is the fixed
+      per-request overhead below. Sharpened by the glue analysis: the reference's
+      device-only floor at 1024x1024 is 191.7 ms against our 230.4 ms, so its model
+      halves are *faster* than ours and the 2.50x end-to-end lead is over its
+      integration, not its model
 - [ ] 2048x2048, which the reference handles by tiling into four 4096-patch blocks
 - [x] Push the branch
 - [ ] Several *large* images in one request — the per-block cost should scale with

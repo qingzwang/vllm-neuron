@@ -736,23 +736,61 @@ several items concurrently, while `tp` only makes each one faster. Rule of thumb
 **`tp_size=4` for single-image latency, the `dp` default for many-image
 throughput.** `run_vl.py` and `benchmark_latency.py` both take `--vision-tp`.
 
-#### Against the reference
+#### Against the reference — cloned and run on this box
 
-Their `run_vl_benchmark.py` at TP=4, end-to-end, versus this port:
+The README comparison that used to sit here was second-hand and, as it turned out,
+wrong about which half was slow. The reference is now cloned at
+`/mnt/nvme/nxdi_ref` (branch `qwen3.5-2b-hybrid-deltanet`) and run on *this*
+trn2.3xlarge, at TP=4, on the same `cherry_blossom` source image. Use the
+`/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference` venv — it has NxDI 0.10.0 and
+transformers 4.57.6, exactly what their README asks for. Two setup notes: their
+`bin` must be on `PATH` (`libneuronpjrt-path` is an executable there, not a
+library), and `run_vl_benchmark.py` expects images pre-staged at
+`/tmp/test_image_<size>.jpg`.
 
-| image | reference | here, vision tp=1 | here, vision tp=4 |
+Fair head-to-head — tight vision bucket both sides, and each given the *smallest
+text bucket that fits* rather than a pinned one:
+
+| image | NxDI | here | |
 |---|---|---|---|
-| 512x512 | 126 ms | 183 ms | 180 ms |
-| 1024x1024 | 488 ms (318 ms with text at TP=8) | 325 ms | **230 ms** |
+| 512x512 | 137.6 ms | **119.9 ms** | 1.15x faster here |
+| 1024x1024 | 575.1 ms | **230.4 ms** | **2.50x faster here** |
+| TPOT | 4.83-4.91 ms | 3.58-3.99 ms | ~1.25x faster here |
 
-The cost-against-cost comparison is the honest one, and it is what motivated the
-sharding fix: their standalone TP=4 encoder is **101 ms** at 1024x1024, against
-176 ms of vision cost here at tp=1 — their encoder was the faster one — and 81 ms
-after sharding, which now leads. Note these rows carry a pinned 2048 text bucket (a
-~149 ms baseline) where their text prefill is far cheaper (42.2 ms at seq 1024, and
-they quote ~17.6 ms at TP=8 for short prompts), so the end-to-end columns flatter
-this port at large images and theirs at small ones. Compare vision cost to vision
-cost, not total to total.
+Their published figures roughly reproduce (126 -> 137.6, 488 -> 575.1); the residual
+is this box against the trn2.48xlarge their README used. Note also that their TTFT
+*excludes* image preprocessing — `apply_chat_template` sits outside their timer —
+while these rows include it, so the gap is understated rather than flattered.
+
+Subtracting each side's own text-only TTFT at the same bucket splits it:
+
+| | NxDI | here | |
+|---|---|---|---|
+| vision, 1024 patches | 106.7 ms | 30.7 ms | **3.47x faster here** |
+| vision, 4096 patches | 484.5 ms | 81.4 ms | **5.95x faster here** |
+| text prefill, bucket 512 | **30.9 ms** | 89.2 ms | 2.89x faster *there* |
+| text prefill, bucket 2048 | **90.6 ms** | 149.0 ms | 1.64x faster *there* |
+
+So the whole advantage is the vision encoder, and the text decoder is where this
+port is *behind* — the opposite of the story the README numbers suggested. Two
+checks that the split is real: the implied text cost at bucket 512 (119.9 − 30.7 =
+89.2 ms) lands on the independent `69 + 0.039/token` fit's 89.0 ms; and their
+text-only TTFT is *not* flat with bucket size (30.9 ms at 512, 90.6 ms at 2048),
+contrary to the README's claim, which is measured here directly.
+
+Why the encoder differs is partly visible and partly not. Visible: this port runs
+the tower sharded TP=4 *inside the same compiled graph* as the text model, with
+`NF.flash_attention` and block packing. Theirs is a separately compiled artifact
+(`compile_vision_encoder_tp.py` -> `--vision-compiled-dir`) invoked per request
+through a Python wrapper. Not visible: their README quotes a **101 ms** standalone
+TP=4 encoder at 1024x1024, against the 484.5 ms of integrated vision cost measured
+here, so ~380 ms is glue rather than encoder — but separating the two would need
+instrumentation inside their wrapper, which has not been done. **Do not quote the
+5.95x as an encoder-vs-encoder result**; it is integrated-path against
+integrated-path.
+
+The practical read for this port: the text prefill is the gap worth closing, and
+69 ms of its 89-149 ms is the fixed per-request overhead already flagged below.
 
 Caveats: every row is one image at batch 1, so nothing here measures several large
 images in one request, where the block cost is paid per block. And the 2048x2048
@@ -955,7 +993,14 @@ Decode is unaffected by all of this and already beats the reference (TPOT 3.72 v
       an oversized `vision_attention_block_size` multiplies that by up to 4x
 - [x] Speed up the vision encoder — it was running *unsharded* (`resolve_tp_dp`
       defaults to tp=1/dp=world_size); `vision_neuron_config.tp_size=4` cuts vision
-      cost 2.17x and TTFT 29% at 1024x1024, beating the reference's 101 ms encoder
+      cost 2.17x and TTFT 29% at 1024x1024
+- [x] Run the reference on this box rather than quoting its README — cloned at
+      `/mnt/nvme/nxdi_ref`, TP=4: this port is 2.50x faster end-to-end at
+      1024x1024, entirely on the vision side (5.95x), while its text prefill is
+      1.64x *slower* than the reference's
+- [ ] Close the text-prefill gap, which is now the measured weak half: 149 ms at
+      bucket 2048 against the reference's 90.6 ms, and 69 ms of it is the fixed
+      per-request overhead below
 - [ ] 2048x2048, which the reference handles by tiling into four 4096-patch blocks
 - [x] Push the branch
 - [ ] Several *large* images in one request — the per-block cost should scale with

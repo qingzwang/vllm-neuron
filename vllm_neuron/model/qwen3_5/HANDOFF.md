@@ -829,48 +829,61 @@ on CPU every call, which is also most of the 119 ms prep — where this port use
 number for this port has *not* been measured; the tower is fused into the text
 graph, so isolating it needs a separate harness.
 
-#### Could the reference remove its glue? Mostly yes — and then it would win
+#### What the reference's glue actually does
 
-Asked directly, because it decides whether the 2.50x lead here is real or borrowed.
+The 264 ms of "VL orchestration" attributed here earlier **did not exist**. It was
+an artefact of assuming the reference's VL text prefill costs what its standalone
+text smoke test costs at bucket 2048 (90.6 ms). Profiling one prefill
+(`probe_nxdi_glue.py`, cProfile over `generate(max_new_tokens=1)`) shows the text
+call is 368 ms, and nothing is unaccounted for:
 
-**Fusing the two halves into one graph is not the answer, and NxDI does not do it
-even in its own supported path.** `NeuronBaseForImageToText` keeps `self.text_models`
-and `self.vision_models` as separate lists behind separate `ModelBuilder`s, so the
-framework's unit of compilation is one NEFF per `ModelWrapper`. A single
-pixel_values -> logits trace would fight per-half bucketing, per-half TP degree and
-the CTE/TKG split that only applies to the text side.
-
-It also is not necessary. Breaking the 119 ms of wrapper prep into components
-(`/tmp/nxdi_prep_split.py`, 1024x1024, 6 CPU threads) shows it is not the mask or
-the RoPE, as first guessed, but a matmul running on the host:
-
-| component | ms | fix |
-|---|---|---|
-| `patch_embed`, CPU, 4096x1536 -> 1024 | **86.0** | move into the *existing* vision graph |
-| `fast_pos_embed_interpolate` | 15.2 | grid-only, cacheable |
-| attention mask build | 9.8 | grid-only, cacheable |
-| `rot_pos_emb` | 0.1 | grid-only, cacheable |
-| sum | 111.1 | (measured prep: 119) |
-
-So ~111 ms is addressable without changing the two-graph structure at all — extend
-the vision graph's inputs to `pixel_values` and memoise the three grid-only helpers.
-The remaining 264 ms of orchestration has *not* been decomposed; that would need
-profiling inside their `generate()` (mRoPE, embedding injection, per-call setup).
-
-The uncomfortable conclusion:
-
-| 1024x1024 | |
+| ms | what |
 |---|---|
-| their device work only (101.1 vision graph + 90.6 text prefill) | **191.7 ms** |
-| this port, measured end to end | 230.4 ms |
+| **368.0** | text CTE forward |
+| 101.1 | vision graph, device |
+| 85.0 | `patch_embed` as a **CPU `torch.conv3d`** |
+| 14.0 | pos-embed interpolate (11) + mask build (3), both grid-only |
+| 7.0 | mRoPE (`get_rope_index` is only ~1 ms), vision scatter, misc |
 
-**If the reference removed all of its glue it would land near 192 ms and beat this
-port by 1.20x**, because its text prefill is 90.6 ms against our 149.0. The 2.50x
-measured lead is a lead over their *integration*, not over their model. Ours has
-overhead too — the 81.4 ms vision figure includes vLLM's CPU preprocessing, and
-69 ms of the text side is fixed per-request cost — but it is much smaller, and it is
-what the comparison is actually measuring. Treat the text prefill as the thing to
-fix, not the win as banked.
+Sums to 575 ms. So the glue is three things, in order of size:
+
+1. **The text half runs at the wrong bucket.** Their code pads `vision_embeddings`
+   and `vision_mask` to `text_config.neuron_config.seq_len`, which is the *maximum*
+   (4096), not the bucket the 1048 real tokens need. Measured text-only: 90.6 ms at
+   bucket 2048 against 173.8 ms at 4096, so **~83 ms is thrown away** on bucket
+   over-selection.
+2. **~194 ms of VL-specific cost inside the text call**, beyond text-only at the
+   same 4096 bucket. Not decomposed; the obvious suspect is the padded
+   `vision_embeddings` — 4096 x 2048 bf16 is 16 MB copied to device per request —
+   plus the injection itself.
+3. **99 ms of CPU work that belongs on the device**: an 85 ms `conv3d` patch
+   embedding, plus 14 ms of grid-only work that could simply be cached.
+
+Almost none of this needs one graph to fix — (1) is a bucket-selection bug, (3) is
+moving `patch_embed` into the *existing* vision graph and memoising three helpers.
+
+**Correcting the claim made here earlier:** "strip their glue and they land at
+191.7 ms and beat this port" assumed text = 90.6 ms. With text measured at 368 ms,
+fixing the CPU work and the bucket still leaves ~386 ms, well behind the 230.4 ms
+here. They only reach ~192 ms if the unexplained 194 ms goes too. So the lead here
+is more robust than that correction feared — but it is still a lead over an
+integration, and the 194 ms is unidentified, so do not treat it as settled.
+
+#### The one number worth taking from all of this
+
+The reference's text-only prefill against bucket size, TP=4, measured here:
+
+| bucket | 512 | 2048 | 4096 |
+|---|---|---|---|
+| TTFT | 30.9 ms | 90.6 ms | 173.8 ms |
+
+which fits **9.9 ms fixed + 39.9 us/token**, against this port's
+**69 ms fixed + 39.0 us/token**. The per-token slopes are the same to within 2%.
+The entire text-prefill gap is the *fixed* cost — 69 ms against 10 ms — not the
+model, not the DeltaNet, not the torch attention. Everything already known about
+that 69 ms says it is per-request framework overhead, and this is independent
+confirmation from a second implementation on the same hardware that ~10 ms is
+achievable. That makes it unambiguously the top item.
 
 The practical read for this port: the text prefill is the gap worth closing, and
 69 ms of its 89-149 ms is the fixed per-request overhead already flagged below.
@@ -1081,12 +1094,12 @@ Decode is unaffected by all of this and already beats the reference (TPOT 3.72 v
       `/mnt/nvme/nxdi_ref`, TP=4: this port is 2.50x faster end-to-end at
       1024x1024, entirely on the vision side (5.95x), while its text prefill is
       1.64x *slower* than the reference's
-- [ ] **Close the text-prefill gap — the highest-value item left.** 149 ms at bucket
-      2048 against the reference's 90.6 ms, and 69 ms of ours is the fixed
-      per-request overhead below. Sharpened by the glue analysis: the reference's
-      device-only floor at 1024x1024 is 191.7 ms against our 230.4 ms, so its model
-      halves are *faster* than ours and the 2.50x end-to-end lead is over its
-      integration, not its model
+- [ ] **Kill the 69 ms fixed per-request overhead — the highest-value item left,
+      and now precisely bounded.** The reference's text prefill fits
+      `9.9 ms + 39.9 us/token` against ours at `69 ms + 39.0 us/token`: the
+      *per-token slopes match to 2%*, so the entire text gap is fixed cost, and a
+      second implementation on this same box shows ~10 ms is achievable. Nothing in
+      the model needs touching.
 - [ ] 2048x2048, which the reference handles by tiling into four 4096-patch blocks
 - [x] Push the branch
 - [ ] Several *large* images in one request — the per-block cost should scale with

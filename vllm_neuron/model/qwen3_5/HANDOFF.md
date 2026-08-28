@@ -866,10 +866,30 @@ Why this port does not pay it is the whole argument for the algorithm in
 |---|---|---|---|
 | HF reference, NxDI `legacy_direct` | forward substitution | yes | **63** |
 | NxDI `current` | Neumann on 32x32 leaves + Schur | **no** | ~5 |
-| **here** | blocked elimination / recursive doubling | yes | **6**, 2 batched matmuls each |
+| **here** | blocked elimination, on a recursive-doubling schedule | yes | **6**, 2 batched matmuls each |
 
-The blocked form is the same elimination as forward substitution, restructured to
-`log2(size)` dependent steps instead of `size - 1`. It keeps exactness *and* gets
+The two names describe different things and both are needed. *Blocked elimination*
+is the algebra of one step — the 2x2 block triangular inverse
+`[[M_U,0],[A_LU,M_L]]^-1 = [[T_U,0],[T_L A_LU T_U, T_L]]`, which is what
+`inv @ a @ inv` masked to a quadrant computes. On its own that buys nothing:
+textbook blocked elimination sweeps left to right at fixed width and is still
+`n/b` sequential steps. The log depth comes from the *schedule* — width doubles
+each round, so round `k` holds exact inverses of every `2^k`-wide diagonal block and
+all merges at a level are independent, collapsing into one batched matmul. That is
+recursive doubling, i.e. the bottom-up iterative form of divide-and-conquer
+triangular inversion. So: the same elimination as forward substitution, restructured
+to `log2(size)` dependent steps instead of `size - 1`. It costs more arithmetic —
+2 full matmuls per round, `O(n^3 log n)` — which is the right trade on hardware where
+batched matmul is cheap and dependency depth is not.
+
+Worth seeing that the reference's fused kernel is *also* recursive doubling —
+`prod (I + A^(2^i))` has the same log depth. The difference is what gets doubled.
+It doubles **powers of A**, whose intermediates reach `|A^16| = 2.7e6` against a true
+inverse with entries of magnitude 1, so the significant digits are lost to
+cancellation. This doubles **exact inverses of sub-problems**, every one of which is
+bounded by the true answer it represents, so nothing grows. Same skeleton, different
+associative operation, and that is the whole reason exactness and log depth are
+available together here. It keeps exactness *and* gets
 log depth, so it is stable on vision embeddings **and** fast — this port never faces
 the trade the reference is stuck with. Consistent with the per-inverse FLOP counts
 measured earlier: legacy 536.9 MFLOP per 128 tokens/head against 16.8 here (32x),

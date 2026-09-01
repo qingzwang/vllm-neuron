@@ -26,7 +26,7 @@ neuron = "vllm_neuron:register"
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements/core.txt"]}
-optional-dependencies = {test = {file = ["requirements/test.txt"]}}
+optional-dependencies = {test = {file = ["requirements/test.txt"]}, flux = {file = ["requirements/flux.txt"]}}
 
 # Keep non-.py data files in the wheel (synthetic model JSONs loaded via
 # Path(__file__).parent, Llama3 LICENSE, py.typed). Without this they get dropped

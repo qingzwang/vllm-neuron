@@ -33,6 +33,13 @@ Model recipe for Qwen3-VL 32B (multimodal) on Trn2/Trn3.
 Model recipe for Qwen3-Embedding 8B (pooling / embeddings) on Trn2/Trn3.
 :::
 
+:::{grid-item-card} Deploy FLUX.1-lite 8B
+:link: flux-1-lite-8b
+:link-type: doc
+
+Model recipe for FLUX.1-lite 8B (text-to-image diffusion) on Trn2.
+:::
+
 ::::
 
 :::{toctree}
@@ -43,4 +50,5 @@ Llama 3 <llama-3>
 GPT-OSS <gpt-oss>
 Qwen3-VL <qwen3-vl>
 Qwen3-Embedding <qwen3-embedding-8b>
+FLUX.1-lite <flux-1-lite-8b>
 :::

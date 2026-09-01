@@ -1,0 +1,9 @@
+# Extra dependencies for the FLUX.1 text-to-image pipeline
+# (vllm_neuron/model/flux). Kept out of core.txt: FLUX does not run through the
+# vLLM engine, so a plain LLM serving install has no use for diffusers.
+# Installable as the `flux` extra: pip install vllm-neuron[flux]
+
+# FluxPipeline, FluxTransformer2DModel, AutoencoderKL, and the flow-matching
+# scheduler. Floor is where diffusers' Flux attention took its current
+# processor/dispatch shape, which NeuronFluxAttnProcessor replaces.
+diffusers>=0.40.0

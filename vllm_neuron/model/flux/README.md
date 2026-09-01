@@ -42,12 +42,12 @@ All four networks run on Neuron, across two logical cores:
 | 0 (this process) | transformer, VAE decoder, CLIP |
 | 1 (child process) | T5-XXL |
 
-T5 needs its own core for two independent reasons: a core holds ~22 GiB of usable
-HBM against 15.2 GiB of transformer plus 8.9 GiB of T5, and the compile backend
-loads every NEFF onto the process's own core (`start_nc = 0` plus the distributed
-rank), so one process cannot drive two. The caller has to leave a core free —
-`NEURON_RT_VISIBLE_CORES` before importing `vllm_neuron` — or the pipeline says
-why and keeps T5 on CPU. See the recipe.
+T5 needs its own core for two independent reasons: an HBM partition holds
+~22 GiB against 15.2 GiB of transformer plus 8.9 GiB of T5, and the compile
+backend loads every NEFF onto the process's own core (`start_nc = 0` plus the
+distributed rank), so one process cannot drive two. The caller has to leave a
+core free — `NEURON_RT_VISIBLE_CORES` before importing `vllm_neuron` — or the
+pipeline says why and keeps T5 on CPU. See the recipe's "Choosing cores".
 
 ## What had to change for Neuron
 

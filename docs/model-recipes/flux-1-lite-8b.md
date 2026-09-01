@@ -117,11 +117,10 @@ one is not enough to hold both large models:
 | `text_encoder` (CLIP-L) | Neuron, core 0 | 0.22 GiB |
 | `text_encoder_2` (T5-XXL) | Neuron, core 1 (child process) | 8.9 GiB |
 
-A logical core addresses ~22 GiB of usable HBM (24 GB nominal at
-`logical-neuroncore-config: 2`, measured by allocating until failure), and
-15.2 + 8.9 GiB exceeds that before any activation memory. Nor can one process
-use two cores: the compile backend loads every NEFF onto the process's own core,
-so weights uploaded to a second core get rejected at execution time. T5
+An HBM partition holds ~22 GiB, and 15.2 + 8.9 GiB exceeds that before any
+activation memory (see "Choosing cores" for how HBM is divided). Nor can one
+process use two cores: the compile backend loads every NEFF onto the process's
+own core, so weights uploaded to a second core get rejected at execution time. T5
 therefore runs in a child process pinned with `NEURON_RT_VISIBLE_CORES`, which
 the pipeline manages for you; see `text_encoder_worker.py`. Structurally this is
 the same split as `vllm_neuron/vllm/disaggregated_encoder` in the LLM path.
@@ -130,22 +129,32 @@ That buys 16x on prompt encoding: **98 ms** on Neuron against **1617 ms** for
 the same weights in CPU eager mode, measured over 10 requests at a 512-token
 budget.
 
-### Reserving a core for the worker
+## Choosing cores
 
-A process that does not restrict itself claims **every** logical core when the
-Neuron runtime initializes, even though it only runs graphs on one — leaving
-nothing for the worker to claim. So pin the main process to a single core
-*before* `vllm_neuron` is imported, which is when the runtime comes up:
+### Which core a process runs on
+
+`NEURON_RT_VISIBLE_CORES`, set **before** `vllm_neuron` is imported — that import
+brings the Neuron runtime up, and the choice is latched then. It both restricts
+and renumbers: the cores it names become indices `0..n-1` inside the process, so
+a process pinned to physical core 2 addresses it as `torch.device("neuron", 0)`
+and `device_index=0`.
 
 ```python
 import os
-os.environ["NEURON_RT_VISIBLE_CORES"] = "0"   # must precede the import
+os.environ["NEURON_RT_VISIBLE_CORES"] = "2"   # must precede the import
 
 from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
 ```
 
-The example scripts do this for you. If it is missing, the pipeline says so and
-keeps T5 in-process rather than failing:
+Accepted forms are a single index, a list, and inclusive ranges: `"2"`, `"0,2"`,
+`"0-3"`. `NEURON_RT_NUM_CORES` also exists but is coarse — the runtime only
+accepts one core or a whole device (a multiple of 8), and it does not say which
+core a request for one got — so prefer `NEURON_RT_VISIBLE_CORES`.
+
+A process that sets neither claims **every** core when the runtime initializes,
+even if it only ever runs graphs on one. That is what makes pinning mandatory
+here rather than optional: without it there is no core left for the T5 worker,
+and the pipeline says so and keeps T5 on CPU:
 
 ```
 Not starting the T5 encoder worker: this process claimed every logical
@@ -153,8 +162,84 @@ NeuronCore when the Neuron runtime initialized, ... Keeping T5 in-process,
 which means CPU and ~1.5 s per request.
 ```
 
+`FluxNeuronConfig` then has two core knobs, in **different namespaces**:
+
+| Knob | Namespace | Usual value |
+|---|---|---|
+| `device_index` | Index into this process's *visible* cores | `0` |
+| `worker_device_index` | *Physical* core id, becomes the child's `NEURON_RT_VISIBLE_CORES` | `1` |
+
 The worker holds its core for the pipeline's lifetime, so use the pipeline as a
 context manager or call `close()`.
+
+### How much HBM each core gets
+
+trn2's 96 GB of HBM is divided into four ~22 GiB partitions, one per **physical
+core pair** — not per logical core. Measured by allocating 1 GiB buffers until
+failure:
+
+| `logical-neuroncore-config` | Logical cores | Allocating on | Total before failure |
+|---|---|---|---|
+| 2 (default) | 4 | core 0 | 22 GiB |
+| 2 | 4 | cores 0 + 1 | 44 GiB |
+| 1 | 8 | core 0 | 22 GiB |
+| 1 | 8 | cores 0 + 1 | 22 GiB — same pair, shared |
+| 1 | 8 | cores 0 + 2 | 44 GiB |
+| 1 | 8 | all eight | 88 GiB |
+
+So the budget follows the pair, and the LNC setting only decides whether that
+pair is one logical core or two.
+
+### Small models on eight cores (LNC=1)
+
+`NEURON_LOGICAL_NC_CONFIG=1` splits each pair into two logical cores, giving
+eight. Each is one physical NeuronCore-v3 — half the compute of an LNC=2 core —
+which suits small models where a whole fused core would sit idle. Note the
+variable is `NEURON_LOGICAL_NC_CONFIG`; `NEURON_RT_LOGICAL_NC_CONFIG` looks
+plausible and is silently ignored.
+
+Because HBM follows the pair, spread independent models across pairs rather than
+across cores:
+
+```bash
+# Eight logical cores; each of these four has a full ~22 GiB partition to itself.
+export NEURON_LOGICAL_NC_CONFIG=1
+NEURON_RT_VISIBLE_CORES=0 python serve.py &   # partition 0
+NEURON_RT_VISIBLE_CORES=2 python serve.py &   # partition 1
+NEURON_RT_VISIBLE_CORES=4 python serve.py &   # partition 2
+NEURON_RT_VISIBLE_CORES=6 python serve.py &   # partition 3
+```
+
+Pack two models onto one pair (`0` and `1`) only when their combined footprint —
+weights plus activations — fits inside that one ~22 GiB partition. For this
+pipeline it does not: at LNC=1, cores 0 and 1 would put the transformer and T5
+back in the same budget that could not hold them. Use different pairs:
+
+```bash
+NEURON_LOGICAL_NC_CONFIG=1 NEURON_RT_VISIBLE_CORES=0 \
+    python examples/vllm_neuron/models/flux/generate.py --size 512
+# with FluxNeuronConfig(worker_device_index=2)
+```
+
+A NEFF records the logical-core config it was built for, and the runtime refuses
+to load one that disagrees. `NEURON_LOGICAL_NC_CONFIG` is *not* part of the
+compilation cache key, so switching to LNC=1 would otherwise replay the LNC=2
+NEFFs and drop every component to CPU. `FluxNeuronConfig.neuronx_cc_args` avoids
+that by mirroring the runtime setting into a `--lnc` compiler flag, which both
+compiles the right NEFF and gives each config its own cache entry. Nothing to set
+by hand — but expect a full recompile the first time you switch.
+
+For FLUX, LNC=2 is the better setting. Measured at 512x512 / 8 steps, everything
+on device:
+
+| | ms/step | End to end |
+|---|---|---|
+| LNC=2 (one fused core) | 281 | 2.47 s |
+| LNC=1 (one physical core) | 333 | 2.92 s |
+
+Half the compute per core costs only 19% more per step, so LNC=1 is not a
+disaster for this model — but it is a loss, and it exists to let *other*, smaller
+models share the chip, not to speed this one up.
 
 ### Overrides
 

@@ -3,10 +3,11 @@
 
 Why a process and not just another device index
 -----------------------------------------------
-The two big components do not fit on one logical core. A core addresses ~22 GiB
-of usable trn2 HBM (measured; 24 GB nominal at ``logical-neuroncore-config: 2``,
-less the runtime's reserve), while BF16 FLUX.1-lite's transformer is 15.2 GiB and
-T5-XXL is 8.9 GiB before any activation memory.
+The two big components do not fit in one HBM partition. On trn2, 96 GB of HBM is
+carved into four ~22 GiB partitions, one per physical core pair (measured by
+allocating until failure: one core gets 22 GiB, two cores in the same pair share
+those 22 GiB, two cores in different pairs get 44 GiB). BF16 FLUX.1-lite is
+15.2 GiB of transformer plus 8.9 GiB of T5, over budget before activations.
 
 Splitting them across cores inside one process does not work either. The compile
 backend loads every NEFF at ``start_nc = 0`` offset by the process's distributed
@@ -146,10 +147,15 @@ def explain_core_conflict(worker_core: int) -> str | None:
     does not restrict itself claims *every* logical core when it initializes,
     even if it only ever runs graphs on one -- so the default configuration
     leaves nothing for a worker, and the worker's failure surfaces as an opaque
-    ``nrt_init`` error inside the child.
+    ``nrt_init`` error inside the child ("Logical Neuron Core(s) not available -
+    Requested:lnc1-lnc1 Available:0 ... cores busy").
 
     This is checked up front so the reason is stated once, in the parent, before
     tens of seconds are spent on a launch that cannot succeed.
+
+    Availability is all this checks. It cannot tell whether the worker's core
+    sits in a *different HBM partition*, which is the property that decides
+    whether T5 fits -- see ``FluxNeuronConfig.worker_device_index``.
 
     Args:
         worker_core: The logical core the worker wants.
@@ -178,15 +184,21 @@ def explain_core_conflict(worker_core: int) -> str | None:
             "does not. " + fix
         )
     if visible is None and num_cores is not None:
-        try:
-            claimed = int(num_cores)
-        except ValueError:
-            return None
-        if worker_core < claimed:
+        # The runtime only accepts 1 or a whole device here ("`NEURON_RT_NUM_CORES`
+        # must request one core, or the whole device (multiple of 8)"), and for a
+        # request of 1 it does not say which core it handed over. So: anything but
+        # 1 took the device and nothing is left; 1 cannot be checked from here, and
+        # is worth a nudge toward the knob that can.
+        if num_cores.strip() != "1":
             return (
-                f"NEURON_RT_NUM_CORES={num_cores!r} means this process claimed "
-                f"cores 0..{claimed - 1}, which includes core {worker_core}. " + fix
+                f"NEURON_RT_NUM_CORES={num_cores!r} claims the whole device, so "
+                f"core {worker_core} is not free. " + fix
             )
+        logger.info(
+            "NEURON_RT_NUM_CORES=1 does not say which core this process took, so "
+            "the worker's core cannot be checked in advance. Prefer "
+            "NEURON_RT_VISIBLE_CORES, which is explicit."
+        )
     return None
 
 
@@ -196,8 +208,9 @@ class TextEncoderWorker:
     Args:
         model_path: HF repo id or local path to the ``FluxPipeline`` folder; the
             child loads the ``text_encoder_2`` subfolder from it.
-        device_index: Physical logical-core index for the child to run on. Must
-            differ from the core the pipeline itself uses.
+        device_index: Which core the child runs on, as a *physical* logical-core
+            index; it becomes the child's ``NEURON_RT_VISIBLE_CORES``. Must be a
+            core the parent does not hold, in a different HBM partition.
         max_sequence_length: Prompt budget, and the exact static shape the child
             compiles for.
         compiler_args: ``neuronx-cc`` flags, so the child compiles with the same

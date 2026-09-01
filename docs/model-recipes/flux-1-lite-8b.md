@@ -74,10 +74,17 @@ python examples/vllm_neuron/models/flux/generate.py \
     --output flux_output.png
 ```
 
+![FLUX.1-lite-8B output on Trn2: a red panda in round glasses reading a book in a library](images/flux-1-lite-8b-sample.png)
+
+*1024x1024, 28 steps, guidance 3.5, seed 42 — exactly the command above.
+Downscaled for this page.*
+
 The first run compiles every component (a few minutes, dominated by the VAE
 decode stages); subsequent runs hit the compilation cache. Within a process, the
 first request additionally pays for loading each NEFF onto the device — about
 20 s extra at 1024x1024 — so warm latency only shows from the second request on.
+`generate.py` therefore issues a discarded single-step request before the one it
+reports; `--no-warmup` skips it.
 
 ```python
 from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
@@ -151,8 +158,15 @@ request, almost all of it loading weights from disk.
 
 ### Reducing latency
 
-- **Fewer steps.** FLUX.1-lite holds up well at 8 steps and is recognizable at 4.
-  Step count scales latency linearly.
+- **Fewer steps.** Step count scales latency linearly, and FLUX.1-lite degrades
+  gracefully: 8 steps (8.4 s) still resolves the subject, materials and lighting,
+  losing mostly fine texture and background detail against 28 steps (24.2 s);
+  4 steps (5.3 s) is a usable preview.
+
+  ![FLUX.1-lite-8B at 4, 8 and 28 denoising steps, same prompt and seed](images/flux-1-lite-8b-steps.png)
+
+  *Same prompt, guidance and seed at each step count; 1024x1024, downscaled.*
+
 - **Lower resolution.** 512x512 is 2.8x faster per step than 1024x1024: the
   joint sequence drops from 4608 to 1536 tokens.
 - **Shorter prompt budget.** `--max-sequence-length 256` removes 256 tokens from

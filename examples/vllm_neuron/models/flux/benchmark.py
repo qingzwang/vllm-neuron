@@ -26,6 +26,12 @@ import statistics
 import time
 from typing import Any
 
+# The T5 encoder runs on a second logical NeuronCore, in a child process. A
+# process that does not restrict itself claims *every* core when the Neuron
+# runtime initializes, leaving none for that child -- so pin this one to a single
+# core here, before importing vllm_neuron triggers the init. Override
+# NEURON_RT_VISIBLE_CORES in the environment to use a different core.
+os.environ.setdefault("NEURON_RT_VISIBLE_CORES", "0")
 os.environ.setdefault("NEURON_LIBTORCH_COMPILATION_TIMEOUT", "3600")
 
 from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
@@ -165,8 +171,10 @@ def run_config(args: argparse.Namespace, size: int, steps: int) -> dict[str, Any
         "runs": [r.as_dict() for r in runs],
     }
 
-    # Sweeping builds one pipeline per configuration, so drop this one's weights
-    # before the next allocates 16 GB of HBM on the same core.
+    # Sweeping builds one pipeline per configuration, so release this one before
+    # the next allocates 15 GiB of HBM on the same core -- and, more sharply, so
+    # its T5 worker gives up the second core the next one needs.
+    pipeline.close()
     del pipeline, image
     gc.collect()
     return result

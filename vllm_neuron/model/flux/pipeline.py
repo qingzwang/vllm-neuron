@@ -33,11 +33,12 @@ request and there is no bucketing. Per request:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Self
 
 import numpy as np
 import torch
@@ -47,6 +48,7 @@ from diffusers.pipelines.flux.pipeline_flux import calculate_shift
 from diffusers.utils.torch_utils import randn_tensor
 
 from .config import FluxNeuronConfig
+from .text_encoder_worker import TextEncoderWorker, explain_core_conflict
 from .transformer import (
     NeuronFluxTransformer,
     build_rotary_embedding,
@@ -119,19 +121,39 @@ class _TextEncoder(nn.Module):
 
 
 class NeuronFluxPipeline:
-    """FLUX.1 text-to-image on a single logical NeuronCore.
+    """FLUX.1 text-to-image on Neuron.
+
+    Occupies one logical NeuronCore, plus a second one for the T5 prompt encoder
+    when ``FluxNeuronConfig.text_encoder_worker`` is set (the default) -- T5 does
+    not fit next to the transformer, and a process can only execute on its own
+    core. That second core is held by a child process for the pipeline's
+    lifetime, so :meth:`close` (or ``with``) matters.
 
     Use :meth:`from_pretrained` to build one; the constructor takes an
     already-loaded diffusers pipeline.
 
+    Args:
+        pipe: A loaded diffusers ``FluxPipeline``.
+        config: Neuron shape/placement config.
+        model_path: Where ``pipe`` was loaded from. Required for the T5 worker,
+            which loads its own copy of the encoder in its own process; without
+            it the worker is skipped.
+
     Attributes:
         placement: Where each component ended up (``"neuron"`` or ``"cpu"``).
-            Components requested on device that failed to compile are recorded
-            here as ``"cpu"``.
-        compile_ms: Wall-clock compilation time per component.
+            Components requested on device that failed to load, compile or start
+            are recorded here as ``"cpu"``.
+        compile_ms: Wall-clock time to make each component ready. For
+            ``text_encoder_2`` on the worker this is the child's whole startup,
+            weight loading included.
     """
 
-    def __init__(self, pipe: FluxPipeline, config: FluxNeuronConfig) -> None:
+    def __init__(
+        self,
+        pipe: FluxPipeline,
+        config: FluxNeuronConfig,
+        model_path: str | None = None,
+    ) -> None:
         self.config = config
         self.pipe = pipe
         self.scheduler = pipe.scheduler
@@ -142,6 +164,9 @@ class NeuronFluxPipeline:
 
         self.placement: dict[str, str] = {}
         self.compile_ms: dict[str, float] = {}
+        self._t5_worker: TextEncoderWorker | None = None
+        self._t5_compiled = None
+        self._model_path = model_path
 
         # Inference only: without this, components left on CPU run in eager mode
         # and build an autograd graph, which then blocks the numpy conversion in
@@ -200,7 +225,7 @@ class NeuronFluxPipeline:
         config = config or FluxNeuronConfig()
         logger.info("Loading FLUX checkpoint from %s", model_path)
         pipe = FluxPipeline.from_pretrained(model_path, dtype=config.dtype, **kwargs)
-        return cls(pipe, config)
+        return cls(pipe, config, model_path=model_path)
 
     def _compile(self, module: nn.Module) -> nn.Module:
         from vllm_neuron.envs import get_compile_backend_name
@@ -357,12 +382,7 @@ class NeuronFluxPipeline:
             self.pipe.text_encoder,
             (torch.zeros(batch, CLIP_SEQ_LEN, dtype=torch.long),),
         )
-        (self._t5_compiled,) = self._place(
-            "text_encoder_2",
-            [self._t5],
-            self.pipe.text_encoder_2,
-            (torch.zeros(batch, cfg.max_sequence_length, dtype=torch.long),),
-        )
+        self._place_t5()
 
         # The RoPE tables are graph inputs, so they live wherever the step graph
         # runs. Uploaded once here, reused by every step of every request.
@@ -376,6 +396,90 @@ class NeuronFluxPipeline:
             self.placement,
             {k: round(v / 1e3, 1) for k, v in self.compile_ms.items()},
         )
+
+    def _place_t5(self) -> None:
+        """Place T5 on its own core via the worker, else in-process.
+
+        Kept out of ``_place`` because T5 is the one component whose Neuron
+        placement is not a ``.to(device)`` in this process: it does not fit
+        alongside the transformer on one logical core, and a process cannot
+        execute on two. See ``text_encoder_worker`` for the details.
+        """
+        cfg = self.config
+        blocked = None
+        if cfg.runs_in_worker("text_encoder_2"):
+            if self._model_path is None:
+                blocked = (
+                    "this pipeline was built without a model_path, so the "
+                    "worker cannot load its own copy of T5"
+                )
+            else:
+                blocked = explain_core_conflict(cfg.worker_device_index)
+
+        if cfg.runs_in_worker("text_encoder_2") and blocked:
+            logger.warning(
+                "Not starting the T5 encoder worker: %s Keeping T5 in-process, "
+                "which means CPU and ~1.5 s per request.",
+                blocked,
+            )
+        elif cfg.runs_in_worker("text_encoder_2"):
+            worker = TextEncoderWorker(
+                model_path=self._model_path,
+                device_index=cfg.worker_device_index,
+                max_sequence_length=cfg.max_sequence_length,
+                compiler_args=cfg.neuronx_cc_args(),
+            )
+            start = time.perf_counter()
+            try:
+                worker.start()
+            except Exception:
+                logger.warning(
+                    "T5 encoder worker failed to start; falling back to the "
+                    "in-process copy, which costs ~1.5 s per request.",
+                    exc_info=True,
+                )
+                worker.close()
+            else:
+                self._t5_worker = worker
+                self._t5_compiled = None
+                self.placement["text_encoder_2"] = "neuron"
+                self.compile_ms["text_encoder_2"] = (time.perf_counter() - start) * 1e3
+                # The in-process copy is now dead weight on the host; the worker
+                # holds its own. Kept only if it is the active path.
+                logger.info(
+                    "Component text_encoder_2: ready on core %d in %.1f s",
+                    cfg.worker_device_index,
+                    self.compile_ms["text_encoder_2"] / 1e3,
+                )
+                return
+
+        # In-process: this will try the pipeline's core, fail to allocate next to
+        # the transformer, and fall back to CPU with a warning from _place.
+        (self._t5_compiled,) = self._place(
+            "text_encoder_2",
+            [self._t5],
+            self.pipe.text_encoder_2,
+            (torch.zeros(1, cfg.max_sequence_length, dtype=torch.long),),
+        )
+
+    def close(self) -> None:
+        """Release the T5 worker process, if one is running. Idempotent."""
+        worker, self._t5_worker = self._t5_worker, None
+        if worker is not None:
+            worker.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # Best effort: a pipeline that goes out of scope (the benchmark drops one
+        # per configuration) must not leave a child holding a NeuronCore.
+        # Nothing useful to do or log if this fails during interpreter teardown.
+        with contextlib.suppress(Exception):
+            self.close()
 
     # ------------------------------------------------------------------
     # Inference
@@ -434,13 +538,19 @@ class NeuronFluxPipeline:
         pooled, pooled_tag = self._clip_compiled(
             clip_ids.to(self._device_for("text_encoder"))
         )
-        embeds, embeds_tag = self._t5_compiled(
-            t5_ids.to(self._device_for("text_encoder_2"))
-        )
-        # Fence both encoders, so the caller's timing attributes their cost here
+        if self._t5_worker is not None:
+            # The worker fences on its own core and hands back a host tensor.
+            embeds = self._t5_worker.encode(t5_ids)
+            embeds_tag = None
+        else:
+            embeds, embeds_tag = self._t5_compiled(
+                t5_ids.to(self._device_for("text_encoder_2"))
+            )
+        # Fence the encoders, so the caller's timing attributes their cost here
         # rather than to whichever later stage first waits on the queue.
         pooled_tag.cpu()
-        embeds_tag.cpu()
+        if embeds_tag is not None:
+            embeds_tag.cpu()
 
         target = self._device_for("transformer")
         return (

@@ -26,6 +26,12 @@ import json
 import logging
 import os
 
+# The T5 encoder runs on a second logical NeuronCore, in a child process. A
+# process that does not restrict itself claims *every* core when the Neuron
+# runtime initializes, leaving none for that child -- so pin this one to a single
+# core here, before importing vllm_neuron triggers the init. Override
+# NEURON_RT_VISIBLE_CORES in the environment to use a different core.
+os.environ.setdefault("NEURON_RT_VISIBLE_CORES", "0")
 os.environ.setdefault("NEURON_LIBTORCH_COMPILATION_TIMEOUT", "3600")
 
 from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
@@ -105,19 +111,20 @@ def main() -> None:
         on_device=tuple(c for c in args.on_device.split(",") if c),
         optimization_level=args.optimization_level,
     )
-    pipeline = NeuronFluxPipeline.from_pretrained(args.model_checkpoint, config)
-    pipeline.compile()
+    # `with` releases the T5 worker's NeuronCore on the way out.
+    with NeuronFluxPipeline.from_pretrained(args.model_checkpoint, config) as pipeline:
+        pipeline.compile()
 
-    if not args.no_warmup:
-        print("Warming up (loading NEFFs onto the device)...")
-        pipeline.generate(args.prompt, num_inference_steps=1, seed=args.seed)
+        if not args.no_warmup:
+            print("Warming up (loading NEFFs onto the device)...")
+            pipeline.generate(args.prompt, num_inference_steps=1, seed=args.seed)
 
-    image, timing = pipeline.generate(
-        args.prompt,
-        num_inference_steps=args.steps,
-        guidance_scale=args.guidance,
-        seed=args.seed,
-    )
+        image, timing = pipeline.generate(
+            args.prompt,
+            num_inference_steps=args.steps,
+            guidance_scale=args.guidance,
+            seed=args.seed,
+        )
     image.save(args.output)
 
     print(f"\nSaved {args.size}x{args.size} image to {args.output}")

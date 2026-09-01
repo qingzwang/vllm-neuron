@@ -30,7 +30,24 @@ reuse the parts of this package that are not LM-specific:
 | `attention.py` | `NeuronFluxAttnProcessor` — diffusers' joint attention over the NKI kernel |
 | `transformer.py` | `NeuronFluxTransformer` — one denoising step as a single static graph |
 | `vae.py` | Staged VAE decode and the nearest-upsample rewrite |
+| `text_encoder_worker.py` | T5 on a second logical core, in a child process |
 | `pipeline.py` | `NeuronFluxPipeline` — load, place, compile, generate, time |
+
+## Placement
+
+All four networks run on Neuron, across two logical cores:
+
+| Core | Components |
+| --- | --- |
+| 0 (this process) | transformer, VAE decoder, CLIP |
+| 1 (child process) | T5-XXL |
+
+T5 needs its own core for two independent reasons: a core holds ~22 GiB of usable
+HBM against 15.2 GiB of transformer plus 8.9 GiB of T5, and the compile backend
+loads every NEFF onto the process's own core (`start_nc = 0` plus the distributed
+rank), so one process cannot drive two. The caller has to leave a core free —
+`NEURON_RT_VISIBLE_CORES` before importing `vllm_neuron` — or the pipeline says
+why and keeps T5 on CPU. See the recipe.
 
 ## What had to change for Neuron
 
@@ -72,9 +89,9 @@ does. Full numbers in the model recipe.
 
 ## Not implemented
 
-- **Tensor parallelism.** The pipeline occupies one logical NeuronCore. The step
-  graph is where all the time goes, so sharding it is the highest-value next
-  change.
+- **Tensor parallelism.** The two cores are used for placement, not speed: the
+  transformer runs on one. It is 97% of a request, so sharding the step graph
+  across a chip's four cores is the highest-value next change.
 - **Batching.** Static shapes are built for batch 1.
 - **True classifier-free guidance**, img2img, inpainting, ControlNet, IP-Adapter,
   LoRA.

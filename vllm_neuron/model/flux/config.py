@@ -10,9 +10,10 @@ import torch
 # Components of a diffusers FluxPipeline that can be placed on Neuron.
 FLUX_COMPONENTS = ("transformer", "vae", "text_encoder", "text_encoder_2")
 
-# Everything but T5-XXL, which does not fit on a logical core next to the
-# transformer. See FluxNeuronConfig.on_device.
-DEFAULT_ON_DEVICE = ("transformer", "vae", "text_encoder")
+# Every component runs on Neuron by default. T5-XXL cannot share a core with the
+# transformer, so it runs on a second one via a worker process; see
+# FluxNeuronConfig.text_encoder_worker.
+DEFAULT_ON_DEVICE = FLUX_COMPONENTS
 
 # VAE spatial compression for the FLUX AutoencoderKL (8x), and the 2x2 patchify
 # the pipeline applies on top of it before feeding the transformer.
@@ -40,17 +41,20 @@ class FluxNeuronConfig:
         device_index: Logical NeuronCore to run on.
         on_device: Which pipeline components to move to Neuron and compile.
             Anything left out stays on CPU in eager PyTorch, which is useful for
-            bringing up a component or for A/B latency comparisons.
+            bringing up a component or for A/B latency comparisons. Defaults to
+            all of them.
+        text_encoder_worker: Run T5-XXL on a second logical NeuronCore in a
+            child process (see ``text_encoder_worker.py``). It cannot share the
+            pipeline's core: a core addresses ~22 GiB of usable HBM and BF16
+            FLUX.1-lite is 15.2 GiB of transformer plus 8.9 GiB of T5. And it
+            cannot use a second core in this process either, because the compile
+            backend binds NEFF execution to the process's own core.
 
-            The default leaves ``text_encoder_2`` (T5-XXL) on CPU, because of a
-            hard memory limit rather than a preference: a process runs on one
-            logical NeuronCore, which addresses its own slice of device HBM
-            (24 GB on trn2 at LNC=2), and BF16 FLUX.1-lite plus T5-XXL is
-            16 GB + 9.5 GB. The transformer wins the seat -- it runs once per
-            denoising step against T5's once per request. Spreading them across
-            two cores in one process does not work: the runtime loads every NEFF
-            onto the process's core, so a graph whose weights were uploaded to
-            another core is rejected at execution time.
+            Set this to False to keep T5 in-process, which means CPU: it will
+            try the pipeline's core, fail to allocate, and fall back with a
+            warning. That costs ~1.5 s per request.
+        worker_device_index: Logical core for that child process. Must differ
+            from ``device_index``.
         fuse_scheduler_step: Fold the FlowMatchEulerDiscreteScheduler update
             into the compiled step graph so latents never leave the device
             during denoising. See NeuronFluxTransformer for the exact update.
@@ -69,6 +73,8 @@ class FluxNeuronConfig:
     dtype: torch.dtype = torch.bfloat16
     device_index: int = 0
     on_device: tuple[str, ...] = DEFAULT_ON_DEVICE
+    text_encoder_worker: bool = True
+    worker_device_index: int = 1
     fuse_scheduler_step: bool = True
     use_nki_attention: bool = True
     optimization_level: int = 1
@@ -96,6 +102,13 @@ class FluxNeuronConfig:
             raise ValueError(
                 f"on_device contains unknown components {sorted(unknown)}; "
                 f"valid components are {list(FLUX_COMPONENTS)}."
+            )
+        if self.text_encoder_worker and self.worker_device_index == self.device_index:
+            raise ValueError(
+                f"worker_device_index={self.worker_device_index} must differ from "
+                f"device_index={self.device_index}: the point of the worker is to "
+                "use a second logical NeuronCore, since T5 does not fit next to "
+                "the transformer on one."
             )
         if not 1 <= self.optimization_level <= 3:
             raise ValueError(
@@ -137,15 +150,24 @@ class FluxNeuronConfig:
         return torch.device("neuron", self.device_index)
 
     def device_for(self, component: str) -> torch.device:
-        """The Neuron device a given component is placed on.
+        """The Neuron device a given in-process component is placed on.
 
-        Every on-device component shares one logical core: the runtime binds
-        NEFF execution to the process's core, so there is no per-component
-        choice to make. Kept as a method so callers do not have to know that.
+        Always this process's core: the runtime binds NEFF execution to it, so
+        there is no per-component choice to make. T5 escapes that constraint by
+        running in a child process instead (``text_encoder_worker``), and is not
+        placed through this method.
         """
         if component not in FLUX_COMPONENTS:
             raise ValueError(f"unknown component {component!r}")
         return self.device
+
+    def runs_in_worker(self, component: str) -> bool:
+        """Whether ``component`` runs on Neuron via the child process."""
+        return (
+            component == "text_encoder_2"
+            and self.text_encoder_worker
+            and self.runs_on_device(component)
+        )
 
     def neuronx_cc_args(self) -> list[str]:
         """Compiler flags for ``torch.compile(options={"compiler_args": ...})``.

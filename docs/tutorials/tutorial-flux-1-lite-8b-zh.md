@@ -55,19 +55,77 @@ kernel 和张量并行层，但不用它的 model runner。
 
 ---
 
-## 1. 确认机器和环境
+## 1. 环境配置
+
+### 1.1 机器和 AMI
+
+| 需要什么 | 本文用的 | 说明 |
+|---|---|---|
+| 实例 | **trn2.3xlarge** | 1 颗 Trainium2，默认 4 个逻辑核；`tp_degree` 2 和 4 都够用 |
+| AMI | Deep Learning AMI Neuron (Ubuntu 22.04/24.04) | 驱动、runtime、工具、插件 venv 都已经装好 |
+| 磁盘 | ≥ 100 GB 可用 | checkpoint 约 25 GB，编译缓存约 1 GB，另外留出空间给 HF 缓存 |
+| 主机内存 | ≥ 64 GB（本文 124 GB） | 每个 rank 要先把完整 checkpoint 读进内存才留下自己的分片 |
+
+用 DLAMI 的话这一步不用装任何东西。自己装驱动的话，需要
+`aws-neuronx-dkms`（内核模块）、`aws-neuronx-runtime-lib`、`aws-neuronx-collectives`、
+`aws-neuronx-tools`，按
+[Neuron setup guide](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/setup/neuron-setup/pytorch/inference/index.html)
+走。
+
+### 1.2 确认驱动和 runtime
 
 ```bash
 export PATH=/opt/aws/neuron/bin:$PATH
-neuron-ls          # 能列出设备 = 驱动正常；PID 列为空 = 没有别的进程占着核
+
+neuron-ls          # 列出设备；PID 列为空说明没有别的进程占着核
+dpkg -l | grep -i neuron | awk '{print $2, $3}'
 ```
 
-DLAMI 自带的插件环境在 `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0`。
-它**通常是只读的**（root 所有），所以装额外依赖有两条路：
+本文验证过的版本：
+
+```
+aws-neuronx-dkms          2.30.2.0       内核模块（驱动）
+aws-neuronx-runtime-lib   2.34.10.0      运行时
+aws-neuronx-collectives   2.34.10.0      跨核集合通信（张量并行要用）
+aws-neuronx-tools         2.32.28.0      neuron-ls / neuron-top / neuron-monitor
+```
+
+`neuron-ls` 的输出里有两件重要的事：表头的 `logical-neuroncore-config: 2`（默认，也是
+本文唯一支持的设置），和表里的 `NEURON CORES` 一列（可用的逻辑核数，就是 `tp_degree`
+的上限）。
+
+### 1.3 选对 Python 环境
+
+DLAMI 里有两个 Neuron 的 venv，**互相冲突，不要混用**：
+
+| venv | 栈 | 用途 |
+|---|---|---|
+| `aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0` | `libtorch-neuronx-lite` | **本文用这个**（vLLM Neuron 插件） |
+| `aws_neuronx_venv_jax_0_10` | JAX | 与本文无关 |
+
+如果你还用过 NxD Inference（`torch-neuronx` + `neuronx-distributed`），那是**第三套**
+栈，和这里的 `libtorch-neuronx-lite` 在 `torch`、`torch-xla`、`transformers` 上都冲突，
+必须各自一个 venv，不要试图合并。
 
 ```bash
 V=/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0
+$V/bin/python -V                       # Python 3.12
+$V/bin/pip list | grep -iE "^(vllm|vllm-neuron|libtorch-neuronx-lite|torch|neuronx-cc) "
+```
 
+验证过的版本组合：
+
+```
+vllm 0.24.0 | vllm-neuron 0.24.0.1.1.0 | libtorch-neuronx-lite 2.11.0.1.0.1284
+torch 2.11.0 | neuronx-cc 2.27.5334.0 | transformers 5.15.0 | Python 3.12
+```
+
+### 1.4 装 diffusers（FLUX 的额外依赖）
+
+FLUX 不走 vLLM 引擎，所以 diffusers 没有装在插件环境里，要自己加。DLAMI 的 venv
+**通常是只读的**（root 所有），两条路选一条：
+
+```bash
 # A. venv 可写：直接装
 $V/bin/pip install -r requirements/flux.txt
 
@@ -76,19 +134,85 @@ $V/bin/pip install --target /mnt/nvme/pyext -r requirements/flux.txt
 export PYTHONPATH=/mnt/nvme/pyext:$PYTHONPATH
 ```
 
-**PATH 一定要包含 venv 的 `bin`**，否则编译时会失败在找不到编译器上——这个坑很容易
-踩，因为如果之前已经编译过、命中了缓存，它不会报错：
+`requirements/flux.txt` 要求 `diffusers>=0.40.0`（本文用 0.40.0）。
+
+### 1.5 拿到这个仓库的代码
+
+插件是通过 vLLM 的 platform plugin 入口发现的（启动时会打印
+`Platform plugin neuron is activated`）。如果你要用仓库里的代码而不是 pip 装的那份：
 
 ```bash
+git clone <this repo> /mnt/nvme/vllm-neuron
+cd /mnt/nvme/vllm-neuron
+git checkout model/flux1-lite-8B
+
+# venv 可写：editable 安装
+$V/bin/pip install -e . --no-deps
+# venv 只读：放进 PYTHONPATH 的最前面
+export PYTHONPATH=/mnt/nvme/vllm-neuron:$PYTHONPATH
+```
+
+确认生效（应该指向你的工作目录，而不是 site-packages）：
+
+```bash
+$V/bin/python -c "import vllm_neuron; print(vllm_neuron.__file__)"
+```
+
+### 1.6 必须设的环境变量
+
+```bash
+V=/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0
+
+# 1) 编译器要能被找到。少了这条，编译时报
+#    "neuronx-cc compiler binary does not exist"——而且如果 NEFF 已在缓存里就不报，
+#    等你换了分辨率或并行度才突然炸。
 export PATH=$V/bin:/opt/aws/neuron/bin:$PATH
+
+# 2) 代码和依赖（按 1.4 / 1.5 选择的方式）
+export PYTHONPATH=/mnt/nvme/vllm-neuron:/mnt/nvme/pyext:$PYTHONPATH
+
+# 3) 把 25 GB 的 checkpoint 放到大盘上，别塞进根盘
+export HF_HOME=/mnt/nvme/hf-cache
 ```
 
-验证过的版本组合：
+可选但值得知道的：
 
+| 变量 | 默认 | 什么时候动 |
+|---|---|---|
+| `NEURON_LIBTORCH_CACHE_ROOT` | `~/.cache/neuron_libtorch` | 编译缓存换盘。缓存约 1 GB，命中它能省掉 4 分钟编译 |
+| `NEURON_LIBTORCH_COMPILATION_TIMEOUT` | 例子脚本里设成 3600 | 编译慢的机器上调大；VAE 那五段图最耗时 |
+| `NEURON_RT_VISIBLE_CORES` | 不要设 | 由 rank 自己设置。手动设反而会和 rank 的核抢 |
+| `NEURON_LOGICAL_NC_CONFIG` | 不要设（= LNC 2） | 见第 4 节，这个模型不该用 LNC=1 |
+
+### 1.7 下载模型
+
+```bash
+$V/bin/pip install "huggingface_hub[cli]"      # DLAMI 里一般已有
+hf download Freepik/flux.1-lite-8B             # 约 25 GB，落在 $HF_HOME
 ```
-vllm 0.24.0 | vllm-neuron 0.24.0.1.1.0 | libtorch-neuronx-lite 2.11.0.1.0.1284
-torch 2.11.0 | neuronx-cc 2.27.5334.0 | diffusers 0.40.0 | Python 3.12
+
+`Freepik/flux.1-lite-8B` 不是 gated 仓库，不用登录。要跑 FLUX.1-dev 的话它是 gated 的，
+需要先在网页上同意协议再 `hf auth login`。
+
+### 1.8 验一遍环境
+
+跑完这一段没报错，就可以进第 2 节了：
+
+```bash
+$V/bin/python - <<'EOF'
+import torch, vllm_neuron
+from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
+print("vllm_neuron:", vllm_neuron.__file__)
+import diffusers; print("diffusers:", diffusers.__version__)
+print("config ok:", FluxNeuronConfig(height=512, width=512, tp_degree=2).tp_core_ids)
+# 一个最小的设备计算：能过就说明驱动、runtime、编译器、核都正常
+x = torch.ones(8, 8).to(torch.device("neuron", 0))
+print("device matmul:", float((x @ x).cpu().sum()))
+EOF
 ```
+
+最后一行应该打印 `512.0`。这一小段自己会占用 0 号核，跑完就释放；如果它报
+`The PyTorch Neuron Runtime could not be initialized`，说明有别的进程占着核，见第 7 节。
 
 ---
 

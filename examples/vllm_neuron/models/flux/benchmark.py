@@ -35,9 +35,7 @@ os.environ.setdefault("NEURON_LIBTORCH_COMPILATION_TIMEOUT", "3600")
 from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
 
 PROMPT = (
-    "A close-up photo of a red panda wearing tiny round glasses, reading a "
-    "leather-bound book in a cozy library, warm afternoon light, shallow "
-    "depth of field"
+    "a photo of a red panda reading a book"
 )
 
 

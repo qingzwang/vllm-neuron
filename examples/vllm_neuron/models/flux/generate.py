@@ -10,7 +10,7 @@ The first run compiles (a few minutes); later runs hit the compilation cache.
 
 Usage:
     python examples/vllm_neuron/models/flux/generate.py \
-        --prompt "a red panda reading a book in a cozy library"
+        --prompt "a photo of a red panda reading a book"
 
     # Faster: fewer steps, shorter prompt budget, lower resolution
     python examples/vllm_neuron/models/flux/generate.py \
@@ -40,9 +40,7 @@ os.environ.setdefault("NEURON_LIBTORCH_COMPILATION_TIMEOUT", "3600")
 from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
 
 DEFAULT_PROMPT = (
-    "A close-up photo of a red panda wearing tiny round glasses, reading a "
-    "leather-bound book in a cozy library, warm afternoon light, shallow "
-    "depth of field"
+    "a photo of a red panda reading a book"
 )
 
 

@@ -2,7 +2,7 @@
 
 <!-- meta: description: Model recipe for running FLUX.1-dev text-to-image
 generation on Neuron, including supported checkpoints, how the model is sharded
-across NeuronCores, dynamic LoRA, measured latency on Trn2 at tp_degree 2 and 4,
+across NeuronCores, dynamic LoRA, measured latency on Trn2 at tp_degree 4,
 and known limitations. -->
 <!-- meta: keywords: Neuron, FLUX, FLUX.1-dev, black-forest-labs, diffusion,
 text-to-image, DiT, diffusers, model recipe, tensor parallelism, tp_degree, LoRA,
@@ -78,15 +78,16 @@ the default `logical-neuroncore-config: 2`, which is what `tp_degree=4` uses.
 python examples/vllm_neuron/models/flux/generate.py \
     --model-checkpoint black-forest-labs/FLUX.1-dev \
     --tp 4 \
-    --prompt "A close-up photo of a red panda wearing tiny round glasses, reading a leather-bound book in a cozy library" \
+    --prompt "a photo of a red panda reading a book" \
     --steps 28 \
     --output flux_output.png
 ```
 
-![FLUX.1-dev output on Trn2: a red panda in round glasses reading a book](images/flux-1-dev-sample.png)
+![FLUX.1-dev output on Trn2: a red panda reading a book](images/flux-1-dev-sample.png)
 
-*1024x1024, 28 steps, guidance 3.5, seed 42 — exactly the command above.
-Downscaled for this page.*
+*`"a photo of a red panda reading a book"` at 1024x1024, 28 steps, guidance 3.5,
+seed 42 — the prompt and settings every measurement on this page uses. Downscaled
+here.*
 
 ```python
 from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
@@ -96,7 +97,7 @@ config = FluxNeuronConfig(height=1024, width=1024, tp_degree=4)
 with NeuronFluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", config) as pipeline:
     pipeline.compile()
     image, timing = pipeline.generate(
-        "a red panda reading a book", num_inference_steps=28, seed=42
+        "a photo of a red panda reading a book", num_inference_steps=28, seed=42
     )
 image.save("out.png")
 print(timing.as_dict())
@@ -127,7 +128,7 @@ tokenizes, drives the denoising loop, and turns the result into an image.
 | `vae` (AutoencoderKL decoder) | 0.16 GiB | replicated | convolutional, once per request |
 
 This is the same division NxD Inference makes for the same model, which makes the
-two directly comparable — see "Against NxD Inference" below.
+two directly comparable — see [Against NxD Inference](#against-nxd-inference).
 
 ### Why tp_degree=4 and not less
 
@@ -194,12 +195,30 @@ that does not use adapters pays nothing.
 diffusers/PEFT, kohya and XLabs layouts all load: the file goes through
 `FluxPipeline.lora_state_dict`, so diffusers' own converters do the format work.
 
-| base model | [XLabs realism](https://huggingface.co/XLabs-AI/flux-RealismLora) (r=16) | [kohya super-realism](https://huggingface.co/strangerzonehf/Flux-Super-Realism-LoRA) (r=64) |
-|---|---|---|
-| ![](images/flux-lora-base.png) | ![](images/flux-lora-xlabs.png) | ![](images/flux-lora-kohya.png) |
+The samples below use the same three prompts, seed, resolution and step count as
+[NxD Inference's dynamic-LoRA samples](https://github.com/aws-neuron/neuronx-distributed-inference/blob/feature/flux-dynamic-lora/examples/flux_lora.md),
+on the same checkpoint and the same two adapters, so the two sets are directly
+comparable.
 
-<sub>One compiled model, one prompt, one seed; both adapters loaded at runtime and
-selected with a sub-millisecond switch. 512x512, 28 steps, `tp_degree=4`.</sub>
+| | base model | [XLabs realism](https://huggingface.co/XLabs-AI/flux-RealismLora) (r=16) | [kohya super-realism](https://huggingface.co/strangerzonehf/Flux-Super-Realism-LoRA) (r=64) |
+|---|---|---|---|
+| *fisherman* | ![](images/flux-lora-fisherman-base.png) | ![](images/flux-lora-fisherman-xlabs.png) | ![](images/flux-lora-fisherman-kohya.png) |
+| *cafe* | ![](images/flux-lora-cafe-base.png) | ![](images/flux-lora-cafe-xlabs.png) | ![](images/flux-lora-cafe-kohya.png) |
+| *workshop* | ![](images/flux-lora-workshop-base.png) | ![](images/flux-lora-workshop-xlabs.png) | ![](images/flux-lora-workshop-kohya.png) |
+
+<sub>One compiled model, one seed per prompt (11), one device slot per adapter, both
+loaded at runtime after the model was up; every row swapped adapters through those
+slots with a sub-millisecond switch. 1024x1024, 20 steps, guidance 3.5, FLUX.1-dev at
+`tp_degree=4`, shown here at 384px.</sub>
+
+<sub>*fisherman*: a close-up portrait photograph of an elderly fisherman mending a
+net, weathered hands, overcast harbour light — *cafe*: a photograph of a woman
+reading a paperback in a busy cafe window, afternoon sun, shallow depth of field —
+*workshop*: a photograph of a cluttered watchmaker's workbench, brass tools and
+loupe, single desk lamp</sub>
+
+Each adapter's effect holds across the three prompts, which is the point of the grid:
+it is the adapter showing up, not prompt-to-prompt variation.
 
 
 ### How it avoids recompiling
@@ -221,20 +240,37 @@ than once per switch.
 
 ### Cost
 
-`tp_degree=4`, 512x512, two slots at rank 64:
+`tp_degree=4`, two slots at rank 64:
 
 | Operation | Cost |
 |---|---|
 | `set_lora(...)` between loaded adapters | **0.5–1.0 ms** |
 | `load_lora(...)`, 22 MiB adapter (152 modules) | 0.13–0.14 s |
 | `load_lora(...)`, 585 MiB adapter (494 modules) | 0.44–0.58 s |
-| Per-step latency, adapter active | 116.3–117.4 ms against 115.3 ms for the base model |
+| Per-step, adapter active vs slot 0 *in the same build*, 512x512 | 116.3–117.4 ms against 115.3 ms |
+| Per-step, adapter active vs slot 0 *in the same build*, 1024x1024 | 304.0–304.8 ms against 303.6 ms |
 | Slot memory | 385 MB per slot per rank |
 
-The step cost of an active adapter is not measurable against run-to-run spread: the
-extra work is two thin matmuls per adapted layer, against a 4608-token attention.
-Slot memory scales with `lora_max_rank`, so set it to the widest adapter you
-actually use.
+Using an adapter is free; *compiling for* adapters is not. Within one LoRA-enabled
+model, an active adapter costs nothing measurable against slot 0 — two thin matmuls
+per adapted layer, against a 4608-token attention. But the adapter path has no
+branch on device: `index_select` and those matmuls are in the graph whether or not a
+slot holds anything, so the whole graph is slower than one compiled without slots.
+Same process, same prompt and seed, only `lora_slots` changed:
+
+| | `lora_slots=0` | `lora_slots=2` |
+|---|---|---|
+| 512x512 | 103.2 ms/step | 117.2 ms/step (+13.6%) |
+| 1024x1024 | 272.3 ms/step | 305.8 ms/step (+12.3%) |
+
+So `lora_slots` is a deployment-level decision, not a per-request one: turn it on if
+adapters are served, leave it at 0 if not. NxD Inference's LoRA path shows the same
+within-build result — a resident adapter at 75.7 ms/step against 74.1 ms for no
+adapter — and its numbers, like the first table here, are measured inside a
+LoRA-enabled model.
+
+Slot memory scales with `lora_max_rank`, so set it to the widest adapter you actually
+use.
 
 ### Correctness
 
@@ -269,6 +305,13 @@ prompt itself.
 
 Switching also has to be lossless: switching away from an adapter and back reproduces
 the earlier latents **bit for bit**, and so does returning to slot 0.
+
+And the result must not depend on the history that led to it. Two processes loaded the
+two adapters in opposite orders — so `xlabs` sat in slot 1 in one and slot 2 in the
+other — and took different swap paths before ending on the same three requests. All
+three came out **bit for bit identical across the two processes**: base, `xlabs` and
+`kohya`. Which slot an adapter occupies, and what passed through that slot earlier,
+have no effect on the output.
 
 ### Adapters have to match the checkpoint
 
@@ -341,22 +384,24 @@ after a discarded warmup request.
 
 | `tp_degree` | Resolution | Steps | ms/step | Denoise | Prompt encode | VAE decode | **End to end** |
 |---|---|---|---|---|---|---|---|
-| 2 | 512x512 | 4 | 134 | 0.54 s | 0.06 s | 0.14 s | **0.74 s** |
-| 4 | 512x512 | 4 | 80 | 0.32 s | 0.03 s | 0.14 s | **0.51 s** |
-| 2 | 1024x1024 | 28 | 392 | 11.0 s | 0.06 s | 0.56 s | **11.65 s** |
-| 4 | 1024x1024 | 28 | 214 | 6.0 s | 0.03 s | 0.57 s | **6.62 s** |
+| 4 | 512x512 | 4 | 103 | 0.41 s | 0.04 s | 0.14 s | **0.60 s** |
+| 4 | 1024x1024 | 28 | 272 | 7.62 s | 0.04 s | 0.59 s | **8.28 s** |
 
-Doubling the ranks takes 1.84x off the step and 1.76x off the request. Step latency
-is flat across step counts and stable to well under 1% — the same graph runs every
-step, on static shapes, with nothing left on the host but a one-element fence read.
+FLUX.1-dev only runs at `tp_degree=4` (see above), so there is no scaling row here at
+1024x1024. At 512x512, where two ranks still fit, the step goes from 171 ms to 104 ms
+— 1.65x for twice the ranks, measured back to back in one process.
 
-Denoising is 91% of a 1024x1024 request at `tp_degree=4`. What running the rest on
+Step latency is flat across step counts and stable to well under 1% — the same graph
+runs every step, on static shapes, with nothing left on the host but a one-element
+fence read.
+
+Denoising is 92% of a 1024x1024 request. What running the rest on
 Neuron buys, against the same weights in CPU eager mode:
 
 | Stage | On Neuron (tp=4) | CPU eager | Speedup |
 |---|---|---|---|
-| Prompt encode (CLIP + T5, 512-token budget) | 0.03 s | 1.62 s | 54x |
-| VAE decode (1024x1024, five staged graphs) | 0.57 s | 7.55 s | 13x |
+| Prompt encode (CLIP + T5, 512-token budget) | 0.04 s | 1.62 s | 46x |
+| VAE decode (1024x1024, five staged graphs) | 0.59 s | 7.55 s | 13x |
 
 Attention dominates the step: 46 attentions over a joint sequence of 4608 tokens
 (4096 image + 512 text) at 1024x1024. Measured in isolation at those shapes, the
@@ -368,7 +413,7 @@ which is why the kernel is the default.
 | Phase | Cost |
 |---|---|
 | Compilation, cold cache | ~4 min, dominated by the five VAE decode stages |
-| Rank startup, warm cache | 130-180 s |
+| Rank startup, warm cache | 100-200 s, the top of that range being LoRA-enabled builds |
 | First image in a process | +12 s at 1024x1024, loading the VAE NEFFs |
 
 Rank startup is where the cost sits, and it grows with `tp_degree`: every rank
@@ -388,8 +433,8 @@ whole request, so a step sends three scalars and gets back a one-element fence.
 
   *Same prompt, guidance and seed at each step count; 1024x1024, downscaled.*
 
-- **Lower resolution.** 512x512 is 2.6x faster per step than 1024x1024 (105 against
-  274 ms at `tp_degree=4`): the joint sequence drops from 4608 to 1536 tokens.
+- **Lower resolution.** 512x512 is 2.6x faster per step than 1024x1024 (103 against
+  272 ms): the joint sequence drops from 4608 to 1536 tokens.
 - **Shorter prompt budget.** `--max-sequence-length 256` removes 256 tokens from
   every attention in every step. Prompts longer than the budget are truncated.
 - **`-O2` / `-O3`.** `--optimization-level` maps straight to `neuronx-cc -O`.
@@ -402,6 +447,29 @@ python examples/vllm_neuron/models/flux/benchmark.py \
     --tp 4 --sizes 512,1024 --steps 8,28 --iterations 2 --json flux_latency.json
 ```
 
+### Against NxD Inference
+
+NxD Inference runs the same checkpoint with the same division of components at the
+same `tp_degree`, on this same instance, so the two are directly comparable. Both
+sides below are LoRA-enabled builds with no adapter selected — that is the
+configuration NxDI's LoRA numbers are measured in, and the fair one to compare
+against — at 1024x1024, medians of full requests:
+
+| | this pipeline | NxD Inference |
+|---|---|---|
+| ms/step | 303.6 | 300.8 |
+| request, 20 steps | 6.75 s | 6.39 s |
+| fixed part (encode + VAE decode + host) | 0.66 s | 0.38 s |
+
+The step itself, which is 90% of a request, agrees to about 1%: the same shards
+doing the same work. The 0.36 s the request differs by is almost entirely the fixed
+part — VAE decode and host postprocessing — not the transformer. NxDI's per-step
+figure is the slope of its own 4/20/28-step measurements (1.58 / 6.39 / 8.80 s),
+which is also where its fixed part comes from.
+
+Without LoRA slots this pipeline runs the same request at 272 ms/step (6.10 s for 20
+steps); see the LoRA section for why compiling for adapters costs the difference.
+
 ## Accuracy
 
 Numerics are BF16 throughout, matching how FLUX is normally served, with two
@@ -409,44 +477,49 @@ deliberate promotions to fp32: RoPE application and the fused Euler update, so
 latent error does not accumulate across ~30 steps of BF16 addition.
 
 **Logic equivalence.** `NeuronFluxTransformer` was run against upstream
-`FluxTransformer2DModel.forward` on identical inputs, both fp32 on CPU: max
-relative difference **2.9e-7**, i.e. fp32 rounding. This is what covers the
-rewritten pieces — hoisted RoPE, the reimplemented rotation, patched GELU, latent
-packing, and the timestep/guidance convention.
+`FluxTransformer2DModel.forward` on identical inputs, both fp32 on CPU, on FLUX.1-dev
+at 512x512 with a 256-token prompt: max relative difference **8.3e-7** on the
+predicted velocity (mean abs 4.5e-7, cosine 0.99999982), i.e. fp32 rounding
+accumulated over 57 blocks. This is what covers the rewritten pieces — hoisted RoPE,
+the reimplemented rotation, patched GELU, latent packing, and the timestep/guidance
+convention.
 
-**BF16 fidelity.** One denoising step at 512x512 with a 256-token prompt, against
-that fp32 reference:
+**BF16 fidelity.** One denoising step at 512x512, `tp_degree=4`, against an fp32 CPU
+diffusers reference — same prompt, same seed, the same initial latents handed to every
+path:
 
-| Path | mean abs error | cosine similarity |
-|---|---|---|
-| Neuron BF16 (this pipeline) | 0.0074 | 0.999969 |
-| CPU BF16 eager (diffusers) | 0.1039 | 0.993771 |
+| Path | mean abs error | max abs error | cosine similarity |
+|---|---|---|---|
+| Neuron BF16 (this pipeline) | 0.0187 | 0.125 | **0.999775** |
+| CPU BF16 eager (diffusers) | 0.0811 | 0.449 | 0.995745 |
 
-Reference velocity has std 1.16, so the Neuron path lands ~14x closer to fp32 than
-CPU BF16 does — Trainium accumulates matmuls in fp32 where CPU BF16 eager
-accumulates in BF16. Separately, the NKI attention kernel matches an fp32 SDPA
-reference to 7e-4 max absolute error at 1024x1024 joint-attention shapes.
+Reference latents have std 1.107, so the Neuron path lands **4.3x closer to fp32**
+than the same weights in CPU BF16 eager do — Trainium accumulates matmuls in fp32
+where CPU BF16 eager accumulates in BF16. That is also why CPU BF16 is not a useful
+ground truth for this pipeline; the LoRA cross-matrix above uses fp32 references for
+the same reason. Separately, the NKI attention kernel matches an fp32 SDPA reference
+to 7e-4 max absolute error at 1024x1024 joint-attention shapes.
 
 **Sharding.** The split is exact rather than an approximation — verified layer by
 layer on CPU, where each rank's partial products sum to the dense layer's result —
 but it does reorder summations, and BF16 shows that. Same seed and prompt:
 
 Sharding is checked against a less-sharded run of the same model: at 512x512, where
-`tp_degree=2` still fits, two and four ranks agree to **cos 0.999554** on the final
-latents after 4 steps (max abs diff 0.74 against a latent std of 1.22) -- bf16
-reassociation, since splitting attention and the feed-forwards changes the order the
-sums happen in. A sharding mistake looks nothing like this; it lands below cos 0.9
+`tp_degree=2` still fits, two and four ranks agree to **cos 0.999623** on the final
+latents after 4 steps (mean abs diff 0.018, max 0.96, against a latent std of 1.12)
+-- bf16 reassociation, since splitting attention and the feed-forwards changes the
+order the sums happen in. A sharding mistake looks nothing like this; it lands below cos 0.9
 and is obvious in the image.
 
-**End to end.** Compared against the stock diffusers pipeline running BF16 on CPU,
-same prompt, seed and schedule (512x512, 8 steps): latent cosine similarity 0.9993
-after 1 step, 0.9916 after 8, and image PSNR 27.3 dB. The two images share
-composition, subject, palette and lighting but differ in fine detail. That is
-expected rather than a defect: a flow-matching ODE amplifies any per-step numerical
-difference across steps, and per the table above the CPU BF16 side is the less
-faithful of the two. Diffusion output is not reproducible bit-for-bit across
-numerical backends — treat a seed as reproducible only within one `tp_degree` and
-dtype.
+**End to end.** Against the stock diffusers pipeline in BF16 on CPU, same prompt,
+seed, schedule and initial latents (512x512): latent cosine similarity 0.9954 after
+1 step, 0.9552 after 8, and decoded image PSNR 20.3 dB. The gap grows with step
+count because a flow-matching ODE amplifies any per-step numerical difference, and
+per the table above the CPU BF16 side is the less faithful of the two — measured
+against fp32 it is four times further off than this pipeline is. So read this as
+"the two backends drift apart over the trajectory", not as an error budget for this
+one. Diffusion output is not reproducible bit-for-bit across numerical backends —
+treat a seed as reproducible only within one `tp_degree` and dtype.
 
 ## Limitations
 
@@ -465,3 +538,9 @@ dtype.
 - A `neuronx-cc` failure terminates the process rather than raising.
 - `logical-neuroncore-config: 1` is unsupported: half the compute per rank, and
   the transformer graph returns NaN there.
+- LoRA: the text encoders are not adapted — adapter keys that name them are
+  reported and dropped.
+- LoRA: `lora_slots` and `lora_max_rank` are fixed at compile time. All slots are
+  the same width, so a rank-8 adapter is zero-padded and costs a rank-64 slot's
+  memory, and the graph is 12-14% slower per step than one compiled without slots
+  even with no adapter selected.

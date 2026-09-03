@@ -2,8 +2,8 @@
 
 <!-- meta: description: Step-by-step Chinese tutorial for running FLUX.1-dev
 text-to-image generation on Trn2 with the vLLM Neuron plugin: environment setup,
-tensor parallelism across NeuronCores, dynamic LoRA, measured latency at tp_degree 2
-and 4, and troubleshooting. -->
+tensor parallelism across NeuronCores, dynamic LoRA, measured latency at tp_degree 4,
+and troubleshooting. -->
 
 <!-- meta: keywords: vLLM, Neuron, FLUX, FLUX.1-dev, 文生图, LoRA,
 diffusion, text-to-image, tensor parallelism, 张量并行, NeuronCore, Trn2,
@@ -369,15 +369,15 @@ EOF
 python examples/vllm_neuron/models/flux/generate.py \
     --model-checkpoint black-forest-labs/FLUX.1-dev \
     --tp 4 \
-    --prompt "A close-up photo of a red panda wearing tiny round glasses, reading a leather-bound book in a cozy library" \
+    --prompt "a photo of a red panda reading a book" \
     --steps 28 \
     --output flux_output.png
 ```
 
-![FLUX.1-dev 在 trn2 上的输出：戴圆眼镜看书的小熊猫](../model-recipes/images/flux-1-dev-sample.png)
+![FLUX.1-dev 在 trn2 上的输出：一只在看书的小熊猫](../model-recipes/images/flux-1-dev-sample.png)
 
-*1024×1024、28 步、guidance 3.5、seed 42、`tp_degree=4`，就是上面那条命令。为了这个
-页面缩过。*
+*提示词 `"a photo of a red panda reading a book"`、1024×1024、28 步、guidance 3.5、
+seed 42、`tp_degree=4`——本文所有测量用的都是这一套。为了页面缩过。*
 
 `--tp 4` 就是用 4 个核（rank 占 0-3 号核），这个 checkpoint 只能用 4，原因见概念 ③。
 **不需要自己安排核的绑定**——这个进程不碰设备，rank 自己会绑。
@@ -477,7 +477,7 @@ trn2.3xlarge、LNC=2、BF16、batch 1、`neuronx-cc -O1`、512 token 预算。�
 | VAE 解码（1024×1024，五段图） | 0.60 s | 7.55 s | 13× |
 
 **启动的代价在另一头**：每个 rank 都要先把完整 checkpoint 读进来才留下自己那几片，而且
-为了不让主机内存爆掉，它们是拿锁排队读的（130–180 秒）。
+为了不让主机内存爆掉，它们是拿锁排队读的（热缓存下 100–200 秒，带 LoRA 槽位的构型在上限那头）。
 每步的额外开销很小（约 1 ms）：embedding 和 latent 整个请求都留在 rank 里，每步只发三个
 标量、收一个一元素栅栏。
 
@@ -486,13 +486,32 @@ trn2.3xlarge、LNC=2、BF16、batch 1、`neuronx-cc -O1`、512 token 预算。�
 切分是精确的，不是近似（每个 rank 的偏积之和等于稠密层的结果，这一条在 CPU 上逐层验
 过），但它确实改变了求和顺序，bf16 下会体现出来。同种子同 prompt，比最终 latent：
 
-| | 步数 | cos | max\|d\| | latent 标准差 |
-|---|---|---|---|---|
-| 512×512，tp=2 vs tp=4 | 4 | 0.999554 | 0.74 | 1.22 |
+| | 步数 | cos | mean\|d\| | max\|d\| | latent 标准差 |
+|---|---|---|---|---|---|
+| 512×512，tp=2 vs tp=4 | 4 | 0.999623 | 0.018 | 0.96 | 1.12 |
 
 只有 512×512 这一行，因为 `tp_degree=2` 在 1024×1024 下装不下。差异来自 bf16 下求和顺序
 变了（注意力和前馈被切开）。切错的话根本不是这个量级——会掉到 cos 0.9 以下，图上一眼就能
 看出来。
+
+顺便，这一对也是唯一能量出并行度收益的地方：同一个进程里先后跑，512×512 下 tp=2 是
+**171 ms/step**、tp=4 是 **104 ms/step**，翻倍核数换来 1.65×。
+
+### 和 NxD Inference 比
+
+NxD Inference 跑的是同一个 checkpoint、同样的组件划分、同样的 `tp_degree=4`，也是这台机器，
+所以两边可以直接比。下面两边都是**带 LoRA 槽位、但没选中任何 adapter**的构型（NxDI 的 LoRA
+数字就是在这个构型里测的），1024×1024、整请求中位数：
+
+| | 本插件 | NxD Inference |
+|---|---|---|
+| ms/step | 303.6 | 300.8 |
+| 20 步一次请求 | 6.75 s | 6.39 s |
+| 固定开销（编码 + VAE 解码 + host） | 0.66 s | 0.38 s |
+
+占一次请求 90% 的那一步，两边差 1% 左右——同样的分片在做同样的事。差出来的 0.36 s 基本
+全在固定开销那一头（VAE 解码和 host 后处理），不在 transformer 上。NxDI 的每步数字是它自己
+4/20/28 步（1.58 / 6.39 / 8.80 s）的斜率，固定开销也是从这里来的。
 
 ---
 
@@ -527,12 +546,28 @@ python examples/vllm_neuron/models/flux/generate.py --tp 4 \
 给了 `--lora` 而没给 `--use-lora` 时，它会把 base 和每个 adapter 各出一张图——因为切换
 几乎不要钱，多出的图只花自己那点去噪时间。
 
-| 底模 | [XLabs realism](https://huggingface.co/XLabs-AI/flux-RealismLora)（r=16） | [kohya super-realism](https://huggingface.co/strangerzonehf/Flux-Super-Realism-LoRA)（r=64） |
-|---|---|---|
-| ![](../model-recipes/images/flux-lora-base.png) | ![](../model-recipes/images/flux-lora-xlabs.png) | ![](../model-recipes/images/flux-lora-kohya.png) |
+下面这组样图用的提示词、种子、分辨率和步数，和
+[NxD Inference 那边动态 LoRA 的样图](https://github.com/aws-neuron/neuronx-distributed-inference/blob/feature/flux-dynamic-lora/examples/flux_lora.md)
+完全一样，checkpoint 和两个 adapter 也一样，所以两边可以直接对着看。
 
-<sub>同一个编译好的模型、同一个 prompt、同一个种子；两个 adapter 都是运行时加载的，切换
-用的是亚毫秒的一次索引写。512×512，28 步，`tp_degree=4`。</sub>
+| | 底模 | [XLabs realism](https://huggingface.co/XLabs-AI/flux-RealismLora)（r=16） | [kohya super-realism](https://huggingface.co/strangerzonehf/Flux-Super-Realism-LoRA)（r=64） |
+|---|---|---|---|
+| *fisherman* | ![](../model-recipes/images/flux-lora-fisherman-base.png) | ![](../model-recipes/images/flux-lora-fisherman-xlabs.png) | ![](../model-recipes/images/flux-lora-fisherman-kohya.png) |
+| *cafe* | ![](../model-recipes/images/flux-lora-cafe-base.png) | ![](../model-recipes/images/flux-lora-cafe-xlabs.png) | ![](../model-recipes/images/flux-lora-cafe-kohya.png) |
+| *workshop* | ![](../model-recipes/images/flux-lora-workshop-base.png) | ![](../model-recipes/images/flux-lora-workshop-xlabs.png) | ![](../model-recipes/images/flux-lora-workshop-kohya.png) |
+
+<sub>同一个编译好的模型，每个提示词同一个种子（11），每个 adapter 一个槽位、都是模型起来之后
+在运行时加载的；每一行都通过这两个槽位切换，切换是亚毫秒的一次索引写。1024×1024，20 步，
+guidance 3.5，FLUX.1-dev，`tp_degree=4`，这里按 384px 展示。</sub>
+
+<sub>*fisherman*：a close-up portrait photograph of an elderly fisherman mending a
+net, weathered hands, overcast harbour light — *cafe*：a photograph of a woman
+reading a paperback in a busy cafe window, afternoon sun, shallow depth of field —
+*workshop*：a photograph of a cluttered watchmaker's workbench, brass tools and
+loupe, single desk lamp</sub>
+
+每个 adapter 的效果在三个提示词上是一致的，这才是这张网格要看的东西：变化来自 adapter，
+不是提示词之间的随机差异。
 
 `lora_slots=0`（默认）时图和原来完全一样，不用 adapter 的部署不付任何代价。
 diffusers/PEFT、kohya、XLabs 三种格式都能读（文件交给
@@ -552,18 +587,32 @@ diffusers/PEFT、kohya、XLabs 三种格式都能读（文件交给
 张量里，搬一次要几百毫秒到几秒；槽位存在的意义就是让这个代价**每个 adapter 付一次**，而
 不是每次切换都付。
 
-### 实测（tp=4，512px，2 个槽位，rank 64）
+### 实测（tp=4，2 个槽位，rank 64）
 
 | 操作 | 耗时 |
 |---|---|
 | `set_lora(...)` 在已加载的 adapter 之间切 | **0.5–1.0 ms** |
 | `load_lora(...)`，22 MiB 的 adapter（152 个模块） | 0.13–0.14 s |
 | `load_lora(...)`，585 MiB 的 adapter（494 个模块） | 0.44–0.58 s |
-| 每步延时（adapter 生效时） | 116.3–117.4 ms，对比底模的 115.3 ms |
+| 每步：**同一个编译好的模型里**，adapter 生效 vs 槽位 0，512×512 | 116.3–117.4 ms vs 115.3 ms |
+| 每步：同上，1024×1024 | 304.0–304.8 ms vs 303.6 ms |
 | 槽位显存 | 385 MB / 槽 / rank |
 
-adapter 生效时的每步开销测不出来——多出来的是每个适配层两个很薄的矩阵乘，对比的是
-4608 token 的注意力。槽位显存和 `lora_max_rank` 成正比，所以按你真正会用的最大 rank 设。
+**用 adapter 是免费的，但"为 adapter 编译"不是。** 在同一个 LoRA 模型里，adapter 生效的每步
+开销测不出来——多出来的是每个适配层两个很薄的矩阵乘，对比的是 4608 token 的注意力。但设备上
+没有分支：不管槽位里有没有东西，`index_select` 和那两个矩阵乘都在图里，所以整张图就是比不带
+槽位编出来的慢。同一个进程、同样的 prompt 和种子，只改 `lora_slots`：
+
+| | `lora_slots=0` | `lora_slots=2` |
+|---|---|---|
+| 512×512 | 103.2 ms/step | 117.2 ms/step（+13.6%） |
+| 1024×1024 | 272.3 ms/step | 305.8 ms/step（+12.3%） |
+
+所以 `lora_slots` 是部署级别的决定，不是每个请求的决定：要服务 adapter 就开，不服务就留 0。
+NxD Inference 的 LoRA 路径给出的是同一个"同图之内"的结论——槽位里已有的 adapter 75.7 ms/step，
+对比不用 adapter 的 74.1 ms——它的数字和上面第一张表一样，都是在 LoRA 模型内部测的。
+
+槽位显存和 `lora_max_rank` 成正比，所以按你真正会用的最大 rank 设。
 
 ### 正确性
 
@@ -590,6 +639,11 @@ rank 得到各自不同的错误结果。四种情况（列并行、行并行、
 embedding，而这边是各自编码自己的 prompt。
 
 切换本身也必须是无损的：切走再切回**逐位相同**，回到槽位 0 也逐位相同。
+
+结果也不能依赖于「怎么走到这一步的」。两个进程用相反的顺序加载这两个 adapter（所以 `xlabs`
+在一个进程里是槽位 1、在另一个里是槽位 2），中间走了不同的切换路径，最后要同样的三个请求：
+base、`xlabs`、`kohya` 三者在两个进程之间**逐位相同**。adapter 落在哪个槽位、这个槽位之前
+放过什么，都不影响输出。
 
 ### adapter 必须和 checkpoint 匹配
 

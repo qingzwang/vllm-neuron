@@ -66,13 +66,88 @@ kernel 和张量并行层，但不用它的 model runner。
 | 磁盘 | ≥ 100 GB 可用 | checkpoint 约 25 GB，编译缓存约 1 GB，另外留出空间给 HF 缓存 |
 | 主机内存 | ≥ 64 GB（本文 124 GB） | 每个 rank 要先把完整 checkpoint 读进内存才留下自己的分片 |
 
-用 DLAMI 的话这一步不用装任何东西。自己装驱动的话，需要
-`aws-neuronx-dkms`（内核模块）、`aws-neuronx-runtime-lib`、`aws-neuronx-collectives`、
-`aws-neuronx-tools`，按
-[Neuron setup guide](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/setup/neuron-setup/pytorch/inference/index.html)
-走。
+用 DLAMI Neuron 的话，驱动、运行时、工具和插件 venv 都是现成的，可以直接跳到 1.3 去
+确认版本。用干净的 Ubuntu 就看下一小节。
 
-### 1.2 确认驱动和 runtime
+### 1.2 如果 AMI 里什么都没有：自己装驱动和运行时
+
+上一小节假设你用的是 DLAMI。如果是一台干净的 Ubuntu（本文验证的是 **Ubuntu 24.04
+noble**，Trainium 上另一个常见选择是 22.04 jammy，把下面的 `noble` 换成 `jammy`），
+整套要自己装。分三层：**驱动 → 运行时和工具 → Python 栈**。
+
+**第 0 步：内核头文件。** 驱动是 DKMS 模块，装的时候要现场编译，所以必须先有和当前内核
+匹配的头文件，否则装完不会生成模块、`/dev/neuron0` 也不会出现：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y linux-headers-$(uname -r) dkms
+```
+
+**第 1 步：加 Neuron 的 apt 源。**
+
+```bash
+# 公钥
+curl -fsSL https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB \
+  | sudo gpg --dearmor -o /usr/share/keyrings/neuron-keyring.gpg
+
+# 源（noble = Ubuntu 24.04；22.04 用 jammy）
+echo "deb [signed-by=/usr/share/keyrings/neuron-keyring.gpg] \
+https://apt.repos.neuron.amazonaws.com noble main" \
+  | sudo tee /etc/apt/sources.list.d/neuron.list
+sudo apt-get update
+```
+
+**第 2 步：驱动、运行时、工具。**
+
+```bash
+sudo apt-get install -y \
+    aws-neuronx-dkms \
+    aws-neuronx-runtime-lib \
+    aws-neuronx-collectives \
+    aws-neuronx-tools
+```
+
+四个包各自的作用：`dkms` 是内核模块（驱动），`runtime-lib` 是运行时，
+`collectives` 是跨核集合通信（**张量并行必须有它**，只跑单核不会报错，一上 TP 就报），
+`tools` 提供 `neuron-ls` / `neuron-top` / `neuron-monitor`。
+
+装完确认三件事：
+
+```bash
+lsmod | grep neuron          # 模块已加载
+ls /dev/neuron0              # 设备节点存在
+/opt/aws/neuron/bin/neuron-ls
+```
+
+模块没加载就 `sudo modprobe neuron`；还是不行就说明 DKMS 没编译成功，回去看第 0 步的
+头文件版本是否和 `uname -r` 一致（换过内核就要重装 `aws-neuronx-dkms`）。
+
+**第 3 步：Python 栈。** 用一个干净的 venv，别装进系统 Python：
+
+```bash
+sudo apt-get install -y python3-venv python3-pip
+python3 -m venv /mnt/nvme/venv-vllm-neuron
+V=/mnt/nvme/venv-vllm-neuron
+$V/bin/pip install --upgrade pip
+
+# 插件本体。它会把 vllm、libtorch-neuronx-lite、torch、torch-xla、transformers 一起带来
+$V/bin/pip install "vllm-neuron==0.24.*" \
+    --extra-index-url https://pip.repos.neuron.amazonaws.com
+
+# 编译器要单独装：vllm-neuron 和 libtorch-neuronx-lite 都没有把它写进依赖
+$V/bin/pip install "neuronx-cc==2.27.*" \
+    --extra-index-url https://pip.repos.neuron.amazonaws.com
+```
+
+> **编译器版本要钉。** 这条栈（`libtorch-neuronx-lite`）用 2.27 是好的；但如果你同时
+> 也在用 NxD Inference 那条栈，注意它在 2.27 上编译 FLUX 会崩
+> （`[NCC_ISMP902] Simplifier error`），要钉 2.26.6360.0。两条栈各自一个 venv，各钉各的。
+
+自己装出来的 venv 和 DLAMI 里那个是一回事，后面 1.5 起的步骤照做即可——把 `V` 指向你
+这个 venv，而且它是**可写的**，所以 1.5 和 1.6 都可以走 `pip install` 那条路，不必用
+`--target` + `PYTHONPATH`。
+
+### 1.3 确认驱动和 runtime
 
 ```bash
 export PATH=/opt/aws/neuron/bin:$PATH
@@ -94,7 +169,7 @@ aws-neuronx-tools         2.32.28.0      neuron-ls / neuron-top / neuron-monitor
 本文唯一支持的设置），和表里的 `NEURON CORES` 一列（可用的逻辑核数，就是 `tp_degree`
 的上限）。
 
-### 1.3 选对 Python 环境
+### 1.4 选对 Python 环境
 
 DLAMI 里有两个 Neuron 的 venv，**互相冲突，不要混用**：
 
@@ -120,7 +195,7 @@ vllm 0.24.0 | vllm-neuron 0.24.0.1.1.0 | libtorch-neuronx-lite 2.11.0.1.0.1284
 torch 2.11.0 | neuronx-cc 2.27.5334.0 | transformers 5.15.0 | Python 3.12
 ```
 
-### 1.4 装 diffusers（FLUX 的额外依赖）
+### 1.5 装 diffusers（FLUX 的额外依赖）
 
 FLUX 不走 vLLM 引擎，所以 diffusers 没有装在插件环境里，要自己加。DLAMI 的 venv
 **通常是只读的**（root 所有），两条路选一条：
@@ -136,7 +211,7 @@ export PYTHONPATH=/mnt/nvme/pyext:$PYTHONPATH
 
 `requirements/flux.txt` 要求 `diffusers>=0.40.0`（本文用 0.40.0）。
 
-### 1.5 拿到这个仓库的代码
+### 1.6 拿到这个仓库的代码
 
 插件是通过 vLLM 的 platform plugin 入口发现的（启动时会打印
 `Platform plugin neuron is activated`）。如果你要用仓库里的代码而不是 pip 装的那份：
@@ -158,7 +233,7 @@ export PYTHONPATH=/mnt/nvme/vllm-neuron:$PYTHONPATH
 $V/bin/python -c "import vllm_neuron; print(vllm_neuron.__file__)"
 ```
 
-### 1.6 必须设的环境变量
+### 1.7 必须设的环境变量
 
 ```bash
 V=/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0
@@ -168,7 +243,7 @@ V=/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0
 #    等你换了分辨率或并行度才突然炸。
 export PATH=$V/bin:/opt/aws/neuron/bin:$PATH
 
-# 2) 代码和依赖（按 1.4 / 1.5 选择的方式）
+# 2) 代码和依赖（按 1.5 / 1.6 选择的方式）
 export PYTHONPATH=/mnt/nvme/vllm-neuron:/mnt/nvme/pyext:$PYTHONPATH
 
 # 3) 把 25 GB 的 checkpoint 放到大盘上，别塞进根盘
@@ -184,7 +259,7 @@ export HF_HOME=/mnt/nvme/hf-cache
 | `NEURON_RT_VISIBLE_CORES` | 不要设 | 由 rank 自己设置。手动设反而会和 rank 的核抢 |
 | `NEURON_LOGICAL_NC_CONFIG` | 不要设（= LNC 2） | 见第 4 节，这个模型不该用 LNC=1 |
 
-### 1.7 下载模型
+### 1.8 下载模型
 
 ```bash
 $V/bin/pip install "huggingface_hub[cli]"      # DLAMI 里一般已有
@@ -194,7 +269,7 @@ hf download Freepik/flux.1-lite-8B             # 约 25 GB，落在 $HF_HOME
 `Freepik/flux.1-lite-8B` 不是 gated 仓库，不用登录。要跑 FLUX.1-dev 的话它是 gated 的，
 需要先在网页上同意协议再 `hf auth login`。
 
-### 1.8 验一遍环境
+### 1.9 验一遍环境
 
 跑完这一段没报错，就可以进第 2 节了：
 

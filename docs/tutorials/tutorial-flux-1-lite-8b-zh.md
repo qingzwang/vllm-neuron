@@ -355,7 +355,7 @@ EOF
 ```
 
 最后一行应该打印 `512.0`。这一小段自己会占用 0 号核，跑完就释放；如果它报
-`The PyTorch Neuron Runtime could not be initialized`，说明有别的进程占着核，见第 7 节。
+`The PyTorch Neuron Runtime could not be initialized`，说明有别的进程占着核，见第 8 节。
 
 ---
 
@@ -497,7 +497,107 @@ rank 数翻倍，每步快 1.84 倍，整个请求快 1.76 倍。每步延时在
 
 ---
 
-## 6. 还想更快
+## 6. 动态 LoRA
+
+adapter 可以在**运行时**加载到设备槽位里、按请求切换，不重新编译任何东西，而且**切换只要
+不到一毫秒**：
+
+```python
+config = FluxNeuronConfig(height=1024, width=1024, tp_degree=4,
+                          lora_slots=2, lora_max_rank=64)
+with NeuronFluxPipeline.from_pretrained(CKPT, config) as pipeline:
+    pipeline.compile()
+    pipeline.load_lora("realism", "/adapters/xlabs-realism")
+    pipeline.load_lora("superreal", "/adapters/super-realism.safetensors")
+
+    pipeline.set_lora("realism")
+    image_a, _ = pipeline.generate(prompt, num_inference_steps=28)
+    pipeline.set_lora("superreal")     # 约 0.6 ms
+    image_b, _ = pipeline.generate(prompt, num_inference_steps=28)
+    pipeline.set_lora(None)            # 回到未改的模型
+```
+
+命令行：
+
+```bash
+python examples/vllm_neuron/models/flux/generate.py --tp 4 \
+    --lora realism=/adapters/xlabs-realism \
+    --lora superreal=/adapters/super-realism.safetensors
+```
+
+给了 `--lora` 而没给 `--use-lora` 时，它会把 base 和每个 adapter 各出一张图——因为切换
+几乎不要钱，多出的图只花自己那点去噪时间。
+
+| 底模 | [XLabs realism](https://huggingface.co/XLabs-AI/flux-RealismLora)（r=16） | [kohya super-realism](https://huggingface.co/strangerzonehf/Flux-Super-Realism-LoRA)（r=64） |
+|---|---|---|
+| ![](../model-recipes/images/flux-lora-base.png) | ![](../model-recipes/images/flux-lora-xlabs.png) | ![](../model-recipes/images/flux-lora-kohya.png) |
+
+<sub>同一个编译好的模型、同一个 prompt、同一个种子；两个 adapter 都是运行时加载的，切换
+用的是亚毫秒的一次索引写。FLUX.1-dev，512×512，28 步，`tp_degree=4`。</sub>
+
+`lora_slots=0`（默认）时图和原来完全一样，不用 adapter 的部署不付任何代价。
+diffusers/PEFT、kohya、XLabs 三种格式都能读（文件交给
+`FluxPipeline.lora_state_dict`，让 diffusers 自己的转换器处理格式）。
+
+### 为什么不用重新编译
+
+靠两条实测出来的性质：
+
+1. **原地写设备张量，已经编译好的图能看到新值。** 往 Parameter、buffer 或普通张量属性里
+   `copy_` 之后，下一次调用返回的就是新值，而 Dynamo 报告没有新图。所以 adapter 的权重
+   可以放在 NEFF 直接读的设备张量里。
+2. **选择用的索引也可以是设备张量。** 每个被适配的层读的是**同一个**一元素张量，在槽位维
+   上做 `index_select`。所以切 adapter 写的是 4 个字节，不是搬权重。
+
+第 2 条才是切换便宜的原因。一个完整的 adapter 在每个 rank 上是几百 MB、散在一千多个小
+张量里，搬一次要几百毫秒到几秒；槽位存在的意义就是让这个代价**每个 adapter 付一次**，而
+不是每次切换都付。
+
+### 实测（FLUX.1-dev，tp=4，512px，2 个槽位，rank 64）
+
+| 操作 | 耗时 |
+|---|---|
+| `set_lora(...)` 在已加载的 adapter 之间切 | **0.6–0.8 ms** |
+| `load_lora(...)`，22 MiB 的 adapter（152 个模块） | 0.14 s |
+| `load_lora(...)`，585 MiB 的 adapter（494 个模块） | 0.58 s |
+| 每步延时（adapter 生效时） | 116.6–118.7 ms，对比底模的 117.3 ms |
+| 槽位显存 | 385 MB / 槽 / rank |
+
+adapter 生效时的每步开销测不出来——多出来的是每个适配层两个很薄的矩阵乘，对比的是
+4608 token 的注意力。槽位显存和 `lora_max_rank` 成正比，所以按你真正会用的最大 rank 设。
+
+### 正确性
+
+adapter 的切分必须和它所适配的层的切分对齐，而**行并行的层，delta 必须加在 all-reduce
+之前**：那里 `x` 是切开的，每个 rank 只能算出部分的 `A @ x`，加在 reduce 之后会让每个
+rank 得到各自不同的错误结果。四种情况（列并行、行并行、单流块被拆开的 `proj_out`、普通
+层）都在 CPU 上和稠密的 `W x + B (A x)` 精确对比过。
+
+设备上：两个 adapter 各自都改变输出（对底模的余弦 0.979 和 0.984，彼此也不同），切走再
+切回**逐位相同**，回到槽位 0 也逐位相同。和 CPU diffusers 加载同一个 adapter 的参考对比
+（同 prompt、同种子、同初始 latent、单步）：
+
+| | cos |
+|---|---|
+| 底模 vs CPU 底模（后端本身的底噪） | 0.996447 |
+| **带 adapter vs CPU 带同一个 adapter** | **0.996433** |
+| 带 adapter vs CPU 底模 | 0.995558 |
+| 底模 vs CPU 带 adapter | 0.986889 |
+
+第二行是关键：加上 adapter 之后，和 CPU 的一致程度**和底模一样**，没有退化。再把两边共有
+的后端差异减掉、只比 adapter 的贡献：两个 delta 的余弦 **0.9655**，幅度也对得上
+（0.1014 对 0.1065）。
+
+### adapter 必须和 checkpoint 匹配
+
+给 FLUX.1-dev 训的 adapter 会点名 19 个双流块，而 FLUX.1-lite 只有 8 个。把 dev 的
+adapter 加载到 lite 上，日志会告诉你有多少目标在这里不存在、并且只适配剩下的那部分——
+这不是 adapter 作者的本意。上面的数字是在 FLUX.1-dev 上测的，因为公开的 adapter 都是给
+dev 训的。
+
+---
+
+## 7. 还想更快
 
 - **加 rank。** `tp_degree` 从 2 到 4，每步快 1.84 倍，代价是多两个核。
 - **减步数。** 延时和步数成正比，FLUX.1-lite 退化得很平缓：8 步还能把主体、材质和
@@ -518,7 +618,7 @@ python examples/vllm_neuron/models/flux/benchmark.py \
 
 ---
 
-## 7. 踩坑清单
+## 8. 踩坑清单
 
 **`RuntimeError: neuronx-cc compiler binary does not exist`**
 venv 的 `bin` 不在 PATH 上（编译器是用 `shutil.which` 找的）。注意 NEFF 已在缓存里时
@@ -560,7 +660,7 @@ LNC=1 目前不支持，见第 4 节。用默认的 LNC=2。
 
 ---
 
-## 8. 继续读
+## 9. 继续读
 
 - [FLUX.1-lite-8B 模型说明](../model-recipes/flux-1-lite-8b.md) —— 特性、切分细节、完整延时和精度数据
 - `vllm_neuron/model/flux/README.md` —— 为什么它不是一个注册进 vLLM 的模型，以及为 Neuron 改了什么

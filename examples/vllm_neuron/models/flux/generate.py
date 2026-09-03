@@ -18,12 +18,18 @@ Usage:
 
     # Four cores instead of two: ~1.9x faster per step
     python examples/vllm_neuron/models/flux/generate.py --prompt "..." --tp 4
+
+    # LoRA: load adapters at runtime and write one image per adapter, plus the base
+    python examples/vllm_neuron/models/flux/generate.py --prompt "..." \
+        --lora realism=/adapters/xlabs-realism \
+        --lora superreal=/adapters/super-realism.safetensors
 """
 
 import argparse
 import json
 import logging
 import os
+import time
 
 # Nothing here touches the device: the model is tensor-parallel across
 # --tp NeuronCores, one rank process each, and those processes own it. This one
@@ -80,6 +86,26 @@ def parse_args() -> argparse.Namespace:
         "~22 GiB HBM partition. A trn2.3xlarge has four logical cores.",
     )
     parser.add_argument(
+        "--lora",
+        action="append",
+        metavar="NAME=PATH",
+        help="Load a LoRA adapter into a device slot; repeatable. With no "
+        "--use-lora, one image is written per adapter plus one for the base model, "
+        "since switching between loaded adapters costs under a millisecond.",
+    )
+    parser.add_argument(
+        "--use-lora",
+        default=None,
+        help="Generate only with this adapter (a name given to --lora).",
+    )
+    parser.add_argument(
+        "--lora-max-rank",
+        type=int,
+        default=64,
+        help="Slot width. Adapters may be narrower, not wider. Slot memory and "
+        "load time scale with it.",
+    )
+    parser.add_argument(
         "--optimization-level",
         type=int,
         default=1,
@@ -102,30 +128,62 @@ def main() -> None:
     )
     args = parse_args()
 
+    adapters = {}
+    for entry in args.lora or []:
+        if "=" not in entry:
+            raise SystemExit(f"--lora expects NAME=PATH, got {entry!r}")
+        name, path = entry.split("=", 1)
+        adapters[name.strip()] = path.strip()
+
     config = FluxNeuronConfig(
         height=args.size,
         width=args.size,
         max_sequence_length=args.max_sequence_length,
         optimization_level=args.optimization_level,
         tp_degree=args.tp,
+        lora_slots=len(adapters),
+        lora_max_rank=args.lora_max_rank,
     )
     # `with` releases the ranks' NeuronCores on the way out.
     with NeuronFluxPipeline.from_pretrained(args.model_checkpoint, config) as pipeline:
         pipeline.compile()
 
+        for name, path in adapters.items():
+            start = time.perf_counter()
+            slot = pipeline.load_lora(name, path)
+            print(f"Loaded adapter {name!r} into slot {slot} in "
+                  f"{time.perf_counter() - start:.2f} s")
+
         if not args.no_warmup:
             print("Warming up (loading NEFFs onto the device)...")
             pipeline.generate(args.prompt, num_inference_steps=1, seed=args.seed)
 
-        image, timing = pipeline.generate(
-            args.prompt,
-            num_inference_steps=args.steps,
-            guidance_scale=args.guidance,
-            seed=args.seed,
-        )
-    image.save(args.output)
+        # With adapters loaded and no single one requested, generate the whole set:
+        # selecting one is a four-byte write, so the extra images cost only their
+        # own denoising.
+        if adapters and args.use_lora is None:
+            wanted = [None, *adapters]
+        else:
+            wanted = [args.use_lora]
 
-    print(f"\nSaved {args.size}x{args.size} image to {args.output}")
+        outputs = {}
+        for name in wanted:
+            pipeline.set_lora(name)
+            image, timing = pipeline.generate(
+                args.prompt,
+                num_inference_steps=args.steps,
+                guidance_scale=args.guidance,
+                seed=args.seed,
+            )
+            path = args.output
+            if len(wanted) > 1:
+                stem, dot, ext = args.output.rpartition(".")
+                path = f"{stem}_{name or 'base'}{dot}{ext}" if dot else f"{args.output}_{name or 'base'}"
+            outputs[name or "base"] = (image, path)
+
+    for name, (image, path) in outputs.items():
+        image.save(path)
+        print(f"\nSaved {args.size}x{args.size} image ({name}) to {path}")
     print(f"Parallelism:  tp_degree={config.tp_degree} on cores "
           f"{list(config.tp_core_ids)}")
     print(

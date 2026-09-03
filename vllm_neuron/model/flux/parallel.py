@@ -104,9 +104,13 @@ class RowParallelLinear(nn.Module):
             )
         shard = in_features // self.tp_size
         start = tp_rank * shard
+        self.in_features_per_rank = shard
+        self.out_features = linear.out_features
         self.weight = nn.Parameter(
             linear.weight.data[:, start : start + shard].clone(), requires_grad=False
         )
+        # Set by lora.wrap_with_lora when adapters are configured.
+        self.lora_A = None
         if linear.bias is None:
             self.register_parameter("bias", None)
         else:
@@ -114,6 +118,14 @@ class RowParallelLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = F.linear(x, self.weight, None)
+        if self.lora_A is not None:
+            # Before the reduce, deliberately: x is sharded so this rank can only
+            # compute a partial A @ x, and lora_B is replicated, so the delta has to
+            # ride the same all-reduce as the base. Added after it instead, every
+            # rank would end up with a different wrong answer.
+            from .lora import lora_delta
+
+            out = out + lora_delta(self, x)
         if self.tp_size > 1:
             out = _all_reduce(out, self.tp_group)
         if self.bias is not None:
@@ -153,7 +165,13 @@ class _SingleBlockProjOut(nn.Module):
                     f"{self.tp_size}"
                 )
         self.attn_shard = attn_dim // self.tp_size
-        mlp_shard = mlp_dim // self.tp_size
+        self.mlp_shard = mlp_dim // self.tp_size
+        mlp_shard = self.mlp_shard
+        self.out_features = linear.out_features
+        # Set by lora.wrap_with_lora when adapters are configured. lora_A covers the
+        # attention half, lora_A_mlp the MLP half; lora_B is shared by both.
+        self.lora_A = None
+        self.lora_A_mlp = None
 
         attn_start = tp_rank * self.attn_shard
         mlp_start = attn_dim + tp_rank * mlp_shard
@@ -176,6 +194,13 @@ class _SingleBlockProjOut(nn.Module):
         out = F.linear(attn_part, self.weight_attn, None) + F.linear(
             mlp_part, self.weight_mlp, None
         )
+        if self.lora_A is not None:
+            # One adapter, two halves, one reduce -- see RowParallelLinear.forward
+            # for why the delta goes in before it. lora_B is shared by the halves,
+            # so their contributions are summed here first.
+            from .lora import lora_delta_split
+
+            out = out + lora_delta_split(self, attn_part, mlp_part)
         if self.tp_size > 1:
             out = _all_reduce(out, self.tp_group)
         if self.bias is not None:

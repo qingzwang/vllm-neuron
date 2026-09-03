@@ -74,6 +74,19 @@ class FluxNeuronConfig:
         tp_core_ids: Physical logical-core ids for the ranks, one each. Defaults
             to ``0..tp_degree-1``. Each becomes that rank's
             ``NEURON_RT_VISIBLE_CORES``.
+        lora_slots: How many LoRA adapters to keep resident on device, on top of
+            the unmodified model. 0 turns LoRA off entirely and leaves the graph
+            exactly as it was. Above 0, the transformer's adaptable layers get slot
+            tensors and the step graph reads a device-side index saying which slot
+            is live -- so adapters can be loaded and switched at runtime without
+            recompiling. See ``lora.py``.
+
+            Slots cost device memory whether or not they hold anything, and the
+            cost scales with ``lora_max_rank``. Switching between resident adapters
+            is a single 4-byte copy; loading one from disk is not.
+        lora_max_rank: Width every slot is allocated at. Adapters may be narrower
+            (they are zero-padded, which is exact) but not wider. Real FLUX
+            adapters run 8-128.
         fuse_scheduler_step: Fold the FlowMatchEulerDiscreteScheduler update into
             the compiled step graph so latents never leave the device during
             denoising. See NeuronFluxTransformer for the exact update. Turning it
@@ -93,6 +106,8 @@ class FluxNeuronConfig:
     dtype: torch.dtype = torch.bfloat16
     tp_degree: int = 2
     tp_core_ids: tuple[int, ...] | None = None
+    lora_slots: int = 0
+    lora_max_rank: int = 64
     fuse_scheduler_step: bool = True
     use_nki_attention: bool = True
     optimization_level: int = 1
@@ -139,10 +154,26 @@ class FluxNeuronConfig:
                 "the rank processes for the whole denoising loop, so a host-side "
                 "scheduler step cannot see them."
             )
+        if self.lora_slots < 0:
+            raise ValueError(f"lora_slots={self.lora_slots} cannot be negative.")
+        if self.lora_slots and not 1 <= self.lora_max_rank <= 512:
+            raise ValueError(
+                f"lora_max_rank={self.lora_max_rank} must be in [1, 512]."
+            )
         if not 1 <= self.optimization_level <= 3:
             raise ValueError(
                 f"optimization_level={self.optimization_level} must be in [1, 3]."
             )
+
+    @property
+    def lora_enabled(self) -> bool:
+        """Whether the step graph carries LoRA slots."""
+        return self.lora_slots > 0
+
+    @property
+    def lora_total_slots(self) -> int:
+        """Slots including slot 0, which stays zero and means "no adapter"."""
+        return self.lora_slots + 1
 
     @property
     def latent_height(self) -> int:

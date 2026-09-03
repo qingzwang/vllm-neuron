@@ -30,6 +30,7 @@ reuse the parts of this package that are not LM-specific:
 | `attention.py` | `NeuronFluxAttnProcessor` — diffusers' joint attention over the NKI kernel |
 | `transformer.py` | `NeuronFluxTransformer` — one denoising step as a single static graph |
 | `parallel.py` | Tensor-parallel sharding for the transformer and the T5 encoder |
+| `lora.py` | Dynamic LoRA: slot tensors on device, a shared device-side index, and adapter loading |
 | `vae.py` | Staged VAE decode and the nearest-upsample rewrite |
 | `worker.py` | What one rank runs: every network, on its core, plus the command protocol |
 | `tp.py` | The ranks from the pipeline's side, over `utils.executor.MPExecutor` |
@@ -98,6 +99,11 @@ does. Full numbers in the model recipe.
 ## Not implemented
 
 - **Batching.** Static shapes are built for batch 1.
+- **Per-batch-item LoRA selection.** One adapter is live at a time, which is all
+  batch 1 can use. The selection index is a device tensor, so making it per-item
+  would be a shape change rather than a redesign.
+- **LoRA on the text encoders.** Adapters that carry text-encoder weights have
+  those tensors ignored with a warning.
 - **Sharded CLIP and VAE.** Both are replicated, so every rank computes them
   redundantly. They are 0.37 GiB and ~4% of a request, so this costs little.
 - **True classifier-free guidance**, img2img, inpainting, ControlNet, IP-Adapter,

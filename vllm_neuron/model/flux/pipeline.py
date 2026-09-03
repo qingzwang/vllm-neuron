@@ -53,7 +53,16 @@ from diffusers.pipelines.flux.pipeline_flux import calculate_shift
 from diffusers.utils.torch_utils import randn_tensor
 
 from .config import FluxNeuronConfig
-from .worker import CLIP_SEQ_LEN, CONTEXT, DECODE, ENCODE, LATENTS, STEP
+from .worker import (
+    CLIP_SEQ_LEN,
+    CONTEXT,
+    DECODE,
+    ENCODE,
+    LATENTS,
+    LOAD_LORA,
+    SELECT_LORA,
+    STEP,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +147,10 @@ class NeuronFluxPipeline:
         self._model_path = model_path
         self.compile_ms: dict[str, float] = {}
         self._tp = None
+        # name -> device slot. Slot 0 is the unmodified model and is never handed
+        # out, so an adapter's slot is always >= 1.
+        self._lora_slots: dict[str, int] = {}
+        self._active_lora: str | None = None
 
         self.scheduler = pipe.scheduler
         self.tokenizer = pipe.tokenizer
@@ -218,6 +231,117 @@ class NeuronFluxPipeline:
         # interpreter teardown.
         with contextlib.suppress(Exception):
             self.close()
+
+    # ------------------------------------------------------------------
+    # LoRA
+    # ------------------------------------------------------------------
+
+    def load_lora(self, name: str, path: str, slot: int | None = None) -> int:
+        """Load an adapter into a device slot. Nothing is recompiled.
+
+        Every rank reads the adapter and keeps its own shard of it, so this costs a
+        pass over the file plus a host-to-device copy -- seconds for a large
+        adapter. Switching to an already-loaded one afterwards is a 4-byte copy, so
+        load the adapters you expect to alternate between and switch freely.
+
+        Args:
+            name: How to refer to it later.
+            path: Directory or file holding the adapter. diffusers/PEFT, kohya and
+                XLabs layouts all work.
+            slot: Which slot to use, 1..lora_slots. Defaults to the next free one,
+                or to the slot ``name`` already occupies.
+
+        Returns:
+            The slot the adapter now occupies.
+
+        Raises:
+            RuntimeError: If this pipeline was built without LoRA slots
+                (``lora_slots=0``).
+            ValueError: If every slot is taken and no slot was named, or the slot
+                given is out of range.
+        """
+        cfg = self.config
+        if not cfg.lora_enabled:
+            raise RuntimeError(
+                "This pipeline was built without LoRA slots; rebuild with "
+                "FluxNeuronConfig(lora_slots=N) to load adapters."
+            )
+        self.compile()
+
+        if slot is None:
+            slot = self._lora_slots.get(name)
+        if slot is None:
+            taken = set(self._lora_slots.values())
+            free = [i for i in range(1, cfg.lora_total_slots) if i not in taken]
+            if not free:
+                raise ValueError(
+                    f"all {cfg.lora_slots} LoRA slots are taken by "
+                    f"{sorted(self._lora_slots)}; pass slot= to overwrite one, or "
+                    "rebuild with more lora_slots."
+                )
+            slot = free[0]
+        if not 1 <= slot < cfg.lora_total_slots:
+            raise ValueError(
+                f"slot {slot} is out of range 1..{cfg.lora_slots}; slot 0 is the "
+                "unmodified model."
+            )
+
+        start = time.perf_counter()
+        self._tp.run(LOAD_LORA, slot, path)
+        # Whatever used to be in this slot is gone.
+        self._lora_slots = {
+            n: s for n, s in self._lora_slots.items() if s != slot or n == name
+        }
+        self._lora_slots[name] = slot
+        if self._active_lora is not None and self._lora_slots.get(self._active_lora) == slot:
+            self._active_lora = name
+        logger.info(
+            "Adapter %r loaded into slot %d in %.2f s",
+            name,
+            slot,
+            time.perf_counter() - start,
+        )
+        return slot
+
+    def set_lora(self, name: str | None) -> None:
+        """Choose the adapter later requests use. Sticky until changed.
+
+        Args:
+            name: A name passed to :meth:`load_lora`, or None for the unmodified
+                model.
+
+        Raises:
+            KeyError: If ``name`` was never loaded.
+            RuntimeError: If this pipeline was built without LoRA slots and ``name``
+                is not None.
+        """
+        if name is None:
+            if self.config.lora_enabled and self._tp is not None:
+                self._tp.run(SELECT_LORA, 0)
+            self._active_lora = None
+            return
+        if not self.config.lora_enabled:
+            raise RuntimeError(
+                "This pipeline was built without LoRA slots; rebuild with "
+                "FluxNeuronConfig(lora_slots=N)."
+            )
+        self.compile()
+        if name not in self._lora_slots:
+            raise KeyError(
+                f"adapter {name!r} is not loaded; loaded adapters are "
+                f"{sorted(self._lora_slots)}"
+            )
+        self._tp.run(SELECT_LORA, self._lora_slots[name])
+        self._active_lora = name
+
+    def list_loras(self) -> dict[str, int]:
+        """Loaded adapters and the slots they occupy."""
+        return dict(self._lora_slots)
+
+    @property
+    def active_lora(self) -> str | None:
+        """The adapter later requests will use, or None for the base model."""
+        return self._active_lora
 
     # ------------------------------------------------------------------
     # Inference

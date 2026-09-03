@@ -56,6 +56,7 @@ import torch
 import torch.nn as nn
 
 from .config import FluxNeuronConfig
+from .lora import group_lora_pairs, load_adapter_into_slot, load_lora_state_dict, wrap_with_lora
 from .parallel import shard_flux_transformer, shard_t5_encoder
 from .transformer import (
     NeuronFluxTransformer,
@@ -67,6 +68,7 @@ from .vae import build_decode_stages, patch_upsampling
 logger = logging.getLogger(__name__)
 
 ENCODE, CONTEXT, STEP, LATENTS, DECODE = "encode", "context", "step", "latents", "decode"
+LOAD_LORA, SELECT_LORA = "load_lora", "select_lora"
 
 # CLIP's fixed context length; the pooled branch always sees exactly this many
 # tokens, independent of max_sequence_length (which governs T5 only).
@@ -151,6 +153,22 @@ class FluxRank(nn.Module):
         # reused by every step of every request.
         self.freqs_cos = freqs_cos.to(DEVICE)
         self.freqs_sin = freqs_sin.to(DEVICE)
+
+        # After the move (the slots are device tensors) and before the compile (the
+        # graph has to contain the LoRA ops).
+        self.lora = None
+        if config.lora_enabled:
+            self.lora = wrap_with_lora(
+                pipe.transformer,
+                config.lora_total_slots,
+                config.lora_max_rank,
+                DEVICE,
+                config.dtype,
+            )
+            self.attn_dim = (
+                pipe.transformer.config.num_attention_heads
+                * pipe.transformer.config.attention_head_dim
+            )
 
         self.step_compiled = self._compile(self._step)
         self.clip_compiled = self._compile(self._clip)
@@ -251,6 +269,18 @@ class FluxRank(nn.Module):
             )
             self.latents = out
             return tag
+
+        if mode == LOAD_LORA:
+            slot, path = args
+            pairs = group_lora_pairs(load_lora_state_dict(path))
+            written = load_adapter_into_slot(self.lora, pairs, int(slot), self.attn_dim)
+            logger.info("Loaded adapter into slot %d: %d modules", int(slot), written)
+            return self.lora.slot
+
+        if mode == SELECT_LORA:
+            (slot,) = args
+            self.lora.select(int(slot))
+            return self.lora.slot
 
         if mode == LATENTS:
             return self.latents

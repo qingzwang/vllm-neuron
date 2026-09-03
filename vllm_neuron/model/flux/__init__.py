@@ -11,11 +11,13 @@ for usage.
 
 from .attention import NeuronFluxAttnProcessor, neuron_joint_attention
 from .config import SUPPORTED_TP_DEGREES, FluxNeuronConfig
+from .lora import FLUX_LORA_TARGETS, load_lora_state_dict
 from .parallel import shard_flux_transformer, shard_t5_encoder
 from .pipeline import GenerationTiming, NeuronFluxPipeline
 from .transformer import NeuronFluxTransformer, build_rotary_embedding
 
 __all__ = [
+    "FLUX_LORA_TARGETS",
     "SUPPORTED_TP_DEGREES",
     "FluxNeuronConfig",
     "GenerationTiming",
@@ -23,6 +25,7 @@ __all__ = [
     "NeuronFluxPipeline",
     "NeuronFluxTransformer",
     "build_rotary_embedding",
+    "load_lora_state_dict",
     "neuron_joint_attention",
     "shard_flux_transformer",
     "shard_t5_encoder",

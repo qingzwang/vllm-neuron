@@ -46,7 +46,8 @@ See `vllm_neuron/model/flux/README.md` for the design.
 |---|---|---|
 | **Task** | Text-to-image | ✅ |
 | | Image-to-image / inpainting | ❌ |
-| | ControlNet / IP-Adapter / LoRA | ❌ |
+| | LoRA, loaded and switched at runtime | ✅ |
+| | ControlNet / IP-Adapter | ❌ |
 | **Quantization** | BF16 | ✅ |
 | | FP8 / MXFP8 | ❌ |
 | **Parallelism** | Tensor parallel over 2, 4 or 8 NeuronCores | ✅ |
@@ -167,6 +168,115 @@ Two places need more than the standard pattern:
 Row-parallel layers use a local implementation rather than `vllm_neuron.nn`'s,
 which rejects a non-float32 bias; FLUX's are BF16. The bias is not a distributed
 quantity, so it is held whole and added after the reduce.
+
+## LoRA
+
+Adapters are loaded into device slots at runtime and selected per request. Nothing
+is recompiled, and switching between loaded adapters costs **under a millisecond**:
+
+```python
+config = FluxNeuronConfig(height=1024, width=1024, tp_degree=4,
+                          lora_slots=2, lora_max_rank=64)
+with NeuronFluxPipeline.from_pretrained(CKPT, config) as pipeline:
+    pipeline.compile()
+    pipeline.load_lora("realism", "/adapters/xlabs-realism")
+    pipeline.load_lora("superreal", "/adapters/super-realism.safetensors")
+
+    pipeline.set_lora("realism")
+    image_a, _ = pipeline.generate(prompt, num_inference_steps=28)
+    pipeline.set_lora("superreal")      # ~0.6 ms
+    image_b, _ = pipeline.generate(prompt, num_inference_steps=28)
+    pipeline.set_lora(None)             # back to the unmodified model
+```
+
+`lora_slots=0` (the default) leaves the graph exactly as it was, so a deployment
+that does not use adapters pays nothing.
+
+diffusers/PEFT, kohya and XLabs layouts all load: the file goes through
+`FluxPipeline.lora_state_dict`, so diffusers' own converters do the format work.
+
+| base model | [XLabs realism](https://huggingface.co/XLabs-AI/flux-RealismLora) (r=16) | [kohya super-realism](https://huggingface.co/strangerzonehf/Flux-Super-Realism-LoRA) (r=64) |
+|---|---|---|
+| ![](images/flux-lora-base.png) | ![](images/flux-lora-xlabs.png) | ![](images/flux-lora-kohya.png) |
+
+<sub>One compiled model, one prompt, one seed; both adapters loaded at runtime and
+selected with a sub-millisecond switch. FLUX.1-dev, 512x512, 28 steps,
+`tp_degree=4`.</sub>
+
+
+### How it avoids recompiling
+
+Two properties of the backend, both verified directly rather than assumed:
+
+* An in-place write to a device tensor is visible to an already-compiled graph —
+  after `copy_` into a parameter, a buffer or a plain tensor attribute, the next
+  call returns the new value and Dynamo reports no additional graph. So adapter
+  weights live in device tensors the NEFF reads.
+* The *selection index* can be a device tensor too. Every adapted layer reads the
+  same one-element tensor and does an `index_select` on its slot dimension, so
+  switching adapters writes four bytes rather than moving weights.
+
+That second point is what makes switching cheap. A full adapter is hundreds of MB
+spread over ~1500 small tensors per rank; moving it takes hundreds of milliseconds
+to seconds, and slots exist precisely so that cost is paid once per adapter rather
+than once per switch.
+
+### Cost
+
+FLUX.1-dev at `tp_degree=4`, 512x512, two slots at rank 64:
+
+| Operation | Cost |
+|---|---|
+| `set_lora(...)` between loaded adapters | **0.6–0.8 ms** |
+| `load_lora(...)`, 22 MiB adapter (152 modules) | 0.14 s |
+| `load_lora(...)`, 585 MiB adapter (494 modules) | 0.58 s |
+| Per-step latency, adapter active | 116.6–118.7 ms against 117.3 ms for the base model |
+| Slot memory | 385 MB per slot per rank |
+
+The step cost of an active adapter is not measurable against run-to-run spread: the
+extra work is two thin matmuls per adapted layer, against a 4608-token attention.
+Slot memory scales with `lora_max_rank`, so set it to the widest adapter you
+actually use.
+
+### Correctness
+
+Sharding an adapter has to match the sharding of the layer it adapts, and for
+row-parallel layers the delta has to be added *before* the layer's all-reduce — `x`
+is sharded there, so each rank can only compute a partial `A @ x`, and adding the
+delta after the reduce leaves every rank with a different wrong answer. The four
+cases (column-parallel, row-parallel, the single block's split `proj_out`, and plain
+layers) are checked on CPU against a dense `W x + B (A x)`, exactly.
+
+On device, with two adapters loaded: each changes the output (cos 0.979 and 0.984
+against the base model, and they differ from each other), switching away and back
+reproduces the earlier latents **bit for bit**, and so does returning to slot 0.
+
+Against a reference -- the same adapter applied by diffusers on CPU, same prompt,
+seed, schedule and initial latents, one denoising step at 512x512:
+
+| | cos | mean abs diff |
+|---|---|---|
+| base vs CPU base (the backend's own floor) | 0.996447 | 0.0909 |
+| **adapter vs CPU with the same adapter** | **0.996433** | 0.0924 |
+| adapter vs CPU base | 0.995558 | 0.1107 |
+| base vs CPU with the adapter | 0.986889 | 0.1555 |
+
+The second row is the point: applying the adapter does not change how well this
+pipeline agrees with CPU diffusers -- it lands on the same floor as the base model.
+The cross rows are ordered the right way round in both directions.
+
+Sharper still, subtracting the backends' own disagreement by comparing what the
+adapter *contributes* on each side: the two deltas agree to **cos 0.9655** with
+matching magnitude (mean 0.1014 against 0.1065). That is close to what agreement
+can look like here, since the backend floor (0.0909) is itself the same size as the
+contribution being measured.
+
+### Adapters have to match the checkpoint
+
+An adapter trained for FLUX.1-dev names 19 double-stream blocks; FLUX.1-lite has 8.
+Loading one into the other logs how many of its targets do not exist here and
+adapts only the rest, which is not what the adapter's author intended. The numbers
+above are on FLUX.1-dev, because that is what the public adapters target.
 
 ## Cores
 

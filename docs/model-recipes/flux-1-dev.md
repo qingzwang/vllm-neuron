@@ -306,9 +306,27 @@ never switches costs (8 steps per request, medians of 6):
 
 Both differences are inside run-to-run spread, in both directions. This is the
 practical claim: per-request adapter selection does not appear in request latency at
-all, as long as the adapters are resident in slots. NxD Inference's equivalent case —
-an adapter that is *not* resident — costs a +1.8 s swap per request there, which is
-why sizing slots for the working set is the whole optimisation on both sides.
+all, as long as the adapters are resident in slots.
+
+When an adapter is *not* resident, the slot has to be rewritten first, and that does
+show up. NxD Inference measures exactly this case — it has no switch call at all: an
+adapter is named per request, and with `max_loras=1` only one can be on device, so its
+cost is the difference between a repeating request pattern and an alternating one. The
+same experiment here, with `lora_slots=1` so alternating also forces a rewrite:
+
+| | NxD Inference | this pipeline |
+|---|---|---|
+| measurement unit | one backbone step, 256px, synthetic inputs | one 8-step request, 512x512 |
+| adapter already on device | 75.7 ms, against 74.1 ms for no adapter | 964.3 ms, against 964.3 ms for no adapter |
+| switch between two adapters *both* on device | not measurable at `max_loras=1`; free at higher values, the slot index being a graph input | `set_lora()`, p50 0.4 ms |
+| adapter not on device | **+1841.8 ms** per request, host to device only | **+296.2 ms** per request, disk included |
+| reading an adapter off disk | 1064 ms per adapter, separately | included in the 296.2 ms above |
+
+Both stacks agree on the part that matters for sizing: an adapter that is already on
+device is free, and the cost of one that is not is data movement. The absolute
+difference in that second row is mechanical — NxDI rewrites its slot as ~4300 small
+copies, this path writes 990 host-padded matrices — and it is why `lora_slots` should
+cover the working set on either stack.
 
 #### Slot width
 

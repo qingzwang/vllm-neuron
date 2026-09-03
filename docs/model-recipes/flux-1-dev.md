@@ -318,12 +318,15 @@ same experiment here, with `lora_slots=1` so alternating also forces a rewrite:
 |---|---|---|
 | measurement unit | one backbone step, 256px, synthetic inputs | one 8-step request, 512x512 |
 | adapter already on device | 75.7 ms, against 74.1 ms for no adapter | 964.3 ms, against 964.3 ms for no adapter |
-| switch between two adapters *both* on device | not measurable at `max_loras=1`; free at higher values, the slot index being a graph input | `set_lora()`, p50 0.4 ms |
+| switch between two adapters *both* on device | +0.4 ms per call at `max_loras=2` (75.0 ms alternating against 74.6 ms repeating) | `set_lora()`, p50 0.4 ms |
 | adapter not on device | **+1841.8 ms** per request, host to device only | **+296.2 ms** per request, disk included |
 | reading an adapter off disk | 1064 ms per adapter, separately | included in the 296.2 ms above |
 
 Both stacks agree on the part that matters for sizing: an adapter that is already on
-device is free, and the cost of one that is not is data movement. The absolute
+device is free — including switching *between* two that are, which NxDI does for the
+same +0.4 ms once `max_loras` is raised enough to hold them — and the cost of one that
+is not is data movement. NxDI's 1.84 s is the second case, not the first: its `max_loras`
+is what decides which case a request lands in, exactly as `lora_slots` does here. The absolute
 difference in that second row is mechanical — NxDI rewrites its slot as ~4300 small
 copies, this path writes 990 host-padded matrices — and it is why `lora_slots` should
 cover the working set on either stack.

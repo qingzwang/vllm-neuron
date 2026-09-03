@@ -1,11 +1,11 @@
-# 教程：在 Trainium 上跑 FLUX.1-lite-8B（中文上手指南）
+# 教程：在 Trainium 上跑 FLUX.1-dev（中文上手指南）
 
-<!-- meta: description: Step-by-step Chinese tutorial for running FLUX.1-lite-8B
+<!-- meta: description: Step-by-step Chinese tutorial for running FLUX.1-dev
 text-to-image generation on Trn2 with the vLLM Neuron plugin: environment setup,
-tensor parallelism across NeuronCores, measured latency at tp_degree 2 and 4, and
-troubleshooting. -->
+tensor parallelism across NeuronCores, dynamic LoRA, measured latency at tp_degree 2
+and 4, and troubleshooting. -->
 
-<!-- meta: keywords: vLLM, Neuron, FLUX, FLUX.1-lite, flux.1-lite-8B, 文生图,
+<!-- meta: keywords: vLLM, Neuron, FLUX, FLUX.1-dev, 文生图, LoRA,
 diffusion, text-to-image, tensor parallelism, 张量并行, NeuronCore, Trn2,
 Trainium, tutorial, 中文, 教程 -->
 
@@ -14,11 +14,11 @@ Trainium, tutorial, 中文, 教程 -->
 <!-- Content type: procedural-tutorial -->
 
 这篇是给**没用过 Trainium 的人**写的：从一台干净的 trn2 实例开始，一步步跑通
-FLUX.1-lite-8B 出图，并理解它是怎么切到多个 NeuronCore 上的。所有命令都在
+FLUX.1-dev 出图，理解它是怎么切到多个 NeuronCore 上的，以及怎么在运行时换 LoRA。所有命令都在
 **trn2.3xlarge** 上实际跑过（2026-09-03），贴出来的输出也是真实输出。
 
 模型本身的特性、精度和限制见
-[FLUX.1-lite-8B 模型说明](../model-recipes/flux-1-lite-8b.md)，这里只讲怎么动手。
+[FLUX.1-dev 模型说明](../model-recipes/flux-1-dev.md)，这里只讲怎么动手。
 
 ---
 
@@ -44,9 +44,11 @@ RuntimeError: The PyTorch Neuron Runtime could not be initialized.
 里；而你写代码所在的这个进程**一个核都不占**，只负责分词、驱动去噪循环、把结果转成
 图片。
 
-**③ 这个模型放不进一个核。** 四个组件加起来是 **24.44 GiB** 的 BF16 权重，而一个核的
-HBM 分区只有约 22 GiB。所以**没有 `tp_degree=1`**，2 是下限；trn2.3xlarge 有 4 个逻辑
-核（默认 `logical-neuroncore-config: 2`），所以上限是 4。
+**③ 这个模型要 4 个核。** 四个组件加起来是 **31.42 GiB** 的 BF16 权重（transformer 自己
+就 22.17 GiB），而一个核的 HBM 分区只有约 22 GiB：`tp_degree=1` 直接被配置拒掉；
+`tp_degree=2` 权重勉强放得下（每核 15.71 GiB），但 1024×1024 的激活放不下、rank 加载时
+报 `Allocation Failure`。所以**这个 checkpoint 用 `tp_degree=4`**（每核 7.86 GiB），而
+trn2.3xlarge 正好有 4 个逻辑核。
 
 **④ FLUX 不走 `vllm serve`。** vLLM 0.24 没有文生图的请求路径（它的 `DiffusionConfig`
 说的是离散扩散*语言*模型）。FLUX 走的是本插件里的独立 pipeline
@@ -61,9 +63,9 @@ kernel 和张量并行层，但不用它的 model runner。
 
 | 需要什么 | 本文用的 | 说明 |
 |---|---|---|
-| 实例 | **trn2.3xlarge** | 1 颗 Trainium2，默认 4 个逻辑核；`tp_degree` 2 和 4 都够用 |
+| 实例 | **trn2.3xlarge** | 1 颗 Trainium2，默认 4 个逻辑核——正好是这个模型需要的 `tp_degree=4` |
 | AMI | Deep Learning AMI Neuron (Ubuntu 22.04/24.04) | 驱动、runtime、工具、插件 venv 都已经装好 |
-| 磁盘 | ≥ 100 GB 可用 | checkpoint 约 25 GB，编译缓存约 1 GB，另外留出空间给 HF 缓存 |
+| 磁盘 | ≥ 100 GB 可用 | checkpoint 约 31 GB，编译缓存约 1 GB，另外留出空间给 HF 缓存 |
 | 主机内存 | ≥ 64 GB（本文 124 GB） | 每个 rank 要先把完整 checkpoint 读进内存才留下自己的分片 |
 
 用 DLAMI Neuron 的话，驱动、运行时、工具和插件 venv 都是现成的，可以直接跳到 1.3 去
@@ -287,7 +289,7 @@ export PYTHONPATH=/mnt/nvme/pyext:$PYTHONPATH
 ```bash
 git clone <this repo> /mnt/nvme/vllm-neuron
 cd /mnt/nvme/vllm-neuron
-git checkout model/flux1-lite-8B
+git checkout feature/flux-dynamic-lora
 
 # venv 可写：editable 安装
 $V/bin/pip install -e . --no-deps
@@ -331,11 +333,13 @@ export HF_HOME=/mnt/nvme/hf-cache
 
 ```bash
 $V/bin/pip install "huggingface_hub[cli]"      # DLAMI 里一般已有
-hf download Freepik/flux.1-lite-8B             # 约 25 GB，落在 $HF_HOME
+# FLUX.1-dev 是 gated 仓库：先在网页上同意协议，再登录
+hf auth login
+hf download black-forest-labs/FLUX.1-dev       # 约 31 GB，落在 $HF_HOME
 ```
 
-`Freepik/flux.1-lite-8B` 不是 gated 仓库，不用登录。要跑 FLUX.1-dev 的话它是 gated 的，
-需要先在网页上同意协议再 `hf auth login`。
+任何 diffusers 格式、`guidance_embeds=True` 的 FLUX checkpoint 都走同一条路（块数、头数
+都是从 checkpoint 里读的），蒸馏版会按它砍掉的块数成比例变快。
 
 ### 1.9 验一遍环境
 
@@ -347,7 +351,7 @@ import torch, vllm_neuron
 from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
 print("vllm_neuron:", vllm_neuron.__file__)
 import diffusers; print("diffusers:", diffusers.__version__)
-print("config ok:", FluxNeuronConfig(height=512, width=512, tp_degree=2).tp_core_ids)
+print("config ok:", FluxNeuronConfig(height=512, width=512, tp_degree=4).tp_core_ids)
 # 一个最小的设备计算：能过就说明驱动、runtime、编译器、核都正常
 x = torch.ones(8, 8).to(torch.device("neuron", 0))
 print("device matmul:", float((x @ x).cpu().sum()))
@@ -363,19 +367,19 @@ EOF
 
 ```bash
 python examples/vllm_neuron/models/flux/generate.py \
-    --model-checkpoint Freepik/flux.1-lite-8B \
+    --model-checkpoint black-forest-labs/FLUX.1-dev \
     --tp 4 \
     --prompt "A close-up photo of a red panda wearing tiny round glasses, reading a leather-bound book in a cozy library" \
     --steps 28 \
     --output flux_output.png
 ```
 
-![FLUX.1-lite-8B 在 trn2 上的输出：戴圆眼镜看书的小熊猫](../model-recipes/images/flux-1-lite-8b-sample.png)
+![FLUX.1-dev 在 trn2 上的输出：戴圆眼镜看书的小熊猫](../model-recipes/images/flux-1-dev-sample.png)
 
 *1024×1024、28 步、guidance 3.5、seed 42、`tp_degree=4`，就是上面那条命令。为了这个
 页面缩过。*
 
-`--tp 4` 就是用 4 个核（rank 占 0-3 号核）。`--tp 2` 用 2 个核，慢一些但省两个核。
+`--tp 4` 就是用 4 个核（rank 占 0-3 号核），这个 checkpoint 只能用 4，原因见概念 ③。
 **不需要自己安排核的绑定**——这个进程不碰设备，rank 自己会绑。
 
 首次运行会编译四个组件（transformer、T5、CLIP、VAE），约 4 分钟；之后命中缓存，rank
@@ -389,7 +393,7 @@ from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
 
 config = FluxNeuronConfig(height=1024, width=1024, tp_degree=4)
 # with 会在退出时把 rank 占的核释放掉
-with NeuronFluxPipeline.from_pretrained("Freepik/flux.1-lite-8B", config) as pipeline:
+with NeuronFluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", config) as pipeline:
     pipeline.compile()
     image, timing = pipeline.generate("a red panda reading a book",
                                       num_inference_steps=28, seed=42)
@@ -403,10 +407,10 @@ print(timing.as_dict())
 
 | 组件 | BF16 权重 | 跨 rank | 为什么 |
 |---|---|---|---|
-| `transformer` | 15.20 GiB | **切开** | 一次请求里跑 28 次，成本几乎全在这 |
+| `transformer` | 22.17 GiB | **切开** | 一次请求里跑 28 次，成本几乎全在这 |
 | `text_encoder_2`（T5-XXL） | 8.87 GiB | **切开** | 大，而且 64 个头能整除 |
-| `text_encoder`（CLIP-L） | 0.22 GiB | 复制 | 切它要加 collective，省不下什么 |
-| `vae`（解码器） | 0.15 GiB | 复制 | 卷积结构，一次请求只跑一次 |
+| `text_encoder`（CLIP-L） | 0.23 GiB | 复制 | 切它要加 collective，省不下什么 |
+| `vae`（解码器） | 0.16 GiB | 复制 | 卷积结构，一次请求只跑一次 |
 
 和 NxD Inference 对同一个模型的切法一致，所以两边可以直接比（见模型说明里的对比）。
 
@@ -427,13 +431,14 @@ norm、调制投影、embedder、最后的 `proj_out` 都是复制的——注�
 
 ## 4. 核怎么算
 
-一个 rank 一个核，除此之外**不需要额外的核**：
+一个 rank 一个核，除此之外**不需要额外的核**。这个 checkpoint 的选择只有一个：
 
-| tp_degree | 核数 | 每核权重 | trn2.3xlarge（4 核）放得下？ |
-|---|---|---|---|
-| 2 | 2 | 12.22 GiB | ✅ |
-| 4 | 4 | 6.11 GiB | ✅ 刚好 |
-| 8 | 8 | 3.06 GiB | ❌ 要更大的实例 |
+| tp_degree | 每核权重 | 结果 |
+|---|---|---|
+| 1 | 31.42 GiB | 配置直接拒掉——transformer 自己就 22.17 GiB |
+| 2 | 15.71 GiB | 权重放得下，但 1024×1024 的激活放不下，加载时 `Allocation Failure` |
+| **4** | **7.86 GiB** | **可用，还有空间放 LoRA 槽位** |
+| 8 | 3.93 GiB | 要比 trn2.3xlarge 更大的实例 |
 
 用默认的 `logical-neuroncore-config: 2`（LNC=2），**逻辑核就是计量单位**。有人会想到用
 LNC=1 把 4 个核变成 8 个——**对这么大的模型不要这么做**：LNC=1 的每个核是单个物理
@@ -453,26 +458,26 @@ transformer 图从第一步去噪就返回 NaN，而同一次运行里 encoder �
 trn2.3xlarge、LNC=2、BF16、batch 1、`neuronx-cc -O1`、512 token 预算。中位数，跑之前
 先丢弃一次预热请求。
 
-| tp_degree | 分辨率 | 步数 | ms/step | 去噪 | prompt 编码 | VAE 解码 | **端到端** |
-|---|---|---|---|---|---|---|---|
-| 2 | 512×512 | 4 | 134 | 0.54 s | 0.06 s | 0.14 s | **0.74 s** |
-| 4 | 512×512 | 4 | 80 | 0.32 s | 0.03 s | 0.14 s | **0.51 s** |
-| 2 | 1024×1024 | 28 | 392 | 11.0 s | 0.06 s | 0.56 s | **11.65 s** |
-| 4 | 1024×1024 | 28 | 214 | 6.0 s | 0.03 s | 0.57 s | **6.62 s** |
+全部是 `tp_degree=4`：
 
-rank 数翻倍，每步快 1.84 倍，整个请求快 1.76 倍。每步延时在不同步数下是平的、抖动远
-小于 1%——每步跑的是同一个图、静态形状，host 上只剩一次一元素的栅栏读取。
+| 分辨率 | 步数 | ms/step | 去噪 | prompt 编码 | VAE 解码 | **端到端** |
+|---|---|---|---|---|---|---|
+| 512×512 | 4 | 105 | 0.42 s | 0.04 s | 0.14 s | **0.61 s** |
+| 1024×1024 | 4 | 276 | 1.10 s | 0.03 s | 0.60 s | **1.77 s** |
+| 1024×1024 | 8 | 274 | 2.20 s | 0.03 s | 0.58 s | **2.85 s** |
+| 1024×1024 | 28 | 274 | 7.69 s | 0.03 s | 0.60 s | **8.37 s** |
 
-1024×1024、`tp_degree=4` 时去噪占一次请求的 91%。其余部分放在 Neuron 上省了多少（对比
-同样权重在 CPU eager 上跑）：
+每步延时在不同步数下是平的、抖动远小于 1%——每步跑的是同一个图、静态形状，host 上只剩
+一次一元素的栅栏读取。1024×1024、28 步时去噪占一次请求的 92%。其余部分放在 Neuron 上省
+了多少（对比同样权重在 CPU eager 上跑）：
 
 | 阶段 | Neuron（tp=4） | CPU eager | 倍数 |
 |---|---|---|---|
 | prompt 编码（CLIP + T5，512 token） | 0.03 s | 1.62 s | 54× |
-| VAE 解码（1024×1024，五段图） | 0.57 s | 7.55 s | 13× |
+| VAE 解码（1024×1024，五段图） | 0.60 s | 7.55 s | 13× |
 
 **启动的代价在另一头**：每个 rank 都要先把完整 checkpoint 读进来才留下自己那几片，而且
-为了不让主机内存爆掉，它们是拿锁排队读的。所以 rank 数越多启动越慢（100–140 秒）。
+为了不让主机内存爆掉，它们是拿锁排队读的（130–180 秒）。
 每步的额外开销很小（约 1 ms）：embedding 和 latent 整个请求都留在 rank 里，每步只发三个
 标量、收一个一元素栅栏。
 
@@ -483,17 +488,11 @@ rank 数翻倍，每步快 1.84 倍，整个请求快 1.76 倍。每步延时在
 
 | | 步数 | cos | max\|d\| | latent 标准差 |
 |---|---|---|---|---|
-| 512×512，tp=2 vs tp=4 | 4 | 0.999545 | 0.74 | 1.18 |
-| 1024×1024，tp=2 vs tp=4 | 28 | 0.998092 | 2.27 | 1.29 |
+| 512×512，tp=2 vs tp=4 | 4 | 0.999554 | 0.74 | 1.22 |
 
-28 步那一行低一些，是因为重结合误差沿链累积，不是因为切得更多。解码出来的两张
-1024×1024 图每个通道平均差 1.71/255：
-
-![tp_degree=2 的输出](../model-recipes/images/flux-1-lite-8b-tp2.png)
-
-*`tp_degree=2`，其余设置和第 2 节那张（`tp_degree=4`）完全一样。*
-
-切错的话根本不是这个量级——会掉到 cos 0.9 以下，图上一眼就能看出来。
+只有 512×512 这一行，因为 `tp_degree=2` 在 1024×1024 下装不下。差异来自 bf16 下求和顺序
+变了（注意力和前馈被切开）。切错的话根本不是这个量级——会掉到 cos 0.9 以下，图上一眼就能
+看出来。
 
 ---
 
@@ -502,13 +501,7 @@ rank 数翻倍，每步快 1.84 倍，整个请求快 1.76 倍。每步延时在
 adapter 可以在**运行时**加载到设备槽位里、按请求切换，不重新编译任何东西，而且**切换只要
 不到一毫秒**：
 
-> **adapter 必须和 checkpoint 匹配。** 下面的例子请按 **FLUX.1-dev** 读：公开能拿到的
-> FLUX adapter 全是对着 dev 训的，而 dev 有 19 个双流块、lite 只有 8 个，所以 dev 的
-> adapter 有一半层在 lite 里不存在。换成给 lite 训的 adapter，这一节的一切在 lite 上
-> 完全一样；这里的数字和图用 dev，是因为那才是真能跑起来的组合。
-
 ```python
-CKPT = "black-forest-labs/FLUX.1-dev"        # 这两个 adapter 是对着它训的
 config = FluxNeuronConfig(height=1024, width=1024, tp_degree=4,
                           lora_slots=2, lora_max_rank=64)
 with NeuronFluxPipeline.from_pretrained(CKPT, config) as pipeline:
@@ -527,7 +520,6 @@ with NeuronFluxPipeline.from_pretrained(CKPT, config) as pipeline:
 
 ```bash
 python examples/vllm_neuron/models/flux/generate.py --tp 4 \
-    -c black-forest-labs/FLUX.1-dev \
     --lora realism=/adapters/xlabs-realism \
     --lora superreal=/adapters/super-realism.safetensors
 ```
@@ -540,7 +532,7 @@ python examples/vllm_neuron/models/flux/generate.py --tp 4 \
 | ![](../model-recipes/images/flux-lora-base.png) | ![](../model-recipes/images/flux-lora-xlabs.png) | ![](../model-recipes/images/flux-lora-kohya.png) |
 
 <sub>同一个编译好的模型、同一个 prompt、同一个种子；两个 adapter 都是运行时加载的，切换
-用的是亚毫秒的一次索引写。FLUX.1-dev，512×512，28 步，`tp_degree=4`。</sub>
+用的是亚毫秒的一次索引写。512×512，28 步，`tp_degree=4`。</sub>
 
 `lora_slots=0`（默认）时图和原来完全一样，不用 adapter 的部署不付任何代价。
 diffusers/PEFT、kohya、XLabs 三种格式都能读（文件交给
@@ -560,7 +552,7 @@ diffusers/PEFT、kohya、XLabs 三种格式都能读（文件交给
 张量里，搬一次要几百毫秒到几秒；槽位存在的意义就是让这个代价**每个 adapter 付一次**，而
 不是每次切换都付。
 
-### 实测（FLUX.1-dev，tp=4，512px，2 个槽位，rank 64）
+### 实测（tp=4，512px，2 个槽位，rank 64）
 
 | 操作 | 耗时 |
 |---|---|
@@ -580,26 +572,26 @@ adapter 的切分必须和它所适配的层的切分对齐，而**行并行的�
 rank 得到各自不同的错误结果。四种情况（列并行、行并行、单流块被拆开的 `proj_out`、普通
 层）都在 CPU 上和稠密的 `W x + B (A x)` 精确对比过。
 
-设备上：两个 adapter 各自都改变输出（对底模的余弦 0.979 和 0.984，彼此也不同），切走再
-切回**逐位相同**，回到槽位 0 也逐位相同。和 CPU diffusers 加载同一个 adapter 的参考对比
-（同 prompt、同种子、同初始 latent、单步）：
+设备上，每个槽位都和**每一个** adapter 的 CPU **float32** 参考对比，而不只是和它自己那个
+——单步、512×512、同 prompt / 同种子 / 同初始 latent，比最终 latent 的余弦：
 
-| | cos |
-|---|---|
-| 底模 vs CPU 底模（后端本身的底噪） | 0.996447 |
-| **带 adapter vs CPU 带同一个 adapter** | **0.996433** |
-| 带 adapter vs CPU 底模 | 0.995558 |
-| 底模 vs CPU 带 adapter | 0.986889 |
+| 槽位 | cpu-base | cpu-xlabs | cpu-kohya |
+|---|---|---|---|
+| base（槽位 0） | **0.999841** | 0.997064 | 0.993697 |
+| xlabs（槽位 1） | 0.998179 | **0.999837** | 0.992665 |
+| kohya（槽位 2） | 0.995441 | 0.993223 | **0.999796** |
 
-第二行是关键：加上 adapter 之后，和 CPU 的一致程度**和底模一样**，没有退化。再把两边共有
-的后端差异减掉、只比 adapter 的贡献：两个 delta 的余弦 **0.9655**，幅度也对得上
-（0.1014 对 0.1065）。
+每一行的最大值都在对角线上，而且对角线贴着 ~0.9998——也就是这个模型 bf16 对 fp32 的底噪
+——非对角是 0.992～0.998。如果某个槽位读错了权重、或者 adapter 被套到了错误的模块上，最大
+值就会跑到对角线外面去。
+
+切换本身也必须是无损的：切走再切回**逐位相同**，回到槽位 0 也逐位相同。
 
 ### adapter 必须和 checkpoint 匹配
 
-给 FLUX.1-dev 训的 adapter 会点名 19 个双流块，而 FLUX.1-lite 只有 8 个。把 dev 的
-adapter 加载到 lite 上，只有确实存在的层会被适配——这不是 adapter 作者的本意——并且会打印
-掉了多少：
+adapter 是按模块名指定目标的，所以对着别的 FLUX 变体训出来的 adapter
+会点名 19 个双流块，而砍过块数的蒸馏版没有那么多。把不匹配的 adapter 加载进来，只有确实
+存在的层会被适配——这不是 adapter 作者的本意——并且会打印掉了多少：
 
 ```
 WARNING Adapter targets 266 modules that are not adapted here, e.g. [...]
@@ -613,11 +605,10 @@ WARNING Adapter targets 266 modules that are not adapted here, e.g. [...]
 
 ## 7. 还想更快
 
-- **加 rank。** `tp_degree` 从 2 到 4，每步快 1.84 倍，代价是多两个核。
-- **减步数。** 延时和步数成正比，FLUX.1-lite 退化得很平缓：8 步还能把主体、材质和
-  光照解出来，4 步可以当预览。
-- **降分辨率。** 512×512 每步比 1024×1024 快 2.7 倍：联合注意力序列从 4608 降到
-  1536 个 token。
+- **减步数。** 延时和步数成正比，但 FLUX.1-dev 没有做步数蒸馏，所以退化得比蒸馏版快：
+  8 步（2.85 s）还能把主体、材质和光照解出来，4 步（1.77 s）就偏暗偏糊了，不只是细节少。
+- **降分辨率。** 512×512 每步比 1024×1024 快 2.6 倍（105 对 274 ms）：联合注意力序列从
+  4608 降到 1536 个 token。
 - **缩短 prompt 预算。** `--max-sequence-length 256` 把每一步每一个注意力都少算
   256 个 token。超过预算的 prompt 会被截断。
 - **`-O2` / `-O3`。** `--optimization-level` 直接对应 `neuronx-cc -O`。编译更慢，跑
@@ -676,7 +667,7 @@ LNC=1 目前不支持，见第 4 节。用默认的 LNC=2。
 
 ## 9. 继续读
 
-- [FLUX.1-lite-8B 模型说明](../model-recipes/flux-1-lite-8b.md) —— 特性、切分细节、完整延时和精度数据
+- [FLUX.1-dev 模型说明](../model-recipes/flux-1-dev.md) —— 特性、切分细节、完整延时和精度数据
 - `vllm_neuron/model/flux/README.md` —— 为什么它不是一个注册进 vLLM 的模型，以及为 Neuron 改了什么
 - `vllm_neuron/model/flux/parallel.py` —— 逐层的切分规则
 - `examples/vllm_neuron/models/flux/generate.py` / `benchmark.py` —— 出图和压测脚本

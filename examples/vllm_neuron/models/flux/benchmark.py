@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Latency benchmark for FLUX.1-lite-8B on Neuron.
+"""Latency benchmark for FLUX.1 on Neuron.
 
 Reports the per-stage breakdown of a request -- prompt encode, per denoising
 step, VAE decode -- plus percentiles over repeated requests, and writes the raw
@@ -43,7 +43,7 @@ PROMPT = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-checkpoint", default="Freepik/flux.1-lite-8B")
+    parser.add_argument("--model-checkpoint", default="black-forest-labs/FLUX.1-dev")
     parser.add_argument("--prompt", default=PROMPT)
     parser.add_argument(
         "--sizes",

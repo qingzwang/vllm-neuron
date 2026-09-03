@@ -1,23 +1,27 @@
-# FLUX.1-lite-8B Model Recipe
+# FLUX.1-dev Model Recipe
 
-<!-- meta: description: Model recipe for running FLUX.1-lite-8B text-to-image
+<!-- meta: description: Model recipe for running FLUX.1-dev text-to-image
 generation on Neuron, including supported checkpoints, how the model is sharded
-across NeuronCores, measured latency on Trn2 at tp_degree 2 and 4, and known
-limitations. -->
-<!-- meta: keywords: Neuron, FLUX, FLUX.1-lite, flux.1-lite-8B, Freepik,
-diffusion, text-to-image, DiT, diffusers, model recipe, tensor parallelism,
-tp_degree, Trn2, Trainium -->
+across NeuronCores, dynamic LoRA, measured latency on Trn2 at tp_degree 2 and 4,
+and known limitations. -->
+<!-- meta: keywords: Neuron, FLUX, FLUX.1-dev, black-forest-labs, diffusion,
+text-to-image, DiT, diffusers, model recipe, tensor parallelism, tp_degree, LoRA,
+dynamic LoRA, Trn2, Trainium -->
 <!-- meta: date_updated: 2026-09-03 -->
 <!-- Content type: model-card -->
 
 ## Introduction
 
-[FLUX.1-lite-8B](https://huggingface.co/Freepik/flux.1-lite-8B) is an 8B-parameter
-text-to-image rectified-flow transformer, distilled by Freepik from
-[FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) by pruning it
-from 19 to 8 double-stream (MMDiT) blocks while keeping all 38 single-stream
-blocks. It uses guidance distillation, so there is no negative pass: image cost
-is independent of the guidance value.
+[FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) is a
+12B-parameter text-to-image rectified-flow transformer from Black Forest Labs: 19
+double-stream (MMDiT) blocks and 38 single-stream blocks, 24 attention heads of 128
+dims. It uses guidance distillation, so there is no negative pass and image cost is
+independent of the guidance value.
+
+Any other diffusers-format `FluxPipeline` with `guidance_embeds=True` loads through
+the same path -- block counts, heads and dimensions are read from the checkpoint --
+so a distilled variant works without changes and is faster in proportion to the
+blocks it drops.
 
 **This model does not run through `vllm serve` or the vLLM offline API.** vLLM
 0.24 has no text-to-image request path — its `DiffusionConfig` covers discrete
@@ -28,17 +32,14 @@ See `vllm_neuron/model/flux/README.md` for the design.
 
 **Compatible model checkpoints:**
 
-| Model | HuggingFace | Hardware | Quantization |
-|-------|-------------|----------|--------------|
-| FLUX.1-lite-8B | [Freepik/flux.1-lite-8B](https://huggingface.co/Freepik/flux.1-lite-8B) | Trn2 | BF16 |
-| FLUX.1-lite-8B-alpha | [Freepik/flux.1-lite-8B-alpha](https://huggingface.co/Freepik/flux.1-lite-8B-alpha) | Trn2 | BF16 |
-| FLUX.1-dev | [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) | Trn2 | BF16 |
+| Model | HuggingFace | Hardware | Quantization | Parallelism |
+|-------|-------------|----------|--------------|-------------|
+| FLUX.1-dev | [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev) | Trn2 | BF16 | `tp_degree=4` |
 
-> Any diffusers-format `FluxPipeline` with `guidance_embeds=True` loads through
-> the same path. FLUX.1-schnell and other guidance-free variants are rejected at
-> load time — they need a different guidance path, not just different weights.
-> FLUX.1-dev is 19 double blocks instead of 8, so expect roughly 1.6x the step
-> latency measured below.
+> Any diffusers-format `FluxPipeline` with `guidance_embeds=True` loads through the
+> same path; block counts are read from the checkpoint. FLUX.1-schnell and other
+> guidance-free variants are rejected at load time — they need a different guidance
+> path, not just different weights.
 
 ## Features
 
@@ -50,8 +51,8 @@ See `vllm_neuron/model/flux/README.md` for the design.
 | | ControlNet / IP-Adapter | ❌ |
 | **Quantization** | BF16 | ✅ |
 | | FP8 / MXFP8 | ❌ |
-| **Parallelism** | Tensor parallel over 2, 4 or 8 NeuronCores | ✅ |
-| | Single core (`tp_degree=1`) | ❌ — 24.44 GiB of weights against ~22 GiB |
+| **Parallelism** | Tensor parallel over 4 NeuronCores | ✅ |
+| | Fewer than 4 (`tp_degree` 1 or 2) | ❌ — 31.42 GiB of weights against ~22 GiB per core |
 | | Data or context parallelism | ❌ |
 | **Guidance** | Distilled guidance embedding | ✅ |
 | | True classifier-free guidance | ❌ |
@@ -68,21 +69,21 @@ Install diffusers on top of the plugin's environment:
 pip install -r requirements/flux.txt
 ```
 
-A trn2.3xlarge is enough: it has four logical NeuronCores at the default
-`logical-neuroncore-config: 2`, which covers `tp_degree` 2 and 4.
+A trn2.3xlarge is enough and is exactly the size needed: four logical NeuronCores at
+the default `logical-neuroncore-config: 2`, which is what `tp_degree=4` uses.
 
 ## Quick start
 
 ```bash
 python examples/vllm_neuron/models/flux/generate.py \
-    --model-checkpoint Freepik/flux.1-lite-8B \
+    --model-checkpoint black-forest-labs/FLUX.1-dev \
     --tp 4 \
     --prompt "A close-up photo of a red panda wearing tiny round glasses, reading a leather-bound book in a cozy library" \
     --steps 28 \
     --output flux_output.png
 ```
 
-![FLUX.1-lite-8B output on Trn2: a red panda in round glasses reading a book](images/flux-1-lite-8b-sample.png)
+![FLUX.1-dev output on Trn2: a red panda in round glasses reading a book](images/flux-1-dev-sample.png)
 
 *1024x1024, 28 steps, guidance 3.5, seed 42 — exactly the command above.
 Downscaled for this page.*
@@ -92,7 +93,7 @@ from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
 
 config = FluxNeuronConfig(height=1024, width=1024, tp_degree=4)
 # `with` releases the ranks' NeuronCores on the way out.
-with NeuronFluxPipeline.from_pretrained("Freepik/flux.1-lite-8B", config) as pipeline:
+with NeuronFluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", config) as pipeline:
     pipeline.compile()
     image, timing = pipeline.generate(
         "a red panda reading a book", num_inference_steps=28, seed=42
@@ -120,28 +121,26 @@ tokenizes, drives the denoising loop, and turns the result into an image.
 
 | Component | BF16 weights | Across ranks | Why |
 |---|---|---|---|
-| `transformer` (FluxTransformer2DModel) | 15.20 GiB | sharded | 28 invocations per request: the whole cost |
+| `transformer` (FluxTransformer2DModel) | 22.17 GiB | sharded | 28 invocations per request: the whole cost |
 | `text_encoder_2` (T5-XXL) | 8.87 GiB | sharded | large, and 64 heads divide cleanly |
-| `text_encoder` (CLIP-L) | 0.22 GiB | replicated | sharding would add collectives to save nothing |
-| `vae` (AutoencoderKL decoder) | 0.15 GiB | replicated | convolutional, once per request |
+| `text_encoder` (CLIP-L) | 0.23 GiB | replicated | sharding would add collectives to save nothing |
+| `vae` (AutoencoderKL decoder) | 0.16 GiB | replicated | convolutional, once per request |
 
 This is the same division NxD Inference makes for the same model, which makes the
 two directly comparable — see "Against NxD Inference" below.
 
-### Why there is no tp_degree=1
+### Why tp_degree=4 and not less
 
-The four components are **24.44 GiB** of BF16 weights, and one core's HBM
-partition holds ~22 GiB. At `tp_degree=1` it compiles and loads, then dies asking
-for activation space on top:
+The four components are **31.42 GiB** of BF16 weights against ~22 GiB per core:
 
-```
-NRT:nrt_infodump  Failure: NRT_RESOURCE in nrt_tensor_allocate
-RuntimeError: nrt_tensor_allocate status=4
-```
+| `tp_degree` | Weights per core | Result |
+|---|---|---|
+| 1 | 31.42 GiB | rejected by the config -- the transformer alone is 22.17 GiB |
+| 2 | 15.71 GiB | weights fit, but 1024x1024 activations do not: the ranks fail to load with `Allocation Failure` |
+| 4 | 7.86 GiB | works, with room for LoRA slots |
 
-`tp_degree=2` halves that to 12.22 GiB per core and is the floor for this
-checkpoint. `FluxNeuronConfig` rejects 1 with that explanation rather than letting
-it fail at load.
+So `tp_degree=4` is the configuration for this checkpoint, and a trn2.3xlarge has
+exactly four logical cores. Everything measured below is at 4.
 
 ### What is sharded, exactly
 
@@ -172,18 +171,9 @@ quantity, so it is held whole and added after the reduce.
 ## LoRA
 
 Adapters are loaded into device slots at runtime and selected per request. Nothing
-is recompiled, and switching between loaded adapters costs **under a millisecond**.
-
-> **The adapter has to match the checkpoint**, so read the examples here as
-> FLUX.1-dev rather than FLUX.1-lite: every widely available FLUX adapter is trained
-> against dev, and dev has 19 double-stream blocks where lite has 8, so half of a
-> dev adapter names layers that do not exist in lite. Everything in this section
-> works the same on lite with a lite-targeted adapter; the measurements and the
-> images below are on dev because that is what can actually be tried. See
-> "Adapters have to match the checkpoint".
+is recompiled, and switching between loaded adapters costs **under a millisecond**:
 
 ```python
-CKPT = "black-forest-labs/FLUX.1-dev"          # what these adapters were trained on
 config = FluxNeuronConfig(height=1024, width=1024, tp_degree=4,
                           lora_slots=2, lora_max_rank=64)
 with NeuronFluxPipeline.from_pretrained(CKPT, config) as pipeline:
@@ -209,8 +199,7 @@ diffusers/PEFT, kohya and XLabs layouts all load: the file goes through
 | ![](images/flux-lora-base.png) | ![](images/flux-lora-xlabs.png) | ![](images/flux-lora-kohya.png) |
 
 <sub>One compiled model, one prompt, one seed; both adapters loaded at runtime and
-selected with a sub-millisecond switch. FLUX.1-dev, 512x512, 28 steps,
-`tp_degree=4`.</sub>
+selected with a sub-millisecond switch. 512x512, 28 steps, `tp_degree=4`.</sub>
 
 
 ### How it avoids recompiling
@@ -232,7 +221,7 @@ than once per switch.
 
 ### Cost
 
-FLUX.1-dev at `tp_degree=4`, 512x512, two slots at rank 64:
+`tp_degree=4`, 512x512, two slots at rank 64:
 
 | Operation | Cost |
 |---|---|
@@ -250,72 +239,60 @@ actually use.
 ### Correctness
 
 Sharding an adapter has to match the sharding of the layer it adapts, and for
-row-parallel layers the delta has to be added *before* the layer's all-reduce — `x`
+row-parallel layers the delta has to be added *before* the layer's all-reduce -- `x`
 is sharded there, so each rank can only compute a partial `A @ x`, and adding the
 delta after the reduce leaves every rank with a different wrong answer. The four
 cases (column-parallel, row-parallel, the single block's split `proj_out`, and plain
 layers) are checked on CPU against a dense `W x + B (A x)`, exactly.
 
-On device, with two adapters loaded: each changes the output (cos 0.979 and 0.984
-against the base model, and they differ from each other), switching away and back
-reproduces the earlier latents **bit for bit**, and so does returning to slot 0.
+On device, every slot is compared against a **float32** CPU reference for *every*
+adapter, not just its own -- one denoising step at 512x512, same prompt, seed,
+schedule and initial latents, cosine on the resulting latents:
 
-Against a reference -- the same adapter applied by diffusers on CPU, same prompt,
-seed, schedule and initial latents, one denoising step at 512x512:
+| slot | cpu-base | cpu-xlabs | cpu-kohya |
+|---|---|---|---|
+| base (slot 0) | **0.999841** | 0.997064 | 0.993697 |
+| xlabs (slot 1) | 0.998179 | **0.999837** | 0.992665 |
+| kohya (slot 2) | 0.995441 | 0.993223 | **0.999796** |
 
-| | cos | mean abs diff |
-|---|---|---|
-| base vs CPU base (the backend's own floor) | 0.996447 | 0.0909 |
-| **adapter vs CPU with the same adapter** | **0.996433** | 0.0924 |
-| adapter vs CPU base | 0.995558 | 0.1107 |
-| base vs CPU with the adapter | 0.986889 | 0.1555 |
+Every row's maximum is on the diagonal, and the diagonal sits at ~0.9998 -- the
+bfloat16-against-float32 floor for this model -- while the off-diagonals are 0.992 to
+0.998. A slot reading the wrong weights, or an adapter applied to the wrong modules,
+moves the maximum off the diagonal.
 
-The second row is the point: applying the adapter does not change how well this
-pipeline agrees with CPU diffusers -- it lands on the same floor as the base model.
-The cross rows are ordered the right way round in both directions.
-
-Sharper still, subtracting the backends' own disagreement by comparing what the
-adapter *contributes* on each side: the two deltas agree to **cos 0.9655** with
-matching magnitude (mean 0.1014 against 0.1065). That is close to what agreement
-can look like here, since the backend floor (0.0909) is itself the same size as the
-contribution being measured.
+Switching also has to be lossless: switching away from an adapter and back reproduces
+the earlier latents **bit for bit**, and so does returning to slot 0.
 
 ### Adapters have to match the checkpoint
 
-An adapter trained for FLUX.1-dev names 19 double-stream blocks; FLUX.1-lite has 8.
-Loading one into the other adapts only the layers that do exist, which is not what
-the adapter's author intended, and logs how many were dropped:
+Adapters name modules, so one trained against a different variant of FLUX -- a
+distilled checkpoint with fewer double-stream blocks, say -- names layers that do not
+exist here. Loading it adapts only the layers that do, which is not what the
+adapter's author intended, and logs how many were dropped:
 
 ```
 WARNING Adapter targets 266 modules that are not adapted here, e.g.
         ['transformer_blocks.10.attn.to_q', ...]. A FLUX adapter trained for a
-        different checkpoint (dev has 19 double blocks, lite has 8) will look
-        like this.
+        different checkpoint (this one has 19 double blocks) will look like this.
 ```
 
-It is a warning rather than an error because a partial adapter is a legitimate
-thing to have -- but if you see it while loading a stock adapter, the checkpoint is
-the problem. Nothing else in this recipe depends on which of the two you run: the
-pipeline reads the block counts from the checkpoint.
+It is a warning rather than an error because a partial adapter is a legitimate thing
+to have -- but if you see it while loading a stock adapter, the checkpoint is the
+problem. Nothing else in this recipe depends on which variant you run: the pipeline
+reads the block counts from the checkpoint.
 
 ## Cores
 
-`tp_degree` logical cores, one rank each, and nothing else needs one:
+Four logical cores, one rank each, and nothing else needs one -- this process holds
+none. On a trn2.3xlarge at the default `logical-neuroncore-config: 2` that is the
+whole instance.
 
-| `tp_degree` | Cores | Per-core weights | Fits a trn2.3xlarge? |
-|---|---|---|---|
-| 2 | 2 | 12.22 GiB | yes |
-| 4 | 4 | 6.11 GiB | yes, exactly |
-| 8 | 8 | 3.06 GiB | no — needs a larger instance |
-
-Use the default `logical-neuroncore-config: 2`. LNC=1 would give eight logical
-cores on this instance, but each is one physical NeuronCore instead of a fused
-pair, so a rank gets half the compute: measured at 1227 ms/step against 791 for
-the same unsharded transformer. It is for models small enough that a fused core
-would sit idle, and for this pipeline it is also currently broken — the transformer
-graph compiled with `--lnc=1` returns NaN from the first denoising step at both
-512x512 and 1024x1024, while the encoders and initial latents on the same run are
-finite.
+Use LNC=2. LNC=1 would give eight logical cores, but each is one physical NeuronCore
+instead of a fused pair, so a rank gets half the compute; and for this pipeline it is
+also currently broken -- a transformer graph compiled with `--lnc=1` returns NaN from
+the first denoising step at both 512x512 and 1024x1024, while the encoders and
+initial latents on the same run are finite. LNC=1 is for models small enough that a
+fused core would sit idle.
 
 ### How much HBM each core gets
 
@@ -384,7 +361,7 @@ which is why the kernel is the default.
 | Phase | Cost |
 |---|---|
 | Compilation, cold cache | ~4 min, dominated by the five VAE decode stages |
-| Rank startup, warm cache | 100-140 s |
+| Rank startup, warm cache | 130-180 s |
 | First image in a process | +12 s at 1024x1024, loading the VAE NEFFs |
 
 Rank startup is where the cost sits, and it grows with `tp_degree`: every rank
@@ -393,33 +370,19 @@ lock to do that one at a time so host memory holds. Per-step overhead from the
 split is about a millisecond: the embeddings and latents stay in the ranks for the
 whole request, so a step sends three scalars and gets back a one-element fence.
 
-### Against NxD Inference
-
-The same checkpoint, resolution and step count under NxD Inference, which divides
-the four components the same way:
-
-| Cores | This pipeline | NxD Inference |
-|---|---|---|
-| 2 | 392 ms/step | 406 ms/step |
-| 4 | 214 ms/step | 217 ms/step |
-
-Two independent implementations landing within 3% is a useful check on both.
-
 ### Reducing latency
 
-- **More ranks.** `tp_degree=4` instead of 2 is 1.84x per step, at twice the
-  cores.
-- **Fewer steps.** Step count scales latency linearly, and FLUX.1-lite degrades
-  gracefully: 8 steps still resolves the subject, materials and lighting, losing
-  mostly fine texture and background detail against 28; 4 steps is a usable
-  preview.
+- **Fewer steps.** Step count scales latency linearly, but FLUX.1-dev is not
+  step-distilled, so it degrades faster than a distilled variant does: 8 steps
+  (2.85 s) still resolves the subject, materials and lighting, while 4 steps
+  (1.77 s) comes out dark and soft rather than merely less detailed.
 
-  ![FLUX.1-lite-8B at 4, 8 and 28 denoising steps, same prompt and seed](images/flux-1-lite-8b-steps.png)
+  ![FLUX.1-dev at 4, 8 and 28 denoising steps, same prompt and seed](images/flux-1-dev-steps.png)
 
   *Same prompt, guidance and seed at each step count; 1024x1024, downscaled.*
 
-- **Lower resolution.** 512x512 is 2.7x faster per step than 1024x1024: the joint
-  sequence drops from 4608 to 1536 tokens.
+- **Lower resolution.** 512x512 is 2.6x faster per step than 1024x1024 (105 against
+  274 ms at `tp_degree=4`): the joint sequence drops from 4608 to 1536 tokens.
 - **Shorter prompt budget.** `--max-sequence-length 256` removes 256 tokens from
   every attention in every step. Prompts longer than the budget are truncated.
 - **`-O2` / `-O3`.** `--optimization-level` maps straight to `neuronx-cc -O`.
@@ -461,22 +424,12 @@ reference to 7e-4 max absolute error at 1024x1024 joint-attention shapes.
 layer on CPU, where each rank's partial products sum to the dense layer's result —
 but it does reorder summations, and BF16 shows that. Same seed and prompt:
 
-| | Steps | cos | max abs diff | latent std |
-|---|---|---|---|---|
-| 512x512, tp=2 vs tp=4 | 4 | 0.999545 | 0.74 | 1.18 |
-| 1024x1024, tp=2 vs tp=4 | 28 | 0.998092 | 2.27 | 1.29 |
-
-The 28-step figure is lower because reassociation error accumulates along the
-chain, not because more of the model is sharded. Decoded, the two 1024x1024 images
-differ by a mean of 1.71/255 per channel:
-
-![FLUX.1-lite-8B at tp_degree=2](images/flux-1-lite-8b-tp2.png)
-
-*`tp_degree=2`, otherwise identical to the `tp_degree=4` sample at the top of this
-page.*
-
-A sharding mistake looks nothing like this — it lands below cos 0.9 and is obvious
-in the image.
+Sharding is checked against a less-sharded run of the same model: at 512x512, where
+`tp_degree=2` still fits, two and four ranks agree to **cos 0.999554** on the final
+latents after 4 steps (max abs diff 0.74 against a latent std of 1.22) -- bf16
+reassociation, since splitting attention and the feed-forwards changes the order the
+sums happen in. A sharding mistake looks nothing like this; it lands below cos 0.9
+and is obvious in the image.
 
 **End to end.** Compared against the stock diffusers pipeline running BF16 on CPU,
 same prompt, seed and schedule (512x512, 8 steps): latent cosine similarity 0.9993
@@ -491,8 +444,8 @@ dtype.
 ## Limitations
 
 - Batch 1 only.
-- `tp_degree` 2, 4 or 8; there is no single-core configuration, and 8 needs an
-  instance larger than trn2.3xlarge.
+- `tp_degree=4` only for this checkpoint: 1 and 2 do not have the memory, and 8 needs
+  an instance larger than trn2.3xlarge.
 - Resolution, prompt budget and `tp_degree` are fixed at load time. Changing any of
   them means recompiling — there is no bucketing, because a diffusion step has no
   analogue of a variable sequence length.

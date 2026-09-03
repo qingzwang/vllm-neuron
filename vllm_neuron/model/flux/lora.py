@@ -477,9 +477,9 @@ def load_adapter_into_slot(
     missing = sorted(set(pairs) - set(slots.modules))
     if missing:
         logger.warning(
-            "Adapter targets %d modules that are not adapted here, e.g. %s. A FLUX "
-            "adapter trained for a different checkpoint (dev has 19 double blocks, "
-            "lite has 8) will look like this.",
+            "Adapter targets %d modules that are not adapted here, e.g. %s. An "
+            "adapter trained against a different FLUX variant -- one with a "
+            "different number of double-stream blocks -- looks like this.",
             len(missing),
             missing[:3],
         )

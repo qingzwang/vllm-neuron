@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Text-to-image generation with FLUX.1-lite-8B on Neuron.
+"""Text-to-image generation with FLUX.1 on Neuron.
 
 Unlike the other examples in this directory this does not go through the vLLM
 offline API: vLLM has no text-to-image request path, so FLUX runs through
 ``vllm_neuron.model.flux.NeuronFluxPipeline`` directly. See
-``docs/model-recipes/flux-1-lite-8b.md``.
+``docs/model-recipes/flux-1-dev.md``.
 
 The first run compiles (a few minutes); later runs hit the compilation cache.
 
@@ -19,11 +19,8 @@ Usage:
     # Four cores instead of two: ~1.9x faster per step
     python examples/vllm_neuron/models/flux/generate.py --prompt "..." --tp 4
 
-    # LoRA: load adapters at runtime and write one image per adapter, plus the base.
-    # Point -c at the checkpoint the adapters were trained against -- a FLUX.1-dev
-    # adapter names layers that FLUX.1-lite does not have.
+    # LoRA: load adapters at runtime and write one image per adapter, plus the base
     python examples/vllm_neuron/models/flux/generate.py --prompt "..." \
-        -c black-forest-labs/FLUX.1-dev \
         --lora realism=/adapters/xlabs-realism \
         --lora superreal=/adapters/super-realism.safetensors
 """
@@ -53,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model-checkpoint",
-        default="Freepik/flux.1-lite-8B",
+        default="black-forest-labs/FLUX.1-dev",
         help="HF repo id or local path to a diffusers FluxPipeline folder.",
     )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)

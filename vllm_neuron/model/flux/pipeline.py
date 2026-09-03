@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """FLUX.1 text-to-image pipeline on Neuron.
 
-Developed against ``Freepik/flux.1-lite-8B`` (8 double + 38 single blocks,
-distilled from FLUX.1-dev), but nothing here is specific to that checkpoint: any
-guidance-distilled ``FluxPipeline`` in diffusers format loads through the same
-path.
+Developed against ``black-forest-labs/FLUX.1-dev`` (19 double + 38 single blocks),
+but nothing here is specific to that checkpoint: any guidance-distilled
+``FluxPipeline`` in diffusers format loads through the same path, with block counts,
+head counts and dimensions read from the checkpoint.
 
 Why this lives outside the vLLM engine
 --------------------------------------
@@ -419,8 +419,7 @@ class NeuronFluxPipeline:
         Args:
             prompt: Text prompt. Truncated to CLIP's 77 tokens for the pooled
                 branch and to ``max_sequence_length`` for T5.
-            num_inference_steps: Denoising steps. FLUX.1-lite is tuned for the
-                same 20-30 range as FLUX.1-dev.
+            num_inference_steps: Denoising steps. FLUX.1-dev is tuned for 20-30.
             guidance_scale: Distilled guidance embedding value. This is *not*
                 classifier-free guidance -- there is no negative pass, so cost is
                 independent of it.

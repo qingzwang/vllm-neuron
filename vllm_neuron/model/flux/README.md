@@ -1,7 +1,7 @@
 # FLUX.1 on Neuron
 
 Text-to-image inference for guidance-distilled FLUX.1 checkpoints, developed
-against [`Freepik/flux.1-lite-8B`](https://huggingface.co/Freepik/flux.1-lite-8B).
+against [`black-forest-labs/FLUX.1-dev`](https://huggingface.co/black-forest-labs/FLUX.1-dev).
 
 ## Why this is not a registered vLLM model
 
@@ -45,13 +45,13 @@ processes hold every network; the pipeline process holds none.
 
 | Component | Across ranks | Why |
 | --- | --- | --- |
-| `transformer` | sharded | 15.2 GiB, 28 invocations per request: the whole cost |
+| `transformer` | sharded | 22.2 GiB, 28 invocations per request: the whole cost |
 | `text_encoder_2` (T5-XXL) | sharded | 8.9 GiB, divides cleanly on 64 heads |
 | `text_encoder` (CLIP-L) | replicated | 0.22 GiB; sharding would add collectives to save nothing |
 | `vae` (decoder) | replicated | 0.15 GiB, convolutional, once per request |
 
 Same division as NxD Inference makes for this model. There is no `tp_degree=1`:
-the four components are 24.44 GiB of BF16 weights against a ~22 GiB HBM partition.
+the four components are 31.42 GiB of BF16 weights against a ~22 GiB HBM partition.
 
 Only attention heads and feed-forward widths are split; the residual stream stays
 full width and identical on every rank. The one layer that does not fit that
@@ -87,7 +87,7 @@ change is local and documented at the site:
 ## Usage
 
 See `examples/vllm_neuron/models/flux/` and
-`docs/model-recipes/flux-1-lite-8b.md`.
+`docs/model-recipes/flux-1-dev.md`.
 
 ## Verified against upstream
 

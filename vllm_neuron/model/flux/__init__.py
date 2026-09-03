@@ -5,7 +5,7 @@ Not registered in ``vllm_neuron.model.registry``: that registry maps HF
 architecture names onto vLLM model classes, and vLLM 0.24 has no
 text-to-image request path to hand a FLUX checkpoint to. This is a standalone
 pipeline that reuses the package's compilation stack and NKI kernels. See
-``pipeline.py`` for the rationale and ``docs/model-recipes/flux-1-lite-8b.md``
+``pipeline.py`` for the rationale and ``docs/model-recipes/flux-1-dev.md``
 for usage.
 """
 

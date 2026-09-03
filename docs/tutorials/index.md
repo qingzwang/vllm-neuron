@@ -68,12 +68,12 @@ Configure encoder-disaggregated (EPD) multimodal topologies.
 Serve embeddings via `/v1/embeddings` with a pooling model.
 :::
 
-:::{grid-item-card} FLUX.1-lite-8B 上手指南（中文）
-:link: tutorial-flux-1-lite-8b-zh
+:::{grid-item-card} FLUX.1-dev 上手指南（中文）
+:link: tutorial-flux-1-dev-zh
 :link-type: doc
 
-Run FLUX.1-lite-8B text-to-image from scratch, then shard the diffusion
-transformer across NeuronCores. In Chinese.
+Run FLUX.1-dev text-to-image from scratch, shard the diffusion transformer across
+NeuronCores, and load LoRA adapters at runtime. In Chinese.
 :::
 
 ::::
@@ -91,5 +91,5 @@ Benchmarking prefix caching (GPT-OSS) <tutorial-prefix-caching-gpt-oss-benchmark
 Deploying Qwen3-VL-32B <tutorial-qwen3-vl-32b>
 Disaggregated encoder (1E1PD and xEyPD) <tutorial-epd-1e-1pd-xeypd>
 Deploying Qwen3-Embedding-8B <tutorial-qwen3-embedding-8b>
-FLUX.1-lite-8B 上手指南（中文）<tutorial-flux-1-lite-8b-zh>
+FLUX.1-dev 上手指南（中文）<tutorial-flux-1-dev-zh>
 :::

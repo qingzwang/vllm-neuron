@@ -4,8 +4,9 @@
 generation on Neuron, including supported checkpoints, component placement,
 measured latency on Trn2, and known limitations. -->
 <!-- meta: keywords: Neuron, FLUX, FLUX.1-lite, flux.1-lite-8B, Freepik,
-diffusion, text-to-image, DiT, diffusers, model recipe, Trn2, Trainium -->
-<!-- meta: date_updated: 2026-09-01 -->
+diffusion, text-to-image, DiT, diffusers, model recipe, tensor parallelism, Trn2,
+Trainium -->
+<!-- meta: date_updated: 2026-09-03 -->
 <!-- Content type: model-card -->
 
 ## Introduction
@@ -48,7 +49,8 @@ See `vllm_neuron/model/flux/README.md` for the design.
 | **Quantization** | BF16 | ✅ |
 | | FP8 / MXFP8 | ❌ |
 | **Parallelism** | Two logical NeuronCores (transformer + T5 encoder) | ✅ |
-| | Tensor parallelism (TP) | ❌ |
+| | Tensor parallelism for the transformer | ✅ |
+| | Data or context parallelism | ❌ |
 | **Guidance** | Distilled guidance embedding | ✅ |
 | | True classifier-free guidance | ❌ |
 | **Batching** | Batch 1 | ✅ |
@@ -128,6 +130,117 @@ the same split as `vllm_neuron/vllm/disaggregated_encoder` in the LLM path.
 That buys 16x on prompt encoding: **98 ms** on Neuron against **1617 ms** for
 the same weights in CPU eager mode, measured over 10 requests at a 512-token
 budget.
+
+## Tensor parallelism
+
+The transformer is where a request's time goes — 28 invocations against one for
+everything else — and on one core it is also 15.2 GiB against a ~22 GiB HBM
+partition. `tp_degree` shards it across cores, which halves step latency at
+`tp_degree=2`:
+
+```python
+config = FluxNeuronConfig(
+    height=1024, width=1024,
+    tp_degree=2,             # shard the transformer over two cores
+    tp_core_ids=(0, 1),      # one physical core per rank
+    worker_device_index=2,   # T5's core
+)
+# and this process, which keeps CLIP and the VAE, pinned before the import:
+#   os.environ["NEURON_RT_VISIBLE_CORES"] = "3"
+```
+
+`tp_degree` must be a power of two and must divide the 24 attention heads, so 1,
+2, 4 or 8. At 1 nothing changes: the transformer stays in this process.
+
+### What is sharded
+
+Only attention heads and the feed-forward intermediate width. The residual stream
+stays full width and identical on every rank, so norms, modulation projections,
+embedders and the final `proj_out` are replicated, and the attention processor
+needs no changes at all — it derives the head count from the tensor it is handed.
+See `parallel.py` for the layer-by-layer table.
+
+The single-stream block's `proj_out` is the one layer that does not fit the
+standard pattern: it consumes `cat([attn_output, mlp_hidden_states])`, and with
+both producers column-parallel each rank holds `[attn_dim/tp + mlp_dim/tp]`, which
+is not that rank's contiguous slice of the global input. Its weight is split at
+`attn_dim`, each half sharded along its own axis, and the two partial products
+summed before a single all-reduce.
+
+### Cores
+
+One core per rank, one for T5, one for this process:
+
+| `tp_degree` | Transformer | T5 | This process | Total | Fits on a trn2.3xlarge (4 cores)? |
+|---|---|---|---|---|---|
+| 1 | 1 | 1 | shares the transformer's | 2 | yes |
+| 2 | 2 | 1 | 1 | 4 | exactly |
+| 4 | 4 | 1 | 1 | 6 | no — needs a larger instance |
+
+A logical core belongs to one process: a second process asking for the same core
+fails to bring the runtime up at all, so the totals above are hard. **On a
+trn2.3xlarge, `tp_degree=2` is the largest fully on-device configuration.**
+`tp_degree=4` needs six cores, which any larger trn2 has.
+
+`NEURON_LOGICAL_NC_CONFIG=1` would produce eight cores on this instance, but it is
+not the answer here: each is one physical NeuronCore-v3 instead of a fused pair,
+so an 8B transformer gets half the compute per rank — measured at 1227 ms/step
+against 791 at LNC=2. It also does not currently work for this pipeline: the
+transformer graph compiled with `--lnc=1` returns NaN from the first denoising
+step, at both 512x512 and 1024x1024, while the encoders and initial latents on the
+same run are finite. LNC=1 is for models small enough that a fused core would sit
+idle.
+
+### Measured
+
+Same instance, prompt, seed and 512-token budget as the latency section below;
+1024x1024, 28 steps, median over 2 requests after a warmup request.
+
+| `tp_degree` | ms/step | Speedup | End to end (28 steps) | Cores for the transformer |
+|---|---|---|---|---|
+| 1 | 791 | 1.00x | 22.24 s | 1 |
+| 2 | 392 | 2.02x | 11.07 s | 2 |
+| 4 | 214 | 3.70x | see below | 4 |
+
+Step latency scales almost linearly, which is what you would hope for from a
+model whose step is 46 attentions over a 4608-token joint sequence plus the
+feed-forwards: there is enough work per rank at 1024x1024 that the two
+all-reduces per block do not dominate.
+
+The `tp_degree=4` row was measured with CLIP, the VAE and T5 on CPU, because a
+trn2.3xlarge does not have six logical cores — only the step latency and the
+latents are from that run, not the end-to-end number. On an instance with six or
+more cores nothing else changes. As a check that this does not distort the
+comparison, `tp_degree=1` measured the same way gives 791.3 ms/step against
+790.9 ms/step with everything on device: where the encoders run does not touch
+the step.
+
+### Accuracy
+
+Sharding is exact, not an approximation, but it does reorder summations, and in
+BF16 that shows up. Same seed and prompt, comparing final latents:
+
+| | Steps | cos | max abs diff | latent std |
+|---|---|---|---|---|
+| 512x512, TP=1 vs TP=2 | 4 | 0.999815 | 0.39 | 1.18 |
+| 1024x1024, TP=1 vs TP=4 | 4 | 0.999962 | 0.96 | 1.51 |
+| 1024x1024, TP=1 vs TP=2 | 28 | 0.998331 | 2.65 | 1.29 |
+
+The 28-step figure is lower because reassociation error accumulates over the
+chain, not because more of the model is sharded. Decoded, the two 1024x1024
+images differ by a mean of 1.35/255 per channel and are visually
+indistinguishable. A sharding mistake looks nothing like this — it lands below
+cos 0.9 and is obvious in the image.
+
+### Cost of the split
+
+Each rank is its own process, so the pipeline sends the request's invariants
+(prompt embeddings, pooled projection, guidance, RoPE tables) once and then only
+three scalars per step; the latents stay in the workers for the whole denoising
+loop and come back once at the end. That keeps the per-step host cost at about a
+millisecond. Startup is where the cost sits: every rank loads the full checkpoint
+before keeping its shard, and they take a lock to do that one at a time, so a
+cold start at `tp_degree=2` takes ~200 s against ~60 s in-process.
 
 ## Choosing cores
 
@@ -308,6 +421,8 @@ parallel with the parent's own startup.
 
 ### Reducing latency
 
+- **Tensor parallelism.** The largest single lever: `tp_degree=2` halves step
+  latency, at the cost of two more cores. See "Tensor parallelism" above.
 - **Fewer steps.** Step count scales latency linearly, and FLUX.1-lite degrades
   gracefully: 8 steps (7.0 s) still resolves the subject, materials and lighting,
   losing mostly fine texture and background detail against 28 steps (22.8 s);

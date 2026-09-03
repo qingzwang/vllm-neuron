@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import statistics
+import sys
 import time
 from typing import Any
 
@@ -31,7 +32,25 @@ from typing import Any
 # runtime initializes, leaving none for that child -- so pin this one to a single
 # core here, before importing vllm_neuron triggers the init. Override
 # NEURON_RT_VISIBLE_CORES in the environment to use a different core.
-os.environ.setdefault("NEURON_RT_VISIBLE_CORES", "0")
+#
+# With --tp above 1 this process keeps only CLIP and the VAE; the transformer's
+# ranks take cores 0..tp-1 and T5 takes core tp, so this one moves to tp+1. Cores
+# are exclusive -- a second process asking for one already held fails to bring the
+# runtime up -- so the layout has to be decided here, before the import.
+
+
+def _tp_from_argv() -> int:
+    """Read --tp ahead of argparse: the pinning below cannot wait for it."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--tp" and i + 1 < len(sys.argv):
+            return int(sys.argv[i + 1])
+        if arg.startswith("--tp="):
+            return int(arg.split("=", 1)[1])
+    return 1
+
+
+_TP = _tp_from_argv()
+os.environ.setdefault("NEURON_RT_VISIBLE_CORES", str(_TP + 1) if _TP > 1 else "0")
 os.environ.setdefault("NEURON_LIBTORCH_COMPILATION_TIMEOUT", "3600")
 
 from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
@@ -74,6 +93,15 @@ def parse_args() -> argparse.Namespace:
         help="Count the first (NEFF-loading) request in the statistics too.",
     )
     parser.add_argument("--on-device", default=",".join(DEFAULT_ON_DEVICE))
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=1,
+        help="Shard the transformer across this many NeuronCores (power of two). "
+        "Ranks take cores 0..tp-1, T5 takes core tp, and this process takes "
+        "core tp+1 unless NEURON_RT_VISIBLE_CORES says otherwise. tp=4 needs "
+        "eight logical cores, i.e. NEURON_LOGICAL_NC_CONFIG=1.",
+    )
     parser.add_argument("--optimization-level", type=int, default=1)
     parser.add_argument(
         "--save-images",
@@ -100,6 +128,9 @@ def run_config(args: argparse.Namespace, size: int, steps: int) -> dict[str, Any
         max_sequence_length=args.max_sequence_length,
         on_device=tuple(c for c in args.on_device.split(",") if c),
         optimization_level=args.optimization_level,
+        tp_degree=args.tp,
+        tp_core_ids=tuple(range(args.tp)) if args.tp > 1 else None,
+        worker_device_index=args.tp if args.tp > 1 else 1,
     )
     pipeline = NeuronFluxPipeline.from_pretrained(args.model_checkpoint, config)
 

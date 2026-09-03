@@ -49,6 +49,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from .config import FluxNeuronConfig
 from .text_encoder_worker import TextEncoderWorker, explain_core_conflict
+from .tp_transformer import TPTransformer
 from .transformer import (
     NeuronFluxTransformer,
     build_rotary_embedding,
@@ -61,6 +62,12 @@ logger = logging.getLogger(__name__)
 # CLIP's fixed context length; the pooled branch always sees exactly this many
 # tokens, independent of max_sequence_length (which governs T5 only).
 CLIP_SEQ_LEN = 77
+
+# Set once this process has put a component on Neuron, i.e. once the Neuron
+# runtime is initialized. Module scope on purpose: the thing it guards -- forking
+# tensor-parallel workers -- is unsafe from that point on for the whole process,
+# not just for one pipeline. See _start_tp_workers.
+_NRT_INITIALIZED = False
 
 
 @dataclass
@@ -166,6 +173,7 @@ class NeuronFluxPipeline:
         self.compile_ms: dict[str, float] = {}
         self._t5_worker: TextEncoderWorker | None = None
         self._t5_compiled = None
+        self._tp: TPTransformer | None = None
         self._model_path = model_path
 
         # Inference only: without this, components left on CPU run in eager mode
@@ -294,6 +302,8 @@ class NeuronFluxPipeline:
             device,
             len(wrappers),
         )
+        global _NRT_INITIALIZED
+        _NRT_INITIALIZED = True
         try:
             # The weight upload is inside the try because it is the step that
             # runs out of HBM: a logical core holds 24 GB, and the transformer
@@ -337,6 +347,15 @@ class NeuronFluxPipeline:
         tcfg = self.pipe.transformer.config
         dtype = cfg.dtype
 
+        if cfg.tp_degree > 1:
+            # Before anything else in this process touches Neuron. MPExecutor
+            # forks, and a child forked after the parent has initialized the
+            # runtime inherits a dead NRT handle -- the executor recognizes that
+            # failure and says so, but the ordering is what avoids it.
+            self._start_tp_workers()
+            self._place_vae_clip_t5(batch, tcfg, dtype)
+            return
+
         # Transformer first: it is both the largest component and the one whose
         # placement actually decides end-to-end latency (~30 invocations per
         # request against one for everything else), so if HBM runs short it must
@@ -362,6 +381,16 @@ class NeuronFluxPipeline:
                 torch.zeros(1, dtype=torch.float32),
             ),
         )
+        self._place_vae_clip_t5(batch, tcfg, dtype)
+
+    def _place_vae_clip_t5(self, batch: int, tcfg: Any, dtype: torch.dtype) -> None:
+        """Place everything except the transformer, then report.
+
+        Split out because tensor parallelism has to run before this: the
+        transformer's workers are forked, and forking after this process has
+        touched Neuron poisons them.
+        """
+        cfg = self.config
         self._decode_compiled = self._place(
             "vae",
             self._decode_stages,
@@ -385,8 +414,9 @@ class NeuronFluxPipeline:
         self._place_t5()
 
         # The RoPE tables are graph inputs, so they live wherever the step graph
-        # runs. Uploaded once here, reused by every step of every request.
-        if self.placement["transformer"] == "neuron":
+        # runs. Uploaded once here, reused by every step of every request. Under
+        # tensor parallelism the workers own that upload instead.
+        if self._tp is None and self.placement["transformer"] == "neuron":
             device = cfg.device_for("transformer")
             self._freqs_cos = self._freqs_cos_host.to(device)
             self._freqs_sin = self._freqs_sin_host.to(device)
@@ -395,6 +425,63 @@ class NeuronFluxPipeline:
             "FLUX pipeline ready. placement=%s compile_time_s=%s",
             self.placement,
             {k: round(v / 1e3, 1) for k, v in self.compile_ms.items()},
+        )
+
+    def _start_tp_workers(self) -> None:
+        """Bring up the sharded transformer in worker processes.
+
+        The workers load and shard the checkpoint themselves, so this process's
+        own copy of the transformer weights is dead afterwards and is dropped --
+        15.2 GiB of host memory that nothing will read again.
+
+        Raises:
+            RuntimeError: If this process has already placed a component on
+                Neuron. The workers are forked, and a child forked after the
+                runtime came up inherits a dead NRT handle, so one process can
+                bring up tensor-parallel workers at most once and must do it
+                before touching the device itself. Use one process per
+                configuration.
+            ValueError: If the checkpoint path is unknown, which happens when the
+                pipeline was built from an in-memory ``FluxPipeline`` rather than
+                :meth:`from_pretrained`. The workers have nothing to load from.
+        """
+        cfg = self.config
+        if _NRT_INITIALIZED:
+            raise RuntimeError(
+                "This process has already initialized the Neuron runtime, so "
+                "tensor-parallel workers forked now would inherit a dead NRT "
+                "handle. A process can start them only once, and only before it "
+                "places anything on Neuron itself -- run one tp_degree>1 "
+                "configuration per process."
+            )
+        if self._model_path is None:
+            raise ValueError(
+                "tp_degree>1 needs the checkpoint path so each worker can load "
+                "its own shard; build the pipeline with from_pretrained()."
+            )
+        tcfg = self.pipe.transformer.config
+        with self._timed("transformer"):
+            self._tp = TPTransformer(
+                self._model_path,
+                cfg,
+                (
+                    torch.zeros(
+                        1, cfg.max_sequence_length, tcfg.joint_attention_dim, dtype=cfg.dtype
+                    ),
+                    torch.zeros(1, tcfg.pooled_projection_dim, dtype=cfg.dtype),
+                    torch.zeros(1, dtype=torch.float32),
+                    self._freqs_cos_host,
+                    self._freqs_sin_host,
+                    torch.zeros(1, cfg.image_seq_len, tcfg.in_channels, dtype=cfg.dtype),
+                ),
+            )
+        self.placement["transformer"] = "neuron"
+        self.pipe.transformer.to("meta")
+        logger.info(
+            "Component transformer: sharded over %d cores %s, compiled in %.1f s",
+            cfg.tp_degree,
+            list(cfg.tp_core_ids),
+            self.compile_ms["transformer"] / 1e3,
         )
 
     def _place_t5(self) -> None:
@@ -463,10 +550,13 @@ class NeuronFluxPipeline:
         )
 
     def close(self) -> None:
-        """Release the T5 worker process, if one is running. Idempotent."""
+        """Release the worker processes, if any are running. Idempotent."""
         worker, self._t5_worker = self._t5_worker, None
         if worker is not None:
             worker.close()
+        tp, self._tp = self._tp, None
+        if tp is not None:
+            tp.close()
 
     def __enter__(self) -> Self:
         return self
@@ -486,6 +576,14 @@ class NeuronFluxPipeline:
     # ------------------------------------------------------------------
 
     def _device_for(self, component: str) -> torch.device:
+        """Where a component's inputs have to be, from this process's side.
+
+        Under tensor parallelism the transformer runs in worker processes, so from
+        here it takes host tensors: this process may not even hold a core, and
+        moving anything to the core it does hold would only be undone again.
+        """
+        if component == "transformer" and self._tp is not None:
+            return torch.device("cpu")
         return (
             self.config.device_for(component)
             if self.placement.get(component) == "neuron"
@@ -650,10 +748,33 @@ class NeuronFluxPipeline:
 
         start = time.perf_counter()
         timesteps, sigmas = self._timesteps_and_sigmas(num_inference_steps)
+        # Under tensor parallelism _device_for returns the host: the workers hold
+        # the latents, and nothing about this request lands on this process's core.
         device = self._device_for("transformer")
         latents = self._init_latents(seed).to(device)
         guidance = torch.full((1,), guidance_scale, dtype=torch.float32).to(device)
         timing.latent_init_ms = (time.perf_counter() - start) * 1e3
+
+        if self._tp is not None:
+            self._tp.set_context(
+                prompt_embeds,
+                pooled_embeds,
+                guidance,
+                self._freqs_cos_host,
+                self._freqs_sin_host,
+                latents,
+            )
+            for i, t in enumerate(timesteps):
+                step_start = time.perf_counter()
+                self._tp.step(
+                    (t / 1000).reshape(1).to(torch.float32),
+                    torch.full((1,), float(sigmas[i]), dtype=torch.float32),
+                    torch.full((1,), float(sigmas[i + 1]), dtype=torch.float32),
+                )
+                timing.step_ms.append((time.perf_counter() - step_start) * 1e3)
+            latents = self._tp.latents()
+            timing.denoise_ms = sum(timing.step_ms)
+            return self._finish(latents, output_type, timing, total_start)
 
         for i, t in enumerate(timesteps):
             step_start = time.perf_counter()
@@ -693,7 +814,17 @@ class NeuronFluxPipeline:
             timing.step_ms.append((time.perf_counter() - step_start) * 1e3)
 
         timing.denoise_ms = sum(timing.step_ms)
+        return self._finish(latents, output_type, timing, total_start)
 
+    def _finish(
+        self,
+        latents: torch.Tensor,
+        output_type: str,
+        timing: GenerationTiming,
+        total_start: float,
+    ) -> tuple[Any, GenerationTiming]:
+        """Decode the final latents and postprocess, shared by both step paths."""
+        cfg = self.config
         if output_type == "latent":
             timing.total_ms = (time.perf_counter() - total_start) * 1e3
             return latents, timing

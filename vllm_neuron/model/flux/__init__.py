@@ -11,6 +11,7 @@ for usage.
 
 from .attention import NeuronFluxAttnProcessor, neuron_joint_attention
 from .config import FluxNeuronConfig
+from .parallel import shard_flux_transformer
 from .pipeline import GenerationTiming, NeuronFluxPipeline
 from .transformer import NeuronFluxTransformer, build_rotary_embedding
 
@@ -22,4 +23,5 @@ __all__ = [
     "NeuronFluxTransformer",
     "build_rotary_embedding",
     "neuron_joint_attention",
+    "shard_flux_transformer",
 ]

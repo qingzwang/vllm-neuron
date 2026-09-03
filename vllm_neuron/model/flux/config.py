@@ -91,6 +91,24 @@ class FluxNeuronConfig:
             one physical core pair, so at ``logical-neuroncore-config: 1`` cores
             2k and 2k+1 share a budget and 0/1 would still not fit; 0 and 2
             would.
+        tp_degree: Shard the transformer's attention heads and feed-forward
+            width across this many logical NeuronCores. 1 keeps it in this
+            process, exactly as before. Above 1 it moves into ``tp_degree``
+            worker processes, one per core, and this process only orchestrates
+            them -- see ``tp_transformer.py`` and "Tensor parallelism" in the
+            recipe. Must be a power of two and must divide 24 attention heads,
+            so 1, 2, 4 and 8.
+
+            Cores are not free: the workers take ``tp_core_ids``, T5 takes
+            ``worker_device_index``, and this process keeps its own for CLIP and
+            the VAE. At the default ``logical-neuroncore-config: 2`` a
+            trn2.3xlarge has four logical cores in total, which is exactly what
+            ``tp_degree=2`` needs; ``tp_degree=4`` needs eight, i.e. LNC=1.
+        tp_core_ids: Physical logical-core ids for the transformer workers, one
+            per rank. Defaults to ``0..tp_degree-1``. Each becomes that worker's
+            ``NEURON_RT_VISIBLE_CORES``, so these are in the same namespace as
+            ``worker_device_index`` and must not collide with it or with the
+            core this process holds.
         fuse_scheduler_step: Fold the FlowMatchEulerDiscreteScheduler update
             into the compiled step graph so latents never leave the device
             during denoising. See NeuronFluxTransformer for the exact update.
@@ -111,6 +129,8 @@ class FluxNeuronConfig:
     on_device: tuple[str, ...] = DEFAULT_ON_DEVICE
     text_encoder_worker: bool = True
     worker_device_index: int = 1
+    tp_degree: int = 1
+    tp_core_ids: tuple[int, ...] | None = None
     fuse_scheduler_step: bool = True
     use_nki_attention: bool = True
     optimization_level: int = 1
@@ -147,6 +167,32 @@ class FluxNeuronConfig:
         if not 1 <= self.optimization_level <= 3:
             raise ValueError(
                 f"optimization_level={self.optimization_level} must be in [1, 3]."
+            )
+        if self.tp_degree < 1 or self.tp_degree & (self.tp_degree - 1):
+            raise ValueError(
+                f"tp_degree={self.tp_degree} must be a power of two. Neuron's "
+                "replica groups, and every TP degree the LLM path supports, are "
+                "powers of two."
+            )
+        if self.tp_core_ids is None:
+            self.tp_core_ids = tuple(range(self.tp_degree))
+        else:
+            self.tp_core_ids = tuple(self.tp_core_ids)
+            if len(self.tp_core_ids) != self.tp_degree:
+                raise ValueError(
+                    f"tp_core_ids={self.tp_core_ids} has "
+                    f"{len(self.tp_core_ids)} entries but tp_degree is "
+                    f"{self.tp_degree}; one core per rank."
+                )
+            if len(set(self.tp_core_ids)) != len(self.tp_core_ids):
+                raise ValueError(f"tp_core_ids={self.tp_core_ids} repeats a core.")
+        if self.tp_degree > 1 and not self.fuse_scheduler_step:
+            # The host scheduler would need the latents back every step, which
+            # is the one transfer the worker protocol exists to avoid.
+            raise ValueError(
+                "tp_degree>1 requires fuse_scheduler_step=True: under tensor "
+                "parallelism the latents stay in the workers for the whole "
+                "denoising loop, so a host-side scheduler step cannot see them."
             )
 
     @property

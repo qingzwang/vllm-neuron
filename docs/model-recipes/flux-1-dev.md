@@ -328,6 +328,29 @@ difference in that second row is mechanical — NxDI rewrites its slot as ~4300 
 copies, this path writes 990 host-padded matrices — and it is why `lora_slots` should
 cover the working set on either stack.
 
+#### Several adapters resident at once
+
+The intended deployment shape: declare the slots at build time, load every adapter
+once at startup, then only ever `set_lora()`. Five adapters at 1024x1024,
+`tp_degree=4`, `lora_max_rank=64`:
+
+| | |
+|---|---|
+| Slot memory | 385 MB per slot per rank, so 1.93 GB per rank for five, on top of the 7.86 GiB of weights |
+| Loading all five at startup | **1.31 s** total (0.13 s for a 22 MiB adapter, 0.47 s for a 585 MiB one) |
+| ms/step, each of the five active | 302.0–303.9, against 303.8 for the base model |
+| `set_lora()` round-robin over five slots | p50 0.28 ms, p90 0.66 ms, max 1.4 ms |
+| A different adapter on every request | 2482 ms per 8-step request, against 2477 ms for a stream that never switches |
+
+Nothing here grows with the number of slots except memory. A step reads one slot
+through `index_select` whichever slot it is, so five resident adapters cost the same
+per step as two, and switching among five costs what switching between two costs.
+
+That makes the sizing arithmetic simple: pick `lora_slots` to cover the adapters you
+serve, and check `lora_slots x 385 MB` against the headroom per core (~22 GiB, less
+the 7.86 GiB of weights and the activations). At `lora_max_rank=16` a slot is 96 MB
+instead, so the widest adapter you actually serve is worth knowing before you build.
+
 #### Slot width
 
 The same rank-16 adapter loaded into progressively wider slots, 512x512:

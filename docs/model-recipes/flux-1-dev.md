@@ -184,7 +184,7 @@ with NeuronFluxPipeline.from_pretrained(CKPT, config) as pipeline:
 
     pipeline.set_lora("realism")
     image_a, _ = pipeline.generate(prompt, num_inference_steps=28)
-    pipeline.set_lora("superreal")      # ~0.6 ms
+    pipeline.set_lora("superreal")      # ~0.4 ms
     image_b, _ = pipeline.generate(prompt, num_inference_steps=28)
     pipeline.set_lora(None)             # back to the unmodified model
 ```
@@ -233,10 +233,10 @@ Two properties of the backend, both verified directly rather than assumed:
   same one-element tensor and does an `index_select` on its slot dimension, so
   switching adapters writes four bytes rather than moving weights.
 
-That second point is what makes switching cheap. A full adapter is hundreds of MB
-spread over ~1500 small tensors per rank; moving it takes hundreds of milliseconds
-to seconds, and slots exist precisely so that cost is paid once per adapter rather
-than once per switch.
+That second point is what makes switching cheap. A slot is hundreds of MB spread over
+990 small tensors per rank (two per adapted module); writing one takes tenths of a
+second, and slots exist precisely so that cost is paid once per adapter rather than
+once per switch.
 
 ### Cost
 
@@ -244,8 +244,8 @@ than once per switch.
 
 | Operation | Cost |
 |---|---|
-| `set_lora(...)` between loaded adapters | **0.5–1.0 ms** |
-| `load_lora(...)`, 22 MiB adapter (152 modules) | 0.13–0.14 s |
+| `set_lora(...)` between loaded adapters | **p50 0.4 ms, p90 0.9 ms** |
+| `load_lora(...)`, 22 MiB adapter (152 modules) | 0.14 s |
 | `load_lora(...)`, 585 MiB adapter (494 modules) | 0.44–0.58 s |
 | Per-step, adapter active vs slot 0 *in the same build*, 512x512 | 116.3–117.4 ms against 115.3 ms |
 | Per-step, adapter active vs slot 0 *in the same build*, 1024x1024 | 304.0–304.8 ms against 303.6 ms |
@@ -268,6 +268,67 @@ adapters are served, leave it at 0 if not. NxD Inference's LoRA path shows the s
 within-build result — a resident adapter at 75.7 ms/step against 74.1 ms for no
 adapter — and its numbers, like the first table here, are measured inside a
 LoRA-enabled model.
+
+#### The switch itself
+
+600 calls per resolution — alternating the two adapters, going back to the base
+model, and re-selecting the slot that was already selected:
+
+| `set_lora(...)` | p50 | p90 | min | max |
+|---|---|---|---|---|
+| alternating two adapters, 512x512 | 0.38 ms | 0.91 ms | 0.21 ms | 1.54 ms |
+| adapter → base → adapter, 512x512 | 0.44 ms | 0.84 ms | 0.18 ms | 1.58 ms |
+| re-selecting the same slot, 512x512 | 0.41 ms | 0.84 ms | 0.19 ms | 1.28 ms |
+| alternating two adapters, 1024x1024 | 0.49 ms | 1.00 ms | 0.20 ms | 1.53 ms |
+| adapter → base → adapter, 1024x1024 | 0.47 ms | 0.98 ms | 0.20 ms | 1.79 ms |
+
+Neither what you switch to nor the resolution changes it: the call writes four bytes
+into one device tensor and waits for every rank to confirm the write landed. The
+sub-millisecond figure is the whole cost, host round-trip included.
+
+None of it is deferred to the next request either — a switch invalidates nothing the
+graph holds, so the first step after one is not a special step:
+
+| | first step | the steps after it, same request |
+|---|---|---|
+| 1024x1024, switch immediately before | 303.3 ms | 303.4 ms |
+| 1024x1024, no switch before it | 304.3 ms | — |
+| 512x512, switch immediately before | 114.6 ms | 115.0 ms |
+| 512x512, no switch before it | 114.0 ms | — |
+
+And a stream that changes adapter on every single request costs what a stream that
+never switches costs (8 steps per request, medians of 6):
+
+| | 512x512 | 1024x1024 |
+|---|---|---|
+| adapter changes every request | 959 ms | 2481 ms |
+| same adapter throughout | 966 ms | 2477 ms |
+
+Both differences are inside run-to-run spread, in both directions. This is the
+practical claim: per-request adapter selection does not appear in request latency at
+all, as long as the adapters are resident in slots. NxD Inference's equivalent case —
+an adapter that is *not* resident — costs a +1.8 s swap per request there, which is
+why sizing slots for the working set is the whole optimisation on both sides.
+
+#### Slot width
+
+The same rank-16 adapter loaded into progressively wider slots, 512x512:
+
+| `lora_max_rank` | slot memory per rank | `load_lora` | switch p50 | ms/step |
+|---|---|---|---|---|
+| 16 | 96 MB | 0.044 s | 0.29 ms | 114.4 |
+| 32 | 193 MB | 0.077 s | 0.32 ms | 116.3 |
+| 64 | 385 MB | 0.139 s | 0.35 ms | 116.5 |
+
+Memory is exactly linear in the slot width, and so is loading: a load rewrites the
+whole padded slot, so an adapter narrower than the slot costs what the *slot* costs,
+not what the adapter weighs. An adapter *wider* than the slot is rejected rather than
+truncated. Switching is flat, as it has to be — four bytes either way.
+
+NxD Inference's sweep over the same widths gives 940 ms / 1322 ms / 1754 ms for its
+host-to-device swap, with roughly 0.7 s of that a fixed cost of issuing ~4300 small
+copies. This path writes 990 host-padded matrices instead, which is where the order
+of magnitude between 1.75 s and 0.139 s comes from.
 
 Slot memory scales with `lora_max_rank`, so set it to the widest adapter you actually
 use.

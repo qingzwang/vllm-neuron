@@ -530,7 +530,7 @@ with NeuronFluxPipeline.from_pretrained(CKPT, config) as pipeline:
 
     pipeline.set_lora("realism")
     image_a, _ = pipeline.generate(prompt, num_inference_steps=28)
-    pipeline.set_lora("superreal")     # 约 0.6 ms
+    pipeline.set_lora("superreal")     # 约 0.4 ms
     image_b, _ = pipeline.generate(prompt, num_inference_steps=28)
     pipeline.set_lora(None)            # 回到未改的模型
 ```
@@ -583,16 +583,16 @@ diffusers/PEFT、kohya、XLabs 三种格式都能读（文件交给
 2. **选择用的索引也可以是设备张量。** 每个被适配的层读的是**同一个**一元素张量，在槽位维
    上做 `index_select`。所以切 adapter 写的是 4 个字节，不是搬权重。
 
-第 2 条才是切换便宜的原因。一个完整的 adapter 在每个 rank 上是几百 MB、散在一千多个小
-张量里，搬一次要几百毫秒到几秒；槽位存在的意义就是让这个代价**每个 adapter 付一次**，而
-不是每次切换都付。
+第 2 条才是切换便宜的原因。一个槽位在每个 rank 上是几百 MB、散在 990 个小张量里（每个被适配
+的模块两个），写一次要零点几秒；槽位存在的意义就是让这个代价**每个 adapter 付一次**，而不是
+每次切换都付。
 
 ### 实测（tp=4，2 个槽位，rank 64）
 
 | 操作 | 耗时 |
 |---|---|
-| `set_lora(...)` 在已加载的 adapter 之间切 | **0.5–1.0 ms** |
-| `load_lora(...)`，22 MiB 的 adapter（152 个模块） | 0.13–0.14 s |
+| `set_lora(...)` 在已加载的 adapter 之间切 | **p50 0.4 ms、p90 0.9 ms** |
+| `load_lora(...)`，22 MiB 的 adapter（152 个模块） | 0.14 s |
 | `load_lora(...)`，585 MiB 的 adapter（494 个模块） | 0.44–0.58 s |
 | 每步：**同一个编译好的模型里**，adapter 生效 vs 槽位 0，512×512 | 116.3–117.4 ms vs 115.3 ms |
 | 每步：同上，1024×1024 | 304.0–304.8 ms vs 303.6 ms |
@@ -611,6 +611,59 @@ diffusers/PEFT、kohya、XLabs 三种格式都能读（文件交给
 所以 `lora_slots` 是部署级别的决定，不是每个请求的决定：要服务 adapter 就开，不服务就留 0。
 NxD Inference 的 LoRA 路径给出的是同一个"同图之内"的结论——槽位里已有的 adapter 75.7 ms/step，
 对比不用 adapter 的 74.1 ms——它的数字和上面第一张表一样，都是在 LoRA 模型内部测的。
+
+#### 切换到底要多久
+
+每个分辨率各 600 次调用——在两个 adapter 之间来回切、切回底模、以及重复选中已经选中的那个槽位：
+
+| `set_lora(...)` | p50 | p90 | min | max |
+|---|---|---|---|---|
+| 两个 adapter 交替，512×512 | 0.38 ms | 0.91 ms | 0.21 ms | 1.54 ms |
+| adapter → 底模 → adapter，512×512 | 0.44 ms | 0.84 ms | 0.18 ms | 1.58 ms |
+| 重选同一个槽位，512×512 | 0.41 ms | 0.84 ms | 0.19 ms | 1.28 ms |
+| 两个 adapter 交替，1024×1024 | 0.49 ms | 1.00 ms | 0.20 ms | 1.53 ms |
+| adapter → 底模 → adapter，1024×1024 | 0.47 ms | 0.98 ms | 0.20 ms | 1.79 ms |
+
+切到哪儿、什么分辨率，都不影响：这个调用往一个设备张量里写 4 个字节，然后等每个 rank 确认写
+到了。亚毫秒这个数就是全部代价，来回一趟 host 也算在里面。
+
+代价也没有被推到下一次请求上——切换不会让图里任何东西失效，所以切完之后的第一步不是特殊的一步：
+
+| | 第一步 | 同一次请求里后面几步 |
+|---|---|---|
+| 1024×1024，紧接着切换之后 | 303.3 ms | 303.4 ms |
+| 1024×1024，前面没有切换 | 304.3 ms | — |
+| 512×512，紧接着切换之后 | 114.6 ms | 115.0 ms |
+| 512×512，前面没有切换 | 114.0 ms | — |
+
+**每个请求都换 adapter** 的流，和从不换的流一样快（每请求 8 步，6 次中位数）：
+
+| | 512×512 | 1024×1024 |
+|---|---|---|
+| 每个请求都换 adapter | 959 ms | 2481 ms |
+| 全程同一个 adapter | 966 ms | 2477 ms |
+
+两边的差都在抖动范围内，而且方向还不一致。这才是能用的结论：**只要 adapter 在槽位里，按请求
+选 adapter 在请求延时上完全看不出来。** NxD Inference 那边对应的情形是 adapter **不在**槽位
+里，每个请求要付 +1.8 s 的 swap——所以两边的优化都是同一件事：让热的 adapter 常驻。
+
+#### 槽位宽度的影响
+
+同一个 rank 16 的 adapter，装进越来越宽的槽位，512×512：
+
+| `lora_max_rank` | 每 rank 每槽显存 | `load_lora` | 切换 p50 | ms/step |
+|---|---|---|---|---|
+| 16 | 96 MB | 0.044 s | 0.29 ms | 114.4 |
+| 32 | 193 MB | 0.077 s | 0.32 ms | 116.3 |
+| 64 | 385 MB | 0.139 s | 0.35 ms | 116.5 |
+
+显存严格和槽位宽度成正比，加载也是：加载会重写整个补零后的槽位，所以比槽位窄的 adapter 付的
+是**槽位**的代价，不是它自己的大小。比槽位宽的 adapter 会被拒绝，而不是被截断。切换是平的
+——反正都是 4 个字节。
+
+NxD Inference 在同样三个宽度上的 host→device swap 是 940 ms / 1322 ms / 1754 ms，其中约 0.7 s
+是发出约 4300 次小拷贝的固定开销。这边写的是 990 个在 host 上补好零的矩阵，这就是 1.75 s 和
+0.139 s 之间那个量级差的来源。
 
 槽位显存和 `lora_max_rank` 成正比，所以按你真正会用的最大 rank 设。
 

@@ -182,6 +182,11 @@ fails to bring the runtime up at all, so the totals above are hard. **On a
 trn2.3xlarge, `tp_degree=2` is the largest fully on-device configuration.**
 `tp_degree=4` needs six cores, which any larger trn2 has.
 
+Two of those cores do very little: T5's runs for ~0.1 s per request and this
+process's only for the VAE decode. Sharding the transformer over four ranks
+therefore costs six cores here where an implementation that shards every component
+would need four — see "what it costs" below.
+
 `NEURON_LOGICAL_NC_CONFIG=1` would produce eight cores on this instance, but it is
 not the answer here: each is one physical NeuronCore-v3 instead of a fused pair,
 so an 8B transformer gets half the compute per rank — measured at 1227 ms/step
@@ -236,24 +241,47 @@ like this — it lands below cos 0.9 and is obvious in the image.
 the sample at the top of this page, which was generated at `tp_degree=1`. The two
 differ by a mean of 1.35/255 per channel.*
 
-### Why tp_degree=1 fits here
+### Why tp_degree=1 fits here, and what it costs
 
-Worth knowing if you have run FLUX under NxD Inference, where TP=1 does not fit at
-all: there the four components are all sharded by the same TP degree, so TP=1 puts
-every one of them on a single core — 15.20 GiB of transformer plus 8.87 of T5 plus
-0.37 of CLIP and VAE, which is 24.44 GiB against ~22 GiB of usable HBM. It
-compiles and loads, then dies asking for activation space
+Worth knowing if you have run FLUX under NxD Inference, where TP=1 fails outright
+with an out-of-memory. There the four components are all sharded by the same TP
+degree, so TP=1 puts every one of them on a single core — 15.20 GiB of transformer
+plus 8.87 of T5 plus 0.37 of CLIP and VAE, or 24.44 GiB against ~22 GiB of usable
+HBM. It compiles and loads, then dies asking for activation space
 (`NRT_RESOURCE in nrt_tensor_allocate`). TP=2 is the floor there.
 
-This pipeline splits by *placement* instead: the transformer, CLIP and the VAE
-(15.57 GiB) stay on one core and T5 goes to a second core in a child process — a
-different HBM partition — so each partition holds well under its budget and
-`tp_degree=1` runs. Tensor parallelism then shards the transformer further on top
-of that placement, rather than replacing it.
+`tp_degree=1` runs here, but not because it needs less memory. **Both
+arrangements occupy two logical cores and therefore two ~22 GiB partitions**;
+24.44 GiB does not fit in one partition either way. The difference is what the
+second core does:
 
-The two implementations agree on what sharding buys, which is a useful check on
-both: NxD Inference measures 217 ms/step at TP=4 and 406 at TP=2 for the same
-checkpoint and resolution, against 214 and 392 here.
+- NxD Inference at TP=2: each core holds half of every model, and both cores
+  compute every stage.
+- Here at `tp_degree=1`: one core holds the transformer whole and runs all the
+  denoising; the second holds T5 and is idle for the rest of the request. In a
+  28-step 1024x1024 request it does 0.098 s of work against the first core's
+  22.6 s.
+
+Which means the placement split does not use those cores as well. At equal core
+count, for the same checkpoint, resolution and step count:
+
+| Cores | This pipeline | ms/step | NxD Inference | ms/step |
+|---|---|---|---|---|
+| 2 | `tp_degree=1`, T5 on the second core | 791 | TP=2, everything sharded | 406 |
+| 4 | `tp_degree=2`, plus T5 and this process | 392 | TP=4, everything sharded | 217 |
+
+So what the placement split buys is the ability to run at all with an unsharded
+transformer, and a T5 that is 16x faster than CPU; what it costs is roughly half
+the throughput per core. The two implementations do agree on what sharding itself
+buys — 214 against 217 ms/step at four ranks, 392 against 406 at two — which is a
+useful check on both.
+
+The reason it is arranged this way is that a process drives exactly one core, so
+components in different processes cannot share one: CLIP and the VAE live in the
+pipeline process, T5 in its worker, each holding a core outright. Moving all four
+into the tensor-parallel workers — T5, CLIP and the VAE as extra graphs on rank 0 —
+would free two cores and let `tp_degree=4` run fully on device on a trn2.3xlarge.
+Not done; the placement split predates tensor parallelism here.
 
 ### Cost of the split
 

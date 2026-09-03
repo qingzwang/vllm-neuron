@@ -179,8 +179,8 @@ DLAMI 里有两个 Neuron 的 venv，**互相冲突，不要混用**：
 | `aws_neuronx_venv_jax_0_10` | JAX | 与本文无关 |
 
 如果你还用过 NxD Inference（`torch-neuronx` + `neuronx-distributed`），那是**第三套**
-栈，和这里的 `libtorch-neuronx-lite` 在 `torch`、`torch-xla`、`transformers` 上都冲突，
-必须各自一个 venv，不要试图合并。
+栈，和这里的 `libtorch-neuronx-lite` 冲突，必须各自一个 venv——机器上只有 NxDI 环境时
+怎么加这一条栈，见本节末尾。
 
 ```bash
 V=/opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0
@@ -194,6 +194,74 @@ $V/bin/pip list | grep -iE "^(vllm|vllm-neuron|libtorch-neuronx-lite|torch|neuro
 vllm 0.24.0 | vllm-neuron 0.24.0.1.1.0 | libtorch-neuronx-lite 2.11.0.1.0.1284
 torch 2.11.0 | neuronx-cc 2.27.5334.0 | transformers 5.15.0 | Python 3.12
 ```
+
+#### 已经有 NxDI 环境、想再加 vllm-neuron
+
+这是很常见的情形：驱动装好了，机器上也已经有一个 NxD Inference 的 venv，现在要把
+vllm-neuron 也跑起来。
+
+**好消息是系统层不用动。** 驱动、运行时、集合通信、工具都是 apt 装的系统级组件，**两条
+栈共用同一份**——两边的 Python 库链的都是同一个 `libnrt.so.1`：
+
+```bash
+# vllm-neuron 这条栈
+ldd .../site-packages/libtorch_neuronx_lite/lib/libtorchneuron.so | grep nrt
+#   libnrt.so.1 => /opt/aws/neuron/lib/libnrt.so.1
+# NxDI 那条栈
+ldd .../site-packages/libneuronxla/libneuronpjrt.so | grep nrt
+#   libnrt.so.1 => /opt/aws/neuron/lib/libnrt.so.1
+```
+
+所以「驱动有了」就等于系统层这一半已经就绪，要加的只有 Python 层。
+
+**必须新建一个 venv，不要往 NxDI 那个里装。** 两条栈在四个包上都要换版本，装一起等于把
+先装的那个弄坏。本机两个 venv 的实测对照：
+
+| | vllm-neuron 栈 | NxDI 栈 |
+|---|---|---|
+| Neuron 层 | `libtorch-neuronx-lite` 2.11.0.1.0.1284 | `torch-neuronx` 2.9.0.2.15 |
+| torch | 2.11.0 | 2.9.1 |
+| torch-xla | 2.11.0 | 2.9.0 |
+| transformers | 5.15.0 | 4.57.6 |
+| neuronx-cc | 2.27.5334.0 | **2.26.6360.0** |
+
+```bash
+python3 -m venv /mnt/nvme/venv-vllm-neuron       # 和 NxDI 的 venv 平级、互不影响
+V=/mnt/nvme/venv-vllm-neuron
+$V/bin/pip install --upgrade pip
+$V/bin/pip install "vllm-neuron==0.24.*" "neuronx-cc==2.27.*" \
+    --extra-index-url https://pip.repos.neuron.amazonaws.com
+```
+
+之后照 1.5（diffusers）和 1.6（仓库代码）做完就行。
+
+**要特别小心 PATH。** 两个 venv 各自带一个 `neuronx-cc` 可执行文件，而且版本不同；编译器
+是用 `shutil.which` 找的，**谁在 PATH 前面就用谁**。用 NxDI 的 2.26 去编 vllm-neuron 的图
+（或者反过来）会得到很难联想到原因的失败。每次进环境先确认一遍：
+
+```bash
+export PATH=$V/bin:/opt/aws/neuron/bin:$PATH
+which neuronx-cc          # 应该指向 $V/bin
+neuronx-cc --version      # 应该是 2.27.x（NxDI 那边应该是 2.26.6360.0）
+```
+
+不要在同一个 shell 里同时 export 两个 venv 的 `PATH`/`PYTHONPATH`。分两个 shell，或者写
+两个小的 `env-vllm.sh` / `env-nxdi.sh` 分别 source。
+
+**运行时版本得够新。** 系统那份 runtime 是共用的，如果它比 1.3 的表更老，先升：
+
+```bash
+sudo apt-get update
+sudo apt-get install --only-upgrade \
+    aws-neuronx-runtime-lib aws-neuronx-collectives aws-neuronx-tools
+# 驱动也要升的话（要重新加载模块，最省事是重启）
+sudo apt-get install --only-upgrade aws-neuronx-dkms
+```
+
+注意这一步对 NxDI 那条栈同样生效——它们共用，所以升级前留意一下那边是否有版本要求。
+
+**编译缓存互不干扰**，不用管：这条栈默认写 `~/.cache/neuron_libtorch`，NxDI 那条写
+`/var/tmp/neuron-compile-cache`，两个目录各自独立。
 
 ### 1.5 装 diffusers（FLUX 的额外依赖）
 

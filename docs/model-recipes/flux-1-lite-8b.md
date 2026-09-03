@@ -227,10 +227,33 @@ BF16 that shows up. Same seed and prompt, comparing final latents:
 | 1024x1024, TP=1 vs TP=2 | 28 | 0.998331 | 2.65 | 1.29 |
 
 The 28-step figure is lower because reassociation error accumulates over the
-chain, not because more of the model is sharded. Decoded, the two 1024x1024
-images differ by a mean of 1.35/255 per channel and are visually
-indistinguishable. A sharding mistake looks nothing like this — it lands below
-cos 0.9 and is obvious in the image.
+chain, not because more of the model is sharded. A sharding mistake looks nothing
+like this — it lands below cos 0.9 and is obvious in the image.
+
+![FLUX.1-lite-8B at tp_degree=2: the same red panda in round glasses reading a book](images/flux-1-lite-8b-tp2.png)
+
+*`tp_degree=2`, 1024x1024, 28 steps, guidance 3.5, seed 42 — the same settings as
+the sample at the top of this page, which was generated at `tp_degree=1`. The two
+differ by a mean of 1.35/255 per channel.*
+
+### Why tp_degree=1 fits here
+
+Worth knowing if you have run FLUX under NxD Inference, where TP=1 does not fit at
+all: there the four components are all sharded by the same TP degree, so TP=1 puts
+every one of them on a single core — 15.20 GiB of transformer plus 8.87 of T5 plus
+0.37 of CLIP and VAE, which is 24.44 GiB against ~22 GiB of usable HBM. It
+compiles and loads, then dies asking for activation space
+(`NRT_RESOURCE in nrt_tensor_allocate`). TP=2 is the floor there.
+
+This pipeline splits by *placement* instead: the transformer, CLIP and the VAE
+(15.57 GiB) stay on one core and T5 goes to a second core in a child process — a
+different HBM partition — so each partition holds well under its budget and
+`tp_degree=1` runs. Tensor parallelism then shards the transformer further on top
+of that placement, rather than replacing it.
+
+The two implementations agree on what sharding buys, which is a useful check on
+both: NxD Inference measures 217 ms/step at TP=4 and 406 at TP=2 for the same
+checkpoint and resolution, against 214 and 392 here.
 
 ### Cost of the split
 

@@ -101,6 +101,10 @@ python examples/vllm_neuron/models/flux/generate.py \
     --output flux_output.png
 ```
 
+![FLUX.1-lite-8B 在 trn2 上的输出：戴圆眼镜看书的小熊猫](../model-recipes/images/flux-1-lite-8b-sample.png)
+
+*1024×1024、28 步、guidance 3.5、seed 42，就是上面那条命令。为了这个页面缩过。*
+
 首次运行会编译四个组件（transformer、VAE、CLIP、T5），几分钟；之后命中缓存，从启动
 到第一张图约 55 秒，大部分时间在从磁盘读权重。
 
@@ -240,9 +244,28 @@ embedding、pooled、guidance、RoPE 表）只在开头发一次，latent 整个
 | 1024×1024，TP=1 vs TP=4 | 4 | 0.999962 | 0.96 | 1.51 |
 | 1024×1024，TP=1 vs TP=2 | 28 | 0.998331 | 2.65 | 1.29 |
 
-28 步那一行低一些，是因为重结合误差在链上累积，不是因为切得更多。解码出来的两张
-1024×1024 图每个通道平均差 1.35/255，肉眼看不出区别。切错的话根本不是这个量级
-——会掉到 cos 0.9 以下，图上一眼就能看出来。
+28 步那一行低一些，是因为重结合误差在链上累积，不是因为切得更多。切错的话根本不是
+这个量级——会掉到 cos 0.9 以下，图上一眼就能看出来。
+
+![tp_degree=2 的输出：同一只小熊猫](../model-recipes/images/flux-1-lite-8b-tp2.png)
+
+*`tp_degree=2`，其余设置和第 2 节那张完全一样（那张是 `tp_degree=1`）。两张图每个通道
+平均差 1.35/255，肉眼看不出区别。*
+
+### 为什么这里 TP=1 能跑
+
+如果你在 NxD Inference 里跑过 FLUX，会发现那边 TP=1 根本跑不起来，报显存不够。原因是
+那边**四个组件都按同一个 TP 度数切**，TP=1 就等于把四个模型全压在一个核上：
+transformer 15.20 GiB + T5 8.87 GiB + CLIP/VAE 0.37 GiB = 24.44 GiB，而一个核可用的
+HBM 只有约 22 GiB。它能编译、也能加载，然后在要激活空间时死掉
+（`NRT_RESOURCE in nrt_tensor_allocate`）。所以那边 TP=2 是下限。
+
+这条 pipeline 拆的是**放置**而不是张量：transformer + CLIP + VAE（15.57 GiB）留在一个
+核上，T5 放到另一个核的子进程里——那是另一块 HBM 分区——两块都远没到上限，所以
+`tp_degree=1` 跑得动。张量并行是在这个放置**之上**再切 transformer，不是替代它。
+
+两套实现对「切了能快多少」的结论是一致的，这本身也是个交叉验证：同样的 checkpoint 和
+分辨率，NxD Inference 量到 TP=4 217 ms/step、TP=2 406 ms/step，这边是 214 和 392。
 
 ---
 

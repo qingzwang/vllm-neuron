@@ -411,6 +411,14 @@ prompt itself.
 Switching also has to be lossless: switching away from an adapter and back reproduces
 the earlier latents **bit for bit**, and so does returning to slot 0.
 
+Slot 0 is the base model, and stays the base model: after both adapters had been
+loaded and selected, returning to slot 0 reproduced the first base image bit for bit.
+It is *not* bit-identical to a model compiled without slots, though — cos 0.999835,
+max abs 0.31 against a latent std of 1.12 after 4 steps. A zero slot contributes an
+exact zero, so this is not the delta: the extra ops change how the compiler schedules
+the rest of the graph, the same way a different `tp_degree` does. Treat a seed as
+reproducible within one build configuration, `lora_slots` included.
+
 And the result must not depend on the history that led to it. Two processes loaded the
 two adapters in opposite orders — so `xlabs` sat in slot 1 in one and slot 2 in the
 other — and took different swap paths before ending on the same three requests. All

@@ -16,47 +16,22 @@ Usage:
     python examples/vllm_neuron/models/flux/generate.py \
         --prompt "..." --steps 8 --max-sequence-length 256 --size 512
 
-    # Run a component on CPU instead of Neuron (A/B comparison)
-    python examples/vllm_neuron/models/flux/generate.py \
-        --prompt "..." --on-device transformer
-
-    # Shard the transformer over two cores: ~2x faster per step
-    python examples/vllm_neuron/models/flux/generate.py --prompt "..." --tp 2
+    # Four cores instead of two: ~1.9x faster per step
+    python examples/vllm_neuron/models/flux/generate.py --prompt "..." --tp 4
 """
 
 import argparse
 import json
 import logging
 import os
-import sys
 
-# The T5 encoder runs on a second logical NeuronCore, in a child process. A
-# process that does not restrict itself claims *every* core when the Neuron
-# runtime initializes, leaving none for that child -- so pin this one to a single
-# core here, before importing vllm_neuron triggers the init. Override
-# NEURON_RT_VISIBLE_CORES in the environment to use a different core.
-#
-# With --tp above 1 the transformer moves into its own worker per rank: ranks take
-# cores 0..tp-1, T5 takes core tp, and this process keeps core tp+1 for CLIP and
-# the VAE. Cores are exclusive, so that layout has to be settled before the
-# import, which is why --tp is read here rather than after parse_args().
-
-
-def _tp_from_argv() -> int:
-    for i, arg in enumerate(sys.argv):
-        if arg == "--tp" and i + 1 < len(sys.argv):
-            return int(sys.argv[i + 1])
-        if arg.startswith("--tp="):
-            return int(arg.split("=", 1)[1])
-    return 1
-
-
-_TP = _tp_from_argv()
-os.environ.setdefault("NEURON_RT_VISIBLE_CORES", str(_TP + 1) if _TP > 1 else "0")
+# Nothing here touches the device: the model is tensor-parallel across
+# --tp NeuronCores, one rank process each, and those processes own it. This one
+# tokenizes, drives the loop and saves the image. So no core pinning is needed
+# for this process -- the ranks pin themselves.
 os.environ.setdefault("NEURON_LIBTORCH_COMPILATION_TIMEOUT", "3600")
 
 from vllm_neuron.model.flux import FluxNeuronConfig, NeuronFluxPipeline
-from vllm_neuron.model.flux.config import DEFAULT_ON_DEVICE
 
 DEFAULT_PROMPT = (
     "A close-up photo of a red panda wearing tiny round glasses, reading a "
@@ -97,18 +72,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--on-device",
-        default=",".join(DEFAULT_ON_DEVICE),
-        help="Comma-separated components to place on Neuron. Anything omitted "
-        "runs on CPU in eager mode.",
-    )
-    parser.add_argument(
         "--tp",
         type=int,
-        default=1,
-        help="Shard the transformer across this many NeuronCores (power of two, "
-        "and it must divide the 24 attention heads). tp=4 needs eight logical "
-        "cores, i.e. NEURON_LOGICAL_NC_CONFIG=1.",
+        default=2,
+        help="How many NeuronCores to shard the model over: 2, 4 or 8. There is "
+        "no 1 -- the four components are 24.44 GiB of BF16 weights against a "
+        "~22 GiB HBM partition. A trn2.3xlarge has four logical cores.",
     )
     parser.add_argument(
         "--optimization-level",
@@ -137,13 +106,10 @@ def main() -> None:
         height=args.size,
         width=args.size,
         max_sequence_length=args.max_sequence_length,
-        on_device=tuple(c for c in args.on_device.split(",") if c),
         optimization_level=args.optimization_level,
         tp_degree=args.tp,
-        tp_core_ids=tuple(range(args.tp)) if args.tp > 1 else None,
-        worker_device_index=args.tp if args.tp > 1 else 1,
     )
-    # `with` releases the T5 worker's NeuronCore on the way out.
+    # `with` releases the ranks' NeuronCores on the way out.
     with NeuronFluxPipeline.from_pretrained(args.model_checkpoint, config) as pipeline:
         pipeline.compile()
 
@@ -160,7 +126,8 @@ def main() -> None:
     image.save(args.output)
 
     print(f"\nSaved {args.size}x{args.size} image to {args.output}")
-    print(f"Placement:    {json.dumps(pipeline.placement)}")
+    print(f"Parallelism:  tp_degree={config.tp_degree} on cores "
+          f"{list(config.tp_core_ids)}")
     print(
         f"Compile time: "
         f"{json.dumps({k: round(v / 1e3, 1) for k, v in pipeline.compile_ms.items()})} s"

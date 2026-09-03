@@ -45,6 +45,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
 
+from transformers.models.t5.modeling_t5 import T5Attention
+
 from vllm_neuron.envs import is_native_backend
 from vllm_neuron.nn import ColumnParallelLinear
 
@@ -278,5 +280,78 @@ def shard_flux_transformer(
         replaced,
         heads // tp_size,
         heads,
+    )
+    return replaced
+
+
+def shard_t5_encoder(encoder: nn.Module, tp_group=None) -> int:
+    """Shard a T5 encoder across a tensor-parallel group, in place.
+
+    Same idea as the transformer -- heads and the feed-forward width -- with two
+    T5 specifics:
+
+    * ``T5Attention`` reshapes with ``self.n_heads`` and ``self.inner_dim`` rather
+      than inferring them from the tensor, so both have to be reduced to this
+      rank's share after the projections are sharded.
+    * The relative-attention bias is an ``Embedding(buckets, heads)`` that only
+      block 0 owns; it is computed once there and threaded through every later
+      block as ``position_bias``. Sharding it along the head axis is what keeps
+      that consistent with the sharded attention -- every block then sees exactly
+      its own heads' biases.
+
+    T5-XXL has no biases anywhere, so nothing needs the after-reduce bias path.
+
+    Args:
+        encoder: A loaded ``T5EncoderModel`` (or its ``.encoder``). Its dense
+            layers are replaced and their weights consumed.
+        tp_group: Process group to shard over, or None for the default world.
+
+    Returns:
+        Number of layers replaced.
+
+    Raises:
+        ValueError: If the head count or feed-forward width does not divide.
+    """
+    tp_size, tp_rank, tp_group = tp_world(tp_group)
+    if tp_size == 1:
+        return 0
+
+    replaced = 0
+    for attn in (m for m in encoder.modules() if isinstance(m, T5Attention)):
+        if attn.n_heads % tp_size:
+            raise ValueError(
+                f"{attn.n_heads} T5 heads do not divide across tp_size {tp_size}"
+            )
+        for name in ("q", "k", "v"):
+            _set(attn, name, _column(getattr(attn, name), tp_group))
+            replaced += 1
+        _set(attn, "o", RowParallelLinear(attn.o, tp_group))
+        replaced += 1
+
+        if attn.has_relative_attention_bias:
+            # [buckets, heads] -> this rank's heads.
+            weight = attn.relative_attention_bias.weight.data
+            heads = weight.shape[1] // tp_size
+            start = tp_rank * heads
+            local = nn.Embedding(weight.shape[0], heads)
+            local.weight = nn.Parameter(
+                weight[:, start : start + heads].clone(), requires_grad=False
+            )
+            _set(attn, "relative_attention_bias", local)
+            replaced += 1
+
+        attn.n_heads = attn.n_heads // tp_size
+        attn.inner_dim = attn.n_heads * attn.key_value_proj_dim
+
+    for block in encoder.block if hasattr(encoder, "block") else encoder.encoder.block:
+        ff = block.layer[-1].DenseReluDense
+        for name in ("wi_0", "wi_1") if hasattr(ff, "wi_0") else ("wi",):
+            _set(ff, name, _column(getattr(ff, name), tp_group))
+            replaced += 1
+        _set(ff, "wo", RowParallelLinear(ff.wo, tp_group))
+        replaced += 1
+
+    logger.info(
+        "T5 encoder sharded over %d ranks: %d layers replaced", tp_size, replaced
     )
     return replaced

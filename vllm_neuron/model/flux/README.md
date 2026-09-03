@@ -26,28 +26,36 @@ reuse the parts of this package that are not LM-specific:
 
 | File | Contents |
 | --- | --- |
-| `config.py` | `FluxNeuronConfig`: resolution, prompt budget, component placement, compiler flags |
+| `config.py` | `FluxNeuronConfig`: resolution, prompt budget, TP degree, compiler flags |
 | `attention.py` | `NeuronFluxAttnProcessor` — diffusers' joint attention over the NKI kernel |
 | `transformer.py` | `NeuronFluxTransformer` — one denoising step as a single static graph |
+| `parallel.py` | Tensor-parallel sharding for the transformer and the T5 encoder |
 | `vae.py` | Staged VAE decode and the nearest-upsample rewrite |
-| `text_encoder_worker.py` | T5 on a second logical core, in a child process |
-| `pipeline.py` | `NeuronFluxPipeline` — load, place, compile, generate, time |
+| `worker.py` | What one rank runs: every network, on its core, plus the command protocol |
+| `tp.py` | The ranks from the pipeline's side, over `utils.executor.MPExecutor` |
+| `pipeline.py` | `NeuronFluxPipeline` — tokenize, drive the loop, postprocess |
 
-## Placement
+## Parallelism
 
-All four networks run on Neuron, across two logical cores:
+The model is tensor-parallel across `tp_degree` logical NeuronCores, one process
+per core, because the compile backend loads every NEFF onto the process's own core
+(`start_nc = 0` plus the distributed rank) and a core belongs to one process. Those
+processes hold every network; the pipeline process holds none.
 
-| Core | Components |
-| --- | --- |
-| 0 (this process) | transformer, VAE decoder, CLIP |
-| 1 (child process) | T5-XXL |
+| Component | Across ranks | Why |
+| --- | --- | --- |
+| `transformer` | sharded | 15.2 GiB, 28 invocations per request: the whole cost |
+| `text_encoder_2` (T5-XXL) | sharded | 8.9 GiB, divides cleanly on 64 heads |
+| `text_encoder` (CLIP-L) | replicated | 0.22 GiB; sharding would add collectives to save nothing |
+| `vae` (decoder) | replicated | 0.15 GiB, convolutional, once per request |
 
-T5 needs its own core for two independent reasons: an HBM partition holds
-~22 GiB against 15.2 GiB of transformer plus 8.9 GiB of T5, and the compile
-backend loads every NEFF onto the process's own core (`start_nc = 0` plus the
-distributed rank), so one process cannot drive two. The caller has to leave a
-core free — `NEURON_RT_VISIBLE_CORES` before importing `vllm_neuron` — or the
-pipeline says why and keeps T5 on CPU. See the recipe's "Choosing cores".
+Same division as NxD Inference makes for this model. There is no `tp_degree=1`:
+the four components are 24.44 GiB of BF16 weights against a ~22 GiB HBM partition.
+
+Only attention heads and feed-forward widths are split; the residual stream stays
+full width and identical on every rank. The one layer that does not fit that
+pattern is the single-stream block's `proj_out`, whose input is the concatenation
+of two column-parallel outputs — see `parallel.py`.
 
 ## What had to change for Neuron
 
@@ -89,10 +97,9 @@ does. Full numbers in the model recipe.
 
 ## Not implemented
 
-- **Tensor parallelism.** The two cores are used for placement, not speed: the
-  transformer runs on one. It is 97% of a request, so sharding the step graph
-  across a chip's four cores is the highest-value next change.
 - **Batching.** Static shapes are built for batch 1.
+- **Sharded CLIP and VAE.** Both are replicated, so every rank computes them
+  redundantly. They are 0.37 GiB and ~4% of a request, so this costs little.
 - **True classifier-free guidance**, img2img, inpainting, ControlNet, IP-Adapter,
   LoRA.
 - **FLUX.1-schnell** and other `guidance_embeds=False` variants.

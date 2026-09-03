@@ -10,12 +10,13 @@ for usage.
 """
 
 from .attention import NeuronFluxAttnProcessor, neuron_joint_attention
-from .config import FluxNeuronConfig
-from .parallel import shard_flux_transformer
+from .config import SUPPORTED_TP_DEGREES, FluxNeuronConfig
+from .parallel import shard_flux_transformer, shard_t5_encoder
 from .pipeline import GenerationTiming, NeuronFluxPipeline
 from .transformer import NeuronFluxTransformer, build_rotary_embedding
 
 __all__ = [
+    "SUPPORTED_TP_DEGREES",
     "FluxNeuronConfig",
     "GenerationTiming",
     "NeuronFluxAttnProcessor",
@@ -24,4 +25,5 @@ __all__ = [
     "build_rotary_embedding",
     "neuron_joint_attention",
     "shard_flux_transformer",
+    "shard_t5_encoder",
 ]

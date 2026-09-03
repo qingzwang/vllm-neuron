@@ -14,69 +14,56 @@ plane. FLUX has no KV cache, no tokens on the output side, and no autoregressive
 loop, so it does not fit ``NeuronModelRunner``. What it does share with the rest
 of this package is the compilation stack, so this module reuses that directly:
 ``torch.compile`` with the ``neuron_libtorch`` backend, the same ``neuronx-cc``
-flags, and the package's NKI flash-attention kernel.
+flags, the package's NKI flash-attention kernel, and its tensor-parallel layers.
 
 Execution model
 ---------------
-Every component is a separate NEFF. Shapes are fully static (fixed resolution,
-prompt padded to ``max_sequence_length``), so one compilation serves every
-request and there is no bucketing. Per request:
+The model is tensor-parallel across ``tp_degree`` NeuronCores, one process per
+core, because the compile backend binds NEFF execution to the process's own core
+and a core belongs to one process. Those processes hold every network; **this
+process never touches the device**. It tokenizes, samples the initial latents,
+drives the denoising loop, and turns the returned tensor into an image. See
+``worker.py`` for what a rank runs and how the four components are divided.
 
-1. tokenize on host; CLIP + T5 encoders produce the pooled and sequence
-   embeddings (device or CPU per config)
-2. sample initial latents on the host from a seeded generator, pack, move to
-   device once
-3. run ``num_inference_steps`` iterations of the compiled step graph; latents
-   stay on device the whole time
-4. unpack, VAE-decode, postprocess to PIL
+Shapes are fully static (fixed resolution, prompt padded to
+``max_sequence_length``), so one compilation serves every request and there is no
+bucketing. Per request:
+
+1. tokenize on host, then both text encoders run on the ranks and the embeddings
+   stay there
+2. sample initial latents on the host from a seeded generator, pack, send once
+3. ``num_inference_steps`` iterations of the compiled step graph; the latents stay
+   in the ranks the whole time
+4. unpack and VAE-decode on the ranks, postprocess to PIL here
 """
 
 from __future__ import annotations
 
 import contextlib
+import gc
 import logging
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Self
 
 import numpy as np
 import torch
-import torch.nn as nn
 from diffusers import FluxPipeline
 from diffusers.pipelines.flux.pipeline_flux import calculate_shift
 from diffusers.utils.torch_utils import randn_tensor
 
 from .config import FluxNeuronConfig
-from .text_encoder_worker import TextEncoderWorker, explain_core_conflict
-from .tp_transformer import TPTransformer
-from .transformer import (
-    NeuronFluxTransformer,
-    build_rotary_embedding,
-    patch_untraceable_activations,
-)
-from .vae import build_decode_stages, patch_upsampling
+from .worker import CLIP_SEQ_LEN, CONTEXT, DECODE, ENCODE, LATENTS, STEP
 
 logger = logging.getLogger(__name__)
-
-# CLIP's fixed context length; the pooled branch always sees exactly this many
-# tokens, independent of max_sequence_length (which governs T5 only).
-CLIP_SEQ_LEN = 77
-
-# Set once this process has put a component on Neuron, i.e. once the Neuron
-# runtime is initialized. Module scope on purpose: the thing it guards -- forking
-# tensor-parallel workers -- is unsafe from that point on for the whole process,
-# not just for one pipeline. See _start_tp_workers.
-_NRT_INITIALIZED = False
 
 
 @dataclass
 class GenerationTiming:
     """Wall-clock breakdown of one ``generate`` call, in milliseconds.
 
-    Every measurement is taken after the device has been synchronized (NEFF
-    execution is asynchronous), so the parts sum to ``total_ms`` up to host
-    overhead.
+    Every measurement is taken after the ranks have answered, and answering means
+    reading a device tensor, so the parts sum to ``total_ms`` up to host overhead.
     """
 
     encode_ms: float = 0.0
@@ -109,50 +96,31 @@ class GenerationTiming:
         }
 
 
-class _TextEncoder(nn.Module):
-    """Static-shape wrapper so a HF text encoder compiles as one graph.
-
-    FLUX pads both prompts to a fixed length and passes no attention mask, so
-    the only input is a token-id tensor of constant shape.
-    """
-
-    def __init__(self, encoder, pooled: bool) -> None:
-        super().__init__()
-        self.encoder = encoder
-        self.pooled = pooled
-
-    def forward(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        out = self.encoder(input_ids, output_hidden_states=False)
-        embeds = out.pooler_output if self.pooled else out[0]
-        return embeds, embeds.reshape(-1)[:1]
-
-
 class NeuronFluxPipeline:
-    """FLUX.1 text-to-image on Neuron.
+    """FLUX.1 text-to-image on Neuron, tensor-parallel across NeuronCores.
 
-    Occupies one logical NeuronCore, plus a second one for the T5 prompt encoder
-    when ``FluxNeuronConfig.text_encoder_worker`` is set (the default) -- T5 does
-    not fit next to the transformer, and a process can only execute on its own
-    core. That second core is held by a child process for the pipeline's
-    lifetime, so :meth:`close` (or ``with``) matters.
+    Occupies ``config.tp_degree`` logical cores, held by child processes for the
+    pipeline's lifetime -- so :meth:`close` (or ``with``) matters. This process
+    holds none.
 
     Use :meth:`from_pretrained` to build one; the constructor takes an
-    already-loaded diffusers pipeline.
+    already-loaded diffusers pipeline, from which it keeps only the tokenizers,
+    the scheduler and the image processor. The networks are dropped here and
+    loaded again inside each rank, which is also what lets a rank keep just its
+    shard.
 
     Args:
         pipe: A loaded diffusers ``FluxPipeline``.
-        config: Neuron shape/placement config.
-        model_path: Where ``pipe`` was loaded from. Required for the T5 worker,
-            which loads its own copy of the encoder in its own process; without
-            it the worker is skipped.
+        config: Neuron shape/parallelism config.
+        model_path: Where ``pipe`` was loaded from. The ranks load from it too, so
+            it is required.
 
     Attributes:
-        placement: Where each component ended up (``"neuron"`` or ``"cpu"``).
-            Components requested on device that failed to load, compile or start
-            are recorded here as ``"cpu"``.
-        compile_ms: Wall-clock time to make each component ready. For
-            ``text_encoder_2`` on the worker this is the child's whole startup,
-            weight loading included.
+        compile_ms: Wall-clock time to bring the ranks up, weight loading and
+            compilation included.
+
+    Raises:
+        ValueError: If ``model_path`` is None.
     """
 
     def __init__(
@@ -161,51 +129,32 @@ class NeuronFluxPipeline:
         config: FluxNeuronConfig,
         model_path: str | None = None,
     ) -> None:
+        if model_path is None:
+            raise ValueError(
+                "model_path is required: each rank loads its own shard of the "
+                "checkpoint, so it has to know where the checkpoint is."
+            )
         self.config = config
-        self.pipe = pipe
+        self._model_path = model_path
+        self.compile_ms: dict[str, float] = {}
+        self._tp = None
+
         self.scheduler = pipe.scheduler
         self.tokenizer = pipe.tokenizer
         self.tokenizer_2 = pipe.tokenizer_2
         self.image_processor = pipe.image_processor
         self.vae_scale_factor = pipe.vae_scale_factor
+        self._in_channels = pipe.transformer.config.in_channels
+        self._pack = pipe._pack_latents
 
-        self.placement: dict[str, str] = {}
-        self.compile_ms: dict[str, float] = {}
-        self._t5_worker: TextEncoderWorker | None = None
-        self._t5_compiled = None
-        self._tp: TPTransformer | None = None
-        self._model_path = model_path
-
-        # Inference only: without this, components left on CPU run in eager mode
-        # and build an autograd graph, which then blocks the numpy conversion in
-        # postprocessing.
-        for component in (
-            pipe.transformer,
-            pipe.vae,
-            pipe.text_encoder,
-            pipe.text_encoder_2,
-        ):
-            component.requires_grad_(False).eval()
-
-        # Rewrite the ops that do not lower before anything captures references
-        # into the module tree.
-        logger.info(
-            "Rewrote %d GELU activations in the transformer and %d upsamplers "
-            "in the VAE for Neuron lowering",
-            patch_untraceable_activations(pipe.transformer),
-            patch_upsampling(pipe.vae),
-        )
-
-        self._step = NeuronFluxTransformer(pipe.transformer, config)
-        self._clip = _TextEncoder(pipe.text_encoder, pooled=True)
-        self._t5 = _TextEncoder(pipe.text_encoder_2, pooled=False)
-        self._decode_stages = build_decode_stages(pipe.vae)
-
-        freqs_cos, freqs_sin = build_rotary_embedding(config, pipe.transformer.config)
-        self._freqs_cos_host = freqs_cos
-        self._freqs_sin_host = freqs_sin
-        self._freqs_cos = freqs_cos
-        self._freqs_sin = freqs_sin
+        # The ranks own every network. Keeping a second copy here would cost
+        # ~25 GiB of host memory that nothing reads -- and the ranks are forked
+        # from this process, so it would be copy-on-write pressure too.
+        pipe.transformer = None
+        pipe.text_encoder = None
+        pipe.text_encoder_2 = None
+        pipe.vae = None
+        gc.collect()
 
     # ------------------------------------------------------------------
     # Construction
@@ -222,338 +171,37 @@ class NeuronFluxPipeline:
 
         Args:
             model_path: HF repo id or local path to a ``FluxPipeline`` folder.
-            config: Neuron shape/placement config; defaults to 1024x1024 with
-                the default component placement (see ``FluxNeuronConfig``).
+            config: Neuron shape/parallelism config; defaults to 1024x1024 at
+                ``tp_degree=2`` (see ``FluxNeuronConfig``).
             **kwargs: Forwarded to ``FluxPipeline.from_pretrained``.
 
         Returns:
-            A pipeline that still needs :meth:`compile` before the first
-            request (``generate`` calls it lazily otherwise).
+            A pipeline that still needs :meth:`compile` before the first request
+            (``generate`` calls it lazily otherwise).
         """
         config = config or FluxNeuronConfig()
         logger.info("Loading FLUX checkpoint from %s", model_path)
         pipe = FluxPipeline.from_pretrained(model_path, dtype=config.dtype, **kwargs)
         return cls(pipe, config, model_path=model_path)
 
-    def _compile(self, module: nn.Module) -> nn.Module:
-        from vllm_neuron.envs import get_compile_backend_name
-
-        # Lift Dynamo's recompile cap, as NeuronModelRunner does. Shapes here
-        # are static, so a recompile is never silent overhead -- but the VAE
-        # decode stages share one code object across five resolution levels, and
-        # a process that builds pipelines for more than one output size blows
-        # through the default limit of 8 and gets a component pushed to CPU.
-        torch._dynamo.config.cache_size_limit = 2**62
-        if hasattr(torch._dynamo.config, "recompile_limit"):
-            torch._dynamo.config.recompile_limit = 2**62
-
-        return torch.compile(
-            module,
-            backend=get_compile_backend_name(),
-            fullgraph=True,
-            options={
-                "alias_meta_to_neuron": True,
-                "compiler_args": self.config.neuronx_cc_args(),
-            },
-        )
-
-    @contextmanager
-    def _timed(self, name: str):
-        start = time.perf_counter()
-        yield
-        self.compile_ms[name] = (time.perf_counter() - start) * 1e3
-
-    def _place(
-        self,
-        name: str,
-        wrappers: list[nn.Module],
-        inner: nn.Module,
-        warmup_args: tuple[torch.Tensor, ...],
-    ) -> list[nn.Module]:
-        """Move a component to Neuron and compile its graphs, or leave it on CPU.
-
-        Compilation is driven by a warmup call with synthetic inputs of the exact
-        runtime shapes -- same pattern as the LLM path, and required here because
-        a failure has to surface at load time rather than mid-request.
-
-        A component may be more than one graph (the VAE decoder is five). Stages
-        are warmed up as a chain: each one's output feeds the next, so only the
-        first stage's shapes have to be stated.
-
-        Args:
-            name: Component key in ``FLUX_COMPONENTS``.
-            wrappers: Modules to compile, in execution order.
-            inner: The weight-owning module to move between devices.
-            warmup_args: Synthetic inputs to the first stage, on the host.
-
-        Returns:
-            The compiled modules, or ``wrappers`` unchanged if the component
-            stays on CPU.
-        """
-        if not self.config.runs_on_device(name):
-            self.placement[name] = "cpu"
-            logger.info("Component %s: staying on CPU (per config)", name)
-            return wrappers
-
-        device = self.config.device_for(name)
-        logger.info(
-            "Component %s: moving to %s and compiling %d graph(s)",
-            name,
-            device,
-            len(wrappers),
-        )
-        global _NRT_INITIALIZED
-        _NRT_INITIALIZED = True
-        try:
-            # The weight upload is inside the try because it is the step that
-            # runs out of HBM: a logical core holds 24 GB, and the transformer
-            # plus T5 do not both fit. Falling back keeps the pipeline usable.
-            inner.to(device)
-            compiled = [self._compile(wrapper) for wrapper in wrappers]
-            with self._timed(name):
-                args = tuple(
-                    a.to(device) if isinstance(a, torch.Tensor) else a
-                    for a in warmup_args
-                )
-                for stage in compiled:
-                    out, tag = stage(*args)
-                    tag.cpu()
-                    args = (out,)
-        except Exception:
-            logger.warning(
-                "Component %s failed to load or compile for Neuron; falling "
-                "back to CPU. Latency for this component will be much worse.",
-                name,
-                exc_info=True,
-            )
-            inner.to("cpu")
-            self.placement[name] = "cpu"
-            self.compile_ms.pop(name, None)
-            return wrappers
-
-        self.placement[name] = "neuron"
-        logger.info(
-            "Component %s: compiled in %.1f s", name, self.compile_ms[name] / 1e3
-        )
-        return compiled
-
     def compile(self) -> None:
-        """Place and compile every component. Idempotent."""
-        if self.placement:
+        """Start the ranks, which load, shard and compile. Idempotent."""
+        if self._tp is not None:
             return
+        from .tp import TensorParallelFlux
 
-        cfg = self.config
-        batch = 1
-        tcfg = self.pipe.transformer.config
-        dtype = cfg.dtype
-
-        if cfg.tp_degree > 1:
-            # Before anything else in this process touches Neuron. MPExecutor
-            # forks, and a child forked after the parent has initialized the
-            # runtime inherits a dead NRT handle -- the executor recognizes that
-            # failure and says so, but the ordering is what avoids it.
-            self._start_tp_workers()
-            self._place_vae_clip_t5(batch, tcfg, dtype)
-            return
-
-        # Transformer first: it is both the largest component and the one whose
-        # placement actually decides end-to-end latency (~30 invocations per
-        # request against one for everything else), so if HBM runs short it must
-        # not be the component that loses its seat.
-        (self._step_compiled,) = self._place(
-            "transformer",
-            [self._step],
-            self.pipe.transformer,
-            (
-                torch.zeros(batch, cfg.image_seq_len, tcfg.in_channels, dtype=dtype),
-                torch.zeros(
-                    batch,
-                    cfg.max_sequence_length,
-                    tcfg.joint_attention_dim,
-                    dtype=dtype,
-                ),
-                torch.zeros(batch, tcfg.pooled_projection_dim, dtype=dtype),
-                torch.zeros(batch, dtype=torch.float32),
-                torch.zeros(batch, dtype=torch.float32),
-                self._freqs_cos_host,
-                self._freqs_sin_host,
-                torch.ones(1, dtype=torch.float32),
-                torch.zeros(1, dtype=torch.float32),
-            ),
-        )
-        self._place_vae_clip_t5(batch, tcfg, dtype)
-
-    def _place_vae_clip_t5(self, batch: int, tcfg: Any, dtype: torch.dtype) -> None:
-        """Place everything except the transformer, then report.
-
-        Split out because tensor parallelism has to run before this: the
-        transformer's workers are forked, and forking after this process has
-        touched Neuron poisons them.
-        """
-        cfg = self.config
-        self._decode_compiled = self._place(
-            "vae",
-            self._decode_stages,
-            self.pipe.vae,
-            (
-                torch.zeros(
-                    batch,
-                    self.pipe.vae.config.latent_channels,
-                    cfg.latent_height,
-                    cfg.latent_width,
-                    dtype=dtype,
-                ),
-            ),
-        )
-        (self._clip_compiled,) = self._place(
-            "text_encoder",
-            [self._clip],
-            self.pipe.text_encoder,
-            (torch.zeros(batch, CLIP_SEQ_LEN, dtype=torch.long),),
-        )
-        self._place_t5()
-
-        # The RoPE tables are graph inputs, so they live wherever the step graph
-        # runs. Uploaded once here, reused by every step of every request. Under
-        # tensor parallelism the workers own that upload instead.
-        if self._tp is None and self.placement["transformer"] == "neuron":
-            device = cfg.device_for("transformer")
-            self._freqs_cos = self._freqs_cos_host.to(device)
-            self._freqs_sin = self._freqs_sin_host.to(device)
-
+        start = time.perf_counter()
+        self._tp = TensorParallelFlux(self._model_path, self.config)
+        self.compile_ms["ranks"] = (time.perf_counter() - start) * 1e3
         logger.info(
-            "FLUX pipeline ready. placement=%s compile_time_s=%s",
-            self.placement,
-            {k: round(v / 1e3, 1) for k, v in self.compile_ms.items()},
-        )
-
-    def _start_tp_workers(self) -> None:
-        """Bring up the sharded transformer in worker processes.
-
-        The workers load and shard the checkpoint themselves, so this process's
-        own copy of the transformer weights is dead afterwards and is dropped --
-        15.2 GiB of host memory that nothing will read again.
-
-        Raises:
-            RuntimeError: If this process has already placed a component on
-                Neuron. The workers are forked, and a child forked after the
-                runtime came up inherits a dead NRT handle, so one process can
-                bring up tensor-parallel workers at most once and must do it
-                before touching the device itself. Use one process per
-                configuration.
-            ValueError: If the checkpoint path is unknown, which happens when the
-                pipeline was built from an in-memory ``FluxPipeline`` rather than
-                :meth:`from_pretrained`. The workers have nothing to load from.
-        """
-        cfg = self.config
-        if _NRT_INITIALIZED:
-            raise RuntimeError(
-                "This process has already initialized the Neuron runtime, so "
-                "tensor-parallel workers forked now would inherit a dead NRT "
-                "handle. A process can start them only once, and only before it "
-                "places anything on Neuron itself -- run one tp_degree>1 "
-                "configuration per process."
-            )
-        if self._model_path is None:
-            raise ValueError(
-                "tp_degree>1 needs the checkpoint path so each worker can load "
-                "its own shard; build the pipeline with from_pretrained()."
-            )
-        tcfg = self.pipe.transformer.config
-        with self._timed("transformer"):
-            self._tp = TPTransformer(
-                self._model_path,
-                cfg,
-                (
-                    torch.zeros(
-                        1, cfg.max_sequence_length, tcfg.joint_attention_dim, dtype=cfg.dtype
-                    ),
-                    torch.zeros(1, tcfg.pooled_projection_dim, dtype=cfg.dtype),
-                    torch.zeros(1, dtype=torch.float32),
-                    self._freqs_cos_host,
-                    self._freqs_sin_host,
-                    torch.zeros(1, cfg.image_seq_len, tcfg.in_channels, dtype=cfg.dtype),
-                ),
-            )
-        self.placement["transformer"] = "neuron"
-        self.pipe.transformer.to("meta")
-        logger.info(
-            "Component transformer: sharded over %d cores %s, compiled in %.1f s",
-            cfg.tp_degree,
-            list(cfg.tp_core_ids),
-            self.compile_ms["transformer"] / 1e3,
-        )
-
-    def _place_t5(self) -> None:
-        """Place T5 on its own core via the worker, else in-process.
-
-        Kept out of ``_place`` because T5 is the one component whose Neuron
-        placement is not a ``.to(device)`` in this process: it does not fit
-        alongside the transformer on one logical core, and a process cannot
-        execute on two. See ``text_encoder_worker`` for the details.
-        """
-        cfg = self.config
-        blocked = None
-        if cfg.runs_in_worker("text_encoder_2"):
-            if self._model_path is None:
-                blocked = (
-                    "this pipeline was built without a model_path, so the "
-                    "worker cannot load its own copy of T5"
-                )
-            else:
-                blocked = explain_core_conflict(cfg.worker_device_index)
-
-        if cfg.runs_in_worker("text_encoder_2") and blocked:
-            logger.warning(
-                "Not starting the T5 encoder worker: %s Keeping T5 in-process, "
-                "which means CPU and ~1.5 s per request.",
-                blocked,
-            )
-        elif cfg.runs_in_worker("text_encoder_2"):
-            worker = TextEncoderWorker(
-                model_path=self._model_path,
-                device_index=cfg.worker_device_index,
-                max_sequence_length=cfg.max_sequence_length,
-                compiler_args=cfg.neuronx_cc_args(),
-            )
-            start = time.perf_counter()
-            try:
-                worker.start()
-            except Exception:
-                logger.warning(
-                    "T5 encoder worker failed to start; falling back to the "
-                    "in-process copy, which costs ~1.5 s per request.",
-                    exc_info=True,
-                )
-                worker.close()
-            else:
-                self._t5_worker = worker
-                self._t5_compiled = None
-                self.placement["text_encoder_2"] = "neuron"
-                self.compile_ms["text_encoder_2"] = (time.perf_counter() - start) * 1e3
-                # The in-process copy is now dead weight on the host; the worker
-                # holds its own. Kept only if it is the active path.
-                logger.info(
-                    "Component text_encoder_2: ready on core %d in %.1f s",
-                    cfg.worker_device_index,
-                    self.compile_ms["text_encoder_2"] / 1e3,
-                )
-                return
-
-        # In-process: this will try the pipeline's core, fail to allocate next to
-        # the transformer, and fall back to CPU with a warning from _place.
-        (self._t5_compiled,) = self._place(
-            "text_encoder_2",
-            [self._t5],
-            self.pipe.text_encoder_2,
-            (torch.zeros(1, cfg.max_sequence_length, dtype=torch.long),),
+            "FLUX pipeline ready: tp_degree=%d on cores %s, up in %.1f s",
+            self.config.tp_degree,
+            list(self.config.tp_core_ids),
+            self.compile_ms["ranks"] / 1e3,
         )
 
     def close(self) -> None:
-        """Release the worker processes, if any are running. Idempotent."""
-        worker, self._t5_worker = self._t5_worker, None
-        if worker is not None:
-            worker.close()
+        """Stop the ranks and release their cores. Idempotent."""
         tp, self._tp = self._tp, None
         if tp is not None:
             tp.close()
@@ -565,9 +213,9 @@ class NeuronFluxPipeline:
         self.close()
 
     def __del__(self) -> None:
-        # Best effort: a pipeline that goes out of scope (the benchmark drops one
-        # per configuration) must not leave a child holding a NeuronCore.
-        # Nothing useful to do or log if this fails during interpreter teardown.
+        # Best effort: a pipeline that goes out of scope must not leave children
+        # holding NeuronCores. Nothing useful to do if this fails during
+        # interpreter teardown.
         with contextlib.suppress(Exception):
             self.close()
 
@@ -575,49 +223,49 @@ class NeuronFluxPipeline:
     # Inference
     # ------------------------------------------------------------------
 
-    def _device_for(self, component: str) -> torch.device:
-        """Where a component's inputs have to be, from this process's side.
+    def _timesteps_and_sigmas(
+        self, num_inference_steps: int
+    ) -> tuple[torch.Tensor, np.ndarray]:
+        """Upstream's flow-matching schedule, on the host.
 
-        Under tensor parallelism the transformer runs in worker processes, so from
-        here it takes host tensors: this process may not even hold a core, and
-        moving anything to the core it does hold would only be undone again.
+        Reproduces ``FluxPipeline.__call__``'s schedule setup: sigmas linear in
+        [1, 1/n], shifted by the resolution-dependent mu that ``calculate_shift``
+        derives from the image sequence length.
         """
-        if component == "transformer" and self._tp is not None:
-            return torch.device("cpu")
-        return (
-            self.config.device_for(component)
-            if self.placement.get(component) == "neuron"
-            else torch.device("cpu")
+        cfg = self.config
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        mu = calculate_shift(
+            cfg.image_seq_len,
+            self.scheduler.config.get("base_image_seq_len", 256),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.5),
+            self.scheduler.config.get("max_shift", 1.15),
         )
+        self.scheduler.set_timesteps(sigmas=sigmas, mu=mu, device="cpu")
+        return self.scheduler.timesteps, self.scheduler.sigmas.numpy()
 
-    @staticmethod
-    def _handoff(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
-        """Move a tensor between components, hopping via the host if needed.
+    def _init_latents(self, seed: int | None) -> torch.Tensor:
+        """Sample and pack the initial latents.
 
-        There is no direct copy between two logical NeuronCores, so a
-        cross-core handoff has to land on the CPU in between. Only small
-        tensors cross component boundaries (prompt embeddings, packed latents),
-        so the extra hop does not show up in the timings.
+        Sampled on the host so a seed reproduces the same image at any
+        ``tp_degree``, then packed into the transformer's
+        ``[1, image_seq_len, in_channels]`` layout.
         """
-        if tensor.device == device:
-            return tensor
-        if tensor.device.type == "neuron" and device.type == "neuron":
-            return tensor.cpu().to(device)
-        return tensor.to(device)
+        cfg = self.config
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device="cpu").manual_seed(seed)
+        channels = self._in_channels // 4
+        latents = randn_tensor(
+            (1, channels, cfg.latent_height, cfg.latent_width),
+            generator=generator,
+            device=torch.device("cpu"),
+            dtype=cfg.dtype,
+        )
+        return self._pack(latents, 1, channels, cfg.latent_height, cfg.latent_width)
 
-    def encode_prompt(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run both text encoders.
-
-        Args:
-            prompt: The text prompt. Truncated to CLIP's 77 tokens for the
-                pooled branch and to ``max_sequence_length`` for T5, matching
-                upstream.
-
-        Returns:
-            ``(prompt_embeds, pooled_prompt_embeds)`` --
-            ``[1, max_sequence_length, joint_attention_dim]`` and
-            ``[1, pooled_projection_dim]``, on the transformer's device.
-        """
+    def _tokenize(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Token ids for both encoders, truncated the way upstream truncates."""
         clip_ids = self.tokenizer(
             [prompt],
             padding="max_length",
@@ -632,73 +280,7 @@ class NeuronFluxPipeline:
             truncation=True,
             return_tensors="pt",
         ).input_ids
-
-        pooled, pooled_tag = self._clip_compiled(
-            clip_ids.to(self._device_for("text_encoder"))
-        )
-        if self._t5_worker is not None:
-            # The worker fences on its own core and hands back a host tensor.
-            embeds = self._t5_worker.encode(t5_ids)
-            embeds_tag = None
-        else:
-            embeds, embeds_tag = self._t5_compiled(
-                t5_ids.to(self._device_for("text_encoder_2"))
-            )
-        # Fence the encoders, so the caller's timing attributes their cost here
-        # rather than to whichever later stage first waits on the queue.
-        pooled_tag.cpu()
-        if embeds_tag is not None:
-            embeds_tag.cpu()
-
-        target = self._device_for("transformer")
-        return (
-            self._handoff(embeds.to(self.config.dtype), target),
-            self._handoff(pooled.to(self.config.dtype), target),
-        )
-
-    def _timesteps_and_sigmas(
-        self, num_inference_steps: int
-    ) -> tuple[torch.Tensor, np.ndarray]:
-        """Host-side schedule for the flow-matching sampler.
-
-        Returns:
-            ``(timesteps, sigmas)`` where ``sigmas`` has
-            ``num_inference_steps + 1`` entries (trailing 0.0), so step ``i``
-            consumes ``sigmas[i]`` and ``sigmas[i + 1]``.
-        """
-        sigmas = np.linspace(1.0, 1.0 / num_inference_steps, num_inference_steps)
-        mu = calculate_shift(
-            self.config.image_seq_len,
-            self.scheduler.config.get("base_image_seq_len", 256),
-            self.scheduler.config.get("max_image_seq_len", 4096),
-            self.scheduler.config.get("base_shift", 0.5),
-            self.scheduler.config.get("max_shift", 1.15),
-        )
-        self.scheduler.set_timesteps(sigmas=sigmas, mu=mu, device="cpu")
-        self.scheduler.set_begin_index(0)
-        return self.scheduler.timesteps, self.scheduler.sigmas.numpy()
-
-    def _init_latents(self, seed: int | None) -> torch.Tensor:
-        """Sample and pack the initial latents.
-
-        Sampled on the host so a seed reproduces the same image regardless of
-        component placement, then packed into the transformer's
-        ``[1, image_seq_len, in_channels]`` layout.
-        """
-        cfg = self.config
-        generator = None
-        if seed is not None:
-            generator = torch.Generator(device="cpu").manual_seed(seed)
-        channels = self.pipe.transformer.config.in_channels // 4
-        latents = randn_tensor(
-            (1, channels, cfg.latent_height, cfg.latent_width),
-            generator=generator,
-            device=torch.device("cpu"),
-            dtype=cfg.dtype,
-        )
-        return self.pipe._pack_latents(
-            latents, 1, channels, cfg.latent_height, cfg.latent_width
-        )
+        return clip_ids, t5_ids
 
     def generate(
         self,
@@ -711,12 +293,13 @@ class NeuronFluxPipeline:
         """Generate one image.
 
         Args:
-            prompt: Text prompt.
+            prompt: Text prompt. Truncated to CLIP's 77 tokens for the pooled
+                branch and to ``max_sequence_length`` for T5.
             num_inference_steps: Denoising steps. FLUX.1-lite is tuned for the
                 same 20-30 range as FLUX.1-dev.
             guidance_scale: Distilled guidance embedding value. This is *not*
-                classifier-free guidance -- there is no negative pass, so cost
-                is independent of this value.
+                classifier-free guidance -- there is no negative pass, so cost is
+                independent of it.
             seed: Host RNG seed for the initial latents. ``None`` is
                 nondeterministic.
             output_type: ``"pil"``, ``"np"``, or ``"latent"``.
@@ -738,109 +321,43 @@ class NeuronFluxPipeline:
         seed: int | None,
         output_type: str,
     ) -> tuple[Any, GenerationTiming]:
-        cfg = self.config
         timing = GenerationTiming()
         total_start = time.perf_counter()
 
         start = time.perf_counter()
-        prompt_embeds, pooled_embeds = self.encode_prompt(prompt)
+        clip_ids, t5_ids = self._tokenize(prompt)
+        self._tp.run(ENCODE, clip_ids, t5_ids)
         timing.encode_ms = (time.perf_counter() - start) * 1e3
 
         start = time.perf_counter()
         timesteps, sigmas = self._timesteps_and_sigmas(num_inference_steps)
-        # Under tensor parallelism _device_for returns the host: the workers hold
-        # the latents, and nothing about this request lands on this process's core.
-        device = self._device_for("transformer")
-        latents = self._init_latents(seed).to(device)
-        guidance = torch.full((1,), guidance_scale, dtype=torch.float32).to(device)
+        self._tp.run(
+            CONTEXT,
+            torch.full((1,), guidance_scale, dtype=torch.float32),
+            self._init_latents(seed),
+        )
         timing.latent_init_ms = (time.perf_counter() - start) * 1e3
-
-        if self._tp is not None:
-            self._tp.set_context(
-                prompt_embeds,
-                pooled_embeds,
-                guidance,
-                self._freqs_cos_host,
-                self._freqs_sin_host,
-                latents,
-            )
-            for i, t in enumerate(timesteps):
-                step_start = time.perf_counter()
-                self._tp.step(
-                    (t / 1000).reshape(1).to(torch.float32),
-                    torch.full((1,), float(sigmas[i]), dtype=torch.float32),
-                    torch.full((1,), float(sigmas[i + 1]), dtype=torch.float32),
-                )
-                timing.step_ms.append((time.perf_counter() - step_start) * 1e3)
-            latents = self._tp.latents()
-            timing.denoise_ms = sum(timing.step_ms)
-            return self._finish(latents, output_type, timing, total_start)
 
         for i, t in enumerate(timesteps):
             step_start = time.perf_counter()
-            # Cast before the device move, never during it (see the scheduler
-            # branch below).
-            timestep = (t / 1000).reshape(1).to(torch.float32).to(device)
-            sigma = torch.full((1,), float(sigmas[i]), dtype=torch.float32).to(device)
-            sigma_next = torch.full((1,), float(sigmas[i + 1]), dtype=torch.float32).to(
-                device
+            self._tp.run(
+                STEP,
+                (t / 1000).reshape(1).to(torch.float32),
+                torch.full((1,), float(sigmas[i]), dtype=torch.float32),
+                torch.full((1,), float(sigmas[i + 1]), dtype=torch.float32),
             )
-
-            out, tag = self._step_compiled(
-                latents,
-                prompt_embeds,
-                pooled_embeds,
-                timestep,
-                guidance,
-                self._freqs_cos,
-                self._freqs_sin,
-                sigma,
-                sigma_next,
-            )
-            if cfg.fuse_scheduler_step:
-                latents = out
-            else:
-                # Cast on the host and move as a second step: privateuse1 cannot
-                # convert dtype as part of a host-to-device copy.
-                stepped = self.scheduler.step(
-                    out.cpu().float(), t, latents.cpu().float(), return_dict=False
-                )[0]
-                latents = stepped.to(cfg.dtype).to(device)
-
-            # NEFF execution is queued, not synchronous: without this the loop
-            # would race ahead of the device and overrun the runtime's execution
-            # queue. Reading a one-element view is the cheapest available fence.
-            tag.cpu()
             timing.step_ms.append((time.perf_counter() - step_start) * 1e3)
-
         timing.denoise_ms = sum(timing.step_ms)
-        return self._finish(latents, output_type, timing, total_start)
 
-    def _finish(
-        self,
-        latents: torch.Tensor,
-        output_type: str,
-        timing: GenerationTiming,
-        total_start: float,
-    ) -> tuple[Any, GenerationTiming]:
-        """Decode the final latents and postprocess, shared by both step paths."""
-        cfg = self.config
         if output_type == "latent":
+            latents = self._tp.run(LATENTS)[0].to(self.config.dtype)
             timing.total_ms = (time.perf_counter() - total_start) * 1e3
             return latents, timing
 
         start = time.perf_counter()
-        # Unpacking is a permute+reshape, which needs a contiguity-fixing copy
-        # that privateuse1 does not implement. It runs on 512 KiB of latents, so
-        # the round trip through the host is free next to the decode itself.
-        unpacked = self.pipe._unpack_latents(
-            latents.cpu(), cfg.height, cfg.width, self.vae_scale_factor
-        )
-        stage_input = unpacked.to(self._device_for("vae"))
-        for stage in self._decode_compiled:
-            stage_input, tag = stage(stage_input)
-            tag.cpu()
-        image = stage_input.cpu()
+        # Every rank decodes the same image, the VAE being replicated; rank 0's is
+        # as good as any.
+        image = self._tp.run(DECODE)[0]
         timing.decode_ms = (time.perf_counter() - start) * 1e3
 
         start = time.perf_counter()

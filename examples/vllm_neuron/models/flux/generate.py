@@ -19,8 +19,11 @@ Usage:
     # Four cores instead of two: ~1.9x faster per step
     python examples/vllm_neuron/models/flux/generate.py --prompt "..." --tp 4
 
-    # LoRA: load adapters at runtime and write one image per adapter, plus the base
+    # LoRA: load adapters at runtime and write one image per adapter, plus the base.
+    # Point -c at the checkpoint the adapters were trained against -- a FLUX.1-dev
+    # adapter names layers that FLUX.1-lite does not have.
     python examples/vllm_neuron/models/flux/generate.py --prompt "..." \
+        -c black-forest-labs/FLUX.1-dev \
         --lora realism=/adapters/xlabs-realism \
         --lora superreal=/adapters/super-realism.safetensors
 """
@@ -91,7 +94,8 @@ def parse_args() -> argparse.Namespace:
         metavar="NAME=PATH",
         help="Load a LoRA adapter into a device slot; repeatable. With no "
         "--use-lora, one image is written per adapter plus one for the base model, "
-        "since switching between loaded adapters costs under a millisecond.",
+        "since switching between loaded adapters costs under a millisecond. The "
+        "adapter has to target the checkpoint given by --model-checkpoint.",
     )
     parser.add_argument(
         "--use-lora",

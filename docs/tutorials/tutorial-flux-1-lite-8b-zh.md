@@ -502,7 +502,13 @@ rank 数翻倍，每步快 1.84 倍，整个请求快 1.76 倍。每步延时在
 adapter 可以在**运行时**加载到设备槽位里、按请求切换，不重新编译任何东西，而且**切换只要
 不到一毫秒**：
 
+> **adapter 必须和 checkpoint 匹配。** 下面的例子请按 **FLUX.1-dev** 读：公开能拿到的
+> FLUX adapter 全是对着 dev 训的，而 dev 有 19 个双流块、lite 只有 8 个，所以 dev 的
+> adapter 有一半层在 lite 里不存在。换成给 lite 训的 adapter，这一节的一切在 lite 上
+> 完全一样；这里的数字和图用 dev，是因为那才是真能跑起来的组合。
+
 ```python
+CKPT = "black-forest-labs/FLUX.1-dev"        # 这两个 adapter 是对着它训的
 config = FluxNeuronConfig(height=1024, width=1024, tp_degree=4,
                           lora_slots=2, lora_max_rank=64)
 with NeuronFluxPipeline.from_pretrained(CKPT, config) as pipeline:
@@ -521,6 +527,7 @@ with NeuronFluxPipeline.from_pretrained(CKPT, config) as pipeline:
 
 ```bash
 python examples/vllm_neuron/models/flux/generate.py --tp 4 \
+    -c black-forest-labs/FLUX.1-dev \
     --lora realism=/adapters/xlabs-realism \
     --lora superreal=/adapters/super-realism.safetensors
 ```
@@ -591,9 +598,16 @@ rank 得到各自不同的错误结果。四种情况（列并行、行并行、
 ### adapter 必须和 checkpoint 匹配
 
 给 FLUX.1-dev 训的 adapter 会点名 19 个双流块，而 FLUX.1-lite 只有 8 个。把 dev 的
-adapter 加载到 lite 上，日志会告诉你有多少目标在这里不存在、并且只适配剩下的那部分——
-这不是 adapter 作者的本意。上面的数字是在 FLUX.1-dev 上测的，因为公开的 adapter 都是给
-dev 训的。
+adapter 加载到 lite 上，只有确实存在的层会被适配——这不是 adapter 作者的本意——并且会打印
+掉了多少：
+
+```
+WARNING Adapter targets 266 modules that are not adapted here, e.g. [...]
+```
+
+这是警告而不是报错，因为"只适配一部分"本身是合法的用法；但如果你加载的是现成的 adapter
+还看到它，那问题就在 checkpoint 上。除此之外这篇文档的其他内容和跑哪个 checkpoint 无关
+——块数是从 checkpoint 里读的。
 
 ---
 

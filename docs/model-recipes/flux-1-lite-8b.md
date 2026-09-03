@@ -172,9 +172,18 @@ quantity, so it is held whole and added after the reduce.
 ## LoRA
 
 Adapters are loaded into device slots at runtime and selected per request. Nothing
-is recompiled, and switching between loaded adapters costs **under a millisecond**:
+is recompiled, and switching between loaded adapters costs **under a millisecond**.
+
+> **The adapter has to match the checkpoint**, so read the examples here as
+> FLUX.1-dev rather than FLUX.1-lite: every widely available FLUX adapter is trained
+> against dev, and dev has 19 double-stream blocks where lite has 8, so half of a
+> dev adapter names layers that do not exist in lite. Everything in this section
+> works the same on lite with a lite-targeted adapter; the measurements and the
+> images below are on dev because that is what can actually be tried. See
+> "Adapters have to match the checkpoint".
 
 ```python
+CKPT = "black-forest-labs/FLUX.1-dev"          # what these adapters were trained on
 config = FluxNeuronConfig(height=1024, width=1024, tp_degree=4,
                           lora_slots=2, lora_max_rank=64)
 with NeuronFluxPipeline.from_pretrained(CKPT, config) as pipeline:
@@ -274,9 +283,20 @@ contribution being measured.
 ### Adapters have to match the checkpoint
 
 An adapter trained for FLUX.1-dev names 19 double-stream blocks; FLUX.1-lite has 8.
-Loading one into the other logs how many of its targets do not exist here and
-adapts only the rest, which is not what the adapter's author intended. The numbers
-above are on FLUX.1-dev, because that is what the public adapters target.
+Loading one into the other adapts only the layers that do exist, which is not what
+the adapter's author intended, and logs how many were dropped:
+
+```
+WARNING Adapter targets 266 modules that are not adapted here, e.g.
+        ['transformer_blocks.10.attn.to_q', ...]. A FLUX adapter trained for a
+        different checkpoint (dev has 19 double blocks, lite has 8) will look
+        like this.
+```
+
+It is a warning rather than an error because a partial adapter is a legitimate
+thing to have -- but if you see it while loading a stock adapter, the checkpoint is
+the problem. Nothing else in this recipe depends on which of the two you run: the
+pipeline reads the block counts from the checkpoint.
 
 ## Cores
 

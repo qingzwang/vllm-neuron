@@ -225,10 +225,10 @@ than once per switch.
 
 | Operation | Cost |
 |---|---|
-| `set_lora(...)` between loaded adapters | **0.6–0.8 ms** |
-| `load_lora(...)`, 22 MiB adapter (152 modules) | 0.14 s |
-| `load_lora(...)`, 585 MiB adapter (494 modules) | 0.58 s |
-| Per-step latency, adapter active | 116.6–118.7 ms against 117.3 ms for the base model |
+| `set_lora(...)` between loaded adapters | **0.5–1.0 ms** |
+| `load_lora(...)`, 22 MiB adapter (152 modules) | 0.13–0.14 s |
+| `load_lora(...)`, 585 MiB adapter (494 modules) | 0.44–0.58 s |
+| Per-step latency, adapter active | 116.3–117.4 ms against 115.3 ms for the base model |
 | Slot memory | 385 MB per slot per rank |
 
 The step cost of an active adapter is not measurable against run-to-run spread: the
@@ -246,19 +246,26 @@ cases (column-parallel, row-parallel, the single block's split `proj_out`, and p
 layers) are checked on CPU against a dense `W x + B (A x)`, exactly.
 
 On device, every slot is compared against a **float32** CPU reference for *every*
-adapter, not just its own -- one denoising step at 512x512, same prompt, seed,
-schedule and initial latents, cosine on the resulting latents:
+adapter, not just its own. Prompt `"a photo of a red panda reading a book"`,
+distilled guidance 3.5, true classifier-free guidance off (there is no negative pass
+here at all) -- the same settings NxD Inference's LoRA checks use, so the two sets of
+numbers are comparable. One denoising step at 512x512, identical initial latents on
+both sides, cosine on the resulting latents:
 
 | slot | cpu-base | cpu-xlabs | cpu-kohya |
 |---|---|---|---|
-| base (slot 0) | **0.999841** | 0.997064 | 0.993697 |
-| xlabs (slot 1) | 0.998179 | **0.999837** | 0.992665 |
-| kohya (slot 2) | 0.995441 | 0.993223 | **0.999796** |
+| base (slot 0) | **0.999772** | 0.997536 | 0.992593 |
+| xlabs (slot 1) | 0.997322 | **0.999820** | 0.991455 |
+| kohya (slot 2) | 0.993000 | 0.991381 | **0.999797** |
 
 Every row's maximum is on the diagonal, and the diagonal sits at ~0.9998 -- the
-bfloat16-against-float32 floor for this model -- while the off-diagonals are 0.992 to
+bfloat16-against-float32 floor for this model -- while the off-diagonals are 0.991 to
 0.998. A slot reading the wrong weights, or an adapter applied to the wrong modules,
-moves the maximum off the diagonal.
+moves the maximum off the diagonal. NxD Inference's equivalent check on the same
+checkpoint and the same two adapters lands on the same kind of diagonal, ~0.9992 to
+0.9996; it compares the predicted velocity directly at 256x256 with both sides fed
+one shared set of float32 prompt embeddings, where this one lets each side encode the
+prompt itself.
 
 Switching also has to be lossless: switching away from an adapter and back reproduces
 the earlier latents **bit for bit**, and so does returning to slot 0.

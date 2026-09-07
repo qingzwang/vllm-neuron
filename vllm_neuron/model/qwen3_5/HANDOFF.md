@@ -1,5 +1,11 @@
 # Qwen3.5-2B onboarding — findings, decisions, plan
 
+> Want to *run* it rather than read how it was built?
+> [`docs/tutorials/tutorial-qwen3-5-2b-zh.md`](../../../docs/tutorials/tutorial-qwen3-5-2b-zh.md)
+> is a step-by-step Chinese walkthrough, re-run from a clean venv: the exact version
+> pins (including why neuronx-cc has to be 2.26), the CPU checks, text and VL at TP=4,
+> and every number reproduced independently of the ones below.
+
 Branch `model/Qwen3.5-2B`, cut from `release-0.21.0.1.0.0`. No overlap with
 `model/InternVL3-8B` or `benchmark/Qwen3-VL-8B`.
 

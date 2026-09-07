@@ -33,6 +33,13 @@ Measure TTFT improvement from prefix caching with GPT-OSS.
 Serve the multimodal Qwen3-VL-32B model.
 :::
 
+:::{grid-item-card} Qwen3.5-2B 上手(中文)
+:link: tutorial-qwen3-5-2b-zh
+:link-type: doc
+
+Run the hybrid DeltaNet + attention Qwen3.5-2B, text and vision, at TP=4.
+:::
+
 ::::
 
 :::{toctree}
@@ -43,4 +50,5 @@ Disaggregated inference (1P1D and xPyD) <tutorial-di-1p1d-xpyd>
 Deploying gpt-oss <tutorial-gpt-oss>
 Benchmarking prefix caching (GPT-OSS) <tutorial-prefix-caching-gpt-oss-benchmarking>
 Deploying Qwen3-VL-32B <tutorial-qwen3-vl-32b>
+Qwen3.5-2B 上手(中文) <tutorial-qwen3-5-2b-zh>
 :::

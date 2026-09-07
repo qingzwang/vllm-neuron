@@ -35,6 +35,28 @@ import vllm.v1.executor.ray_utils  # noqa: F401 — Eager-load ray chain (~310ms
 
 logger = logging.getLogger(__name__)
 
+# How long a worker gets to answer LOAD. A worker's LOAD *includes compiling every
+# graph it owns*, so a fixed five minutes is not a load timeout at all -- it is a
+# compile deadline, and a shorter one than the compiler is given
+# (NEURON_LIBTORCH_COMPILATION_TIMEOUT, which the FLUX examples raise to 3600 s).
+# Timing out here kills the ranks mid-compile, and the surviving rank then reports
+# the confusing "Lock holder process died - cache invalidated" from the shared
+# compilation cache rather than a timeout. So: default to the compiler's own budget,
+# with a floor at the historical 300 s and an explicit override.
+_LOAD_TIMEOUT_ENV = "VLLM_NEURON_WORKER_LOAD_TIMEOUT"
+_LOAD_TIMEOUT_FLOOR = 300.0
+
+
+def _load_timeout() -> float:
+    """Seconds a worker gets to finish LOAD, compilation included."""
+    explicit = os.environ.get(_LOAD_TIMEOUT_ENV)
+    if explicit:
+        return float(explicit)
+    compile_budget = os.environ.get("NEURON_LIBTORCH_COMPILATION_TIMEOUT")
+    if compile_budget:
+        return max(_LOAD_TIMEOUT_FLOOR, float(compile_budget))
+    return _LOAD_TIMEOUT_FLOOR
+
 # fp8 dtypes require ml_dtypes for np conversion since np has no native fp8.
 _FP8_NUMPY_DTYPES = {
     torch.float8_e5m2: ml_dtypes.float8_e5m2,
@@ -242,9 +264,15 @@ class _WorkerPool:
         )
 
     def _wait_for_load(self, num_local_ranks):
-        """Wait for LOAD_OK/ERROR from all workers."""
+        """Wait for LOAD_OK/ERROR from all workers.
+
+        The budget comes from :func:`_load_timeout`, because a worker's LOAD covers
+        weight loading *and* compiling every graph it owns -- on a cold cache that
+        is minutes, and at 1024x1024 more than the historical five.
+        """
+        timeout = _load_timeout()
         for rank in range(num_local_ranks):
-            if self._output_pipes[rank].poll(timeout=300.0):
+            if self._output_pipes[rank].poll(timeout=timeout):
                 item = self._output_pipes[rank].recv()
                 if item[0] == "LOAD_OK":
                     continue
@@ -256,7 +284,13 @@ class _WorkerPool:
                     )
             else:
                 raise TimeoutError(
-                    f"Worker {rank} did not respond to LOAD within timeout of 300 seconds."
+                    f"Worker {rank} did not respond to LOAD within {timeout:.0f} s. "
+                    "A worker's LOAD includes compiling its graphs, so on a cold "
+                    "compilation cache this is a compile that ran long rather than a "
+                    "hang: raise NEURON_LIBTORCH_COMPILATION_TIMEOUT (which this "
+                    f"timeout follows) or set {_LOAD_TIMEOUT_ENV} directly. Note the "
+                    "compiler subprocesses outlive this teardown and populate the "
+                    "cache, so re-running the same command usually gets further."
                 )
 
     def _wait_for_reinit(self, num_local_ranks):

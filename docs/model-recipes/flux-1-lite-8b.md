@@ -253,9 +253,17 @@ which is why the kernel is the default.
 
 | Phase | Cost |
 |---|---|
-| Compilation, cold cache | ~4 min, dominated by the five VAE decode stages |
+| Cold cache, end to end to the first image, 512x512 at `tp_degree=2` | **4.8 min** |
+| Cold cache, end to end to the first image, 1024x1024 at `tp_degree=2` | **14.1 min** |
 | Rank startup, warm cache | 100-140 s |
 | First image in a process | +12 s at 1024x1024, loading the VAE NEFFs |
+
+Those two cold figures are the whole command, measured from a genuinely empty
+`NEURON_LIBTORCH_CACHE_ROOT` — worth knowing because a worker's LOAD *includes* its
+compilation, so anything that bounds LOAD has to exceed them. The plugin's LOAD
+timeout follows `NEURON_LIBTORCH_COMPILATION_TIMEOUT` for exactly this reason (the
+examples set it to 3600 s); it used to be a fixed 300 s, which killed the ranks
+mid-compile on any cold 1024x1024 build.
 
 Rank startup is where the cost sits, and it grows with `tp_degree`: every rank
 materializes the whole checkpoint before keeping its shares of it, and they take a

@@ -544,6 +544,59 @@ rank 是 fork 出来的，而 fork 之前本进程如果已经初始化过 NRT�
 死掉的 NRT 句柄。所以一个进程里只能起一套 rank——**一个配置一个进程**，压测多个
 `--tp` 时分开跑。
 
+**`FATAL: Lock holder process died - cache invalidated, please retry compilation`
+（或 `TimeoutError: Worker 0 did not respond to LOAD within ... s`）**
+**第一次跑、缓存全空的时候最容易撞到,而且报的错和真正的原因差得很远。** 真正发生的事:
+一个 rank 的 LOAD 里**包含编译它自己那份图**,冷缓存下 1024×1024 在 `tp_degree=2` 上要十几
+分钟;而 executor 等 LOAD 的超时以前是**硬编码 300 秒**——超时后父进程把 rank 全杀掉,活着的
+那个 rank 于是在共享编译缓存里看到"持锁的进程不见了",打出上面那句 FATAL。
+
+实测的证据链(冷缓存、默认参数,3 次全中):
+
+```
+07:53:26  rank 1: Waiting for shared compilation by process 287506
+07:53:54  rank 1: Process 287506 no longer exists      <- rank 0 被父进程杀了
+          rank 1: FATAL: Lock holder process died - cache invalidated
+07:53:55  WorkerPool: workers shut down
+          TimeoutError: Worker 0 did not respond to LOAD within timeout of 300 seconds
+07:38:53  （上一次跑的)编译器子进程 Compiler status PASS   <- 编译本身没问题
+```
+
+注意最后一行:**编译器子进程会活过这次拆除并把 NEFF 写进缓存**,所以"再跑一遍"通常能往前
+走一截——这也是为什么这个问题在反复跑过的机器上看不见,只有同事从零开始时才撞上。
+
+现在 LOAD 的超时**跟随 `NEURON_LIBTORCH_COMPILATION_TIMEOUT`**(示例脚本把它设成 3600),
+下限仍是 300 秒,也可以用 `VLLM_NEURON_WORKER_LOAD_TIMEOUT` 直接指定:
+
+```bash
+# 自己写脚本时(示例脚本已经设了)
+export NEURON_LIBTORCH_COMPILATION_TIMEOUT=3600
+# 或者只调这个超时
+export VLLM_NEURON_WORKER_LOAD_TIMEOUT=1800
+```
+
+修好之后同一条命令(冷缓存、`tp_degree=2`、1024×1024)跑通:**约 14 分钟**出第一张图,
+392 ms/step——和第 5 节表里的数字一致。
+
+**`[NCC_ISMP902] Simplifier error: is_subset()` / `neuronx-cc compilation failed with 70`**
+编译器版本不对。这个错**和栈绑定**,不是"新版本一定更好":
+
+| 栈 | 能用的 neuronx-cc | 用错会怎样 |
+|---|---|---|
+| 本文这条(`libtorch-neuronx-lite` + vllm 0.24) | **2.27.5334.0**(实测冷编译 512px 和 1024px 都过) | — |
+| NxD Inference(`torch-neuronx`) | **2.26.6360.0** | 2.27 编 FLUX 报 ISMP902 |
+| vllm 0.21 那条栈 | **2.26.6360.0** | 2.27 编 DeltaNet 类图报 ISMP902 |
+
+所以先确认到底用的是哪一个:
+
+```bash
+which neuronx-cc          # 必须指向你正在用的那个 venv 的 bin
+neuronx-cc --version
+```
+
+两个 venv 各带一个 `neuronx-cc`,**PATH 里谁在前面就用谁**——用 NxDI 的 2.26 去编这条栈的图
+(或者反过来)就会得到这个错。
+
 **启动很慢（100 秒以上）**
 正常。每个 rank 都要读完整的 checkpoint 才留下自己的分片，而且是排队读的（否则主机
 内存放不下）。编译缓存只省编译，不省这个。

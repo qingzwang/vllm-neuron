@@ -5,8 +5,9 @@ one model, one set of weights, three tasks (semantic / instance / panoptic) sele
 a task token at inference. This directory brings `shi-labs/oneformer_coco_swin_large`
 up on Trn2.
 
-**Status: op-level bring-up.** The compiler blocker is found and solved (see
-"grid_sample"), the rest of the risky ops are cleared. The model itself is next.
+**Status: the patched model is verified on CPU.** The compiler blockers are found and
+solved, the two required patches provably do not change the model, and HuggingFace's
+own output is recorded as the reference. Compiling the whole thing is next.
 
 ## Why this is not a vllm-neuron model
 
@@ -95,14 +96,75 @@ On device the same graph produces something else entirely (relative difference 6
 against the CPU result). So that guard is **load-bearing here, not defensive**: it has
 to be kept, and correctness must not depend on NaN semantics matching.
 
+## The model on CPU first, patched, before any compilation
+
+Two scripts, in this order. Neither needs the device, both take seconds to a minute,
+and together they separate "the patch is wrong" from "the compiler is wrong" — which
+are indistinguishable if you only ever look at the end of the pipeline.
+
+**1. `check_hf_reference.py`** — HuggingFace on CPU, at a *pinned* input size, saving
+both a picture and the raw head outputs for later diffs. The pin is the one deviation
+from the model card: the processor defaults to shortest_edge 800 / longest_edge 1333,
+i.e. a different shape per image, and an ahead-of-time compiler needs one shape.
+384x384 is the natural choice — it is what Swin-L was trained at, and it leaves every
+stage's map (96, 48, 24, 12) divisible by the window size 12, so nothing is padded.
+
+```bash
+python contrib/oneformer-swin-l/check_hf_reference.py \
+    --image examples/cat.png --task panoptic --size 384 --out /tmp/of_ref
+```
+
+On a photo of a cat on a couch it returns four segments — `couch` 0.994, `pillow`
+0.941, `cat` 0.999, `remote` 0.948 — which is the whole picture, remote included.
+Heads are `class_queries_logits (1, 150, 134)` and `masks_queries_logits (1, 150, 96,
+96)`; forward is 0.9 s on CPU.
+
+Worth noting from the load report: `swin.layernorm.{weight,bias}` are **missing from
+the checkpoint** and get initialized (to 1 and 0, deterministically — two loads agree
+bit for bit, which was checked). OneFormer norms each stage through
+`hidden_states_norms` instead, so that module is dead weight rather than a random
+factor in the output.
+
+**2. `check_patches_vs_hf.py`** — the same model with the patches installed against
+the same model without them, on random input, on CPU:
+
+```
+  PASS  class_queries_logits: rel=6.028e-07  bitwise=False
+  PASS  masks_queries_logits: rel=5.988e-07  bitwise=False
+  PASS  per-query argmax label unchanged
+the patched model is the same model
+```
+
+Random input rather than a photo on purpose: it drives the deformable sampler across
+its whole coordinate range, including the out-of-range offsets where zeros-padding has
+to agree with `grid_sample`, which a natural image may never produce.
+
+### The level order is silent when wrong
+
+The first run of this check failed at **rel 0.32**, and the cause is worth writing
+down. `patched_msda` needs the per-level feature-map sizes as Python constants (they
+are `split` sizes). The model's own order is **smallest map first** — for 384x384,
+`[(12, 12), (24, 24), (48, 48)]`, i.e. stride 32, 16, 8 — and installing the reverse
+of that sums to exactly the same 3024 positions, so every shape "fits" while every
+level samples from the wrong feature map. Nothing raises; the logits just move.
+
+The lesson generalised into two changes: the sanity check no longer settles for
+matching totals but compares the order element by element whenever the caller's
+`value_spatial_shapes` is already on the host, and the standalone probe was extended
+to diff our deformable attention against **HuggingFace's own**, which is the check
+that was missing. Ours matches upstream to **3.8e-07** on CPU.
+
 ## Layout
 
 ```
 contrib/oneformer-swin-l/
-├── README.md              — this file
-├── probe_device_ops.py    — the op-level device probes above
+├── README.md               — this file
+├── probe_device_ops.py     — op-level device probes
+├── check_hf_reference.py   — HuggingFace on CPU: the reference, and something to look at
+├── check_patches_vs_hf.py  — patched vs unpatched, on CPU
 └── src/
-    └── bilinear.py        — grid_sample-free bilinear sampling + deformable attention
+    ├── bilinear.py         — grid_sample-free bilinear sampling + deformable attention
+    └── patches.py          — the two substitutions, with version-drift assertions
 ```
 
 ## Plan
@@ -110,9 +172,10 @@ contrib/oneformer-swin-l/
 - [x] Checkpoint, and the architecture read off its real config
 - [x] Op probes: what compiles, what is silently wrong, what aborts
 - [x] `grid_sample` replacement, verified against `F.grid_sample` on CPU and on device
-- [ ] Swin-L backbone at a fixed input size, checked against HF layer by layer on CPU
-- [ ] Pixel decoder (6 deformable layers) on the replacement attention
-- [ ] Transformer decoder (10 layers, 150 queries, masked cross-attention + the guard)
+- [x] HuggingFace reference on CPU at a pinned 384x384, saved as logits and images
+- [x] The two patches — deformable attention, mask guard — proved not to change the
+      model (rel 6e-07 end to end, argmax unchanged)
+- [ ] The same patched model compiled and run on device, diffed against that reference
 - [ ] End-to-end on device, against HF on CPU: class logits and mask logits
 - [ ] Post-processing on the host (semantic / instance / panoptic), and sample outputs
 - [ ] Latency, and whether the 76 s `interpolate` compile is worth avoiding by doing

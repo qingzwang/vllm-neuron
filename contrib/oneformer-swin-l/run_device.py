@@ -350,10 +350,15 @@ def main():
         for reason, count in sorted(counters["graph_break"].items(), key=lambda p: -p[1])[:5]:
             print(f"          {count:4}x {reason[:110]}")
 
+    # Read one element back, or this measures *dispatch* and nothing else: Neuron
+    # execution is asynchronous, so timing a call whose outputs are never touched
+    # reports single-digit milliseconds for any graph, however large. That mistake is
+    # what made an early version of this script claim a 3 ms forward.
     start = time.perf_counter()
     with torch.no_grad():
-        compiled(*[x.to(DEVICE) for x in inputs])
-    print(f"[device] warm call: {(time.perf_counter() - start) * 1e3:.0f} ms")
+        warm = compiled(*[x.to(DEVICE) for x in inputs])
+        float(warm[0].reshape(-1)[0].cpu())
+    print(f"[device] warm call (synced): {(time.perf_counter() - start) * 1e3:.0f} ms")
 
     print("\n[compare] device vs CPU, same dtype, same input")
     ok = True

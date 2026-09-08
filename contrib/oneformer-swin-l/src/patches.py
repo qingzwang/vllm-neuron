@@ -98,6 +98,12 @@ _INV_SQRT2 = 0.7071067811865476
 # Set by install(), so the per-model helpers below do not need it passed twice.
 _installed_level_shapes: list = []
 
+# Every patch that rewrites *module-level* state has to be idempotent: a process that
+# builds two model instances (a host one and a device one, to compare them) calls the
+# installers twice, and the source transforms cannot run on their own output -- the text
+# they look for is gone, so the assertions would fire on a correctly patched module.
+_applied: dict = {}
+
 
 def replace_gelu(module: torch.nn.Module) -> int:
     """Swap every GELU activation in ``module`` for :class:`ErfGELU`. Returns the count."""
@@ -131,12 +137,22 @@ def cache_position_embeddings(model: torch.nn.Module) -> int:
         if getattr(module, "_position_cache", None) is not None:
             continue
         module._position_cache = {}
+        module._position_cache_device = {}
         module._uncached_forward = module.forward
 
         def cached_forward(self, shape, device, dtype, mask=None, _orig=module._uncached_forward):
             _check(mask is None, "a masked sine position embedding cannot be cached by shape")
             key = (tuple(shape), str(dtype))
-            hit = self._position_cache.get(key)
+            # Host and device copies are kept side by side and chosen by what the caller
+            # is working on, so one process can hold a CPU model and a device model at
+            # once -- which is exactly what comparing them requires.
+            on_device = torch.device(device).type != "cpu"
+            table = self._position_cache_device if on_device else self._position_cache
+            hit = table.get(key)
+            if hit is None and on_device:
+                # Never build (or move) on the device inside a traced region; the host
+                # cache has to have been moved first. Fall back rather than corrupt.
+                hit = self._position_cache.get(key)
             if hit is None:
                 # Built on the host on purpose. Anything else defeats the point.
                 hit = _orig(torch.Size(shape), torch.device("cpu"), dtype, None)
@@ -149,14 +165,19 @@ def cache_position_embeddings(model: torch.nn.Module) -> int:
 
 
 def move_position_cache(model: torch.nn.Module, device, dtype=None) -> int:
-    """Move every cached position table to ``device``. Returns how many were moved."""
+    """Copy every cached position table to ``device``, keeping the host one.
+
+    Keeping both is what lets a CPU model and a device model coexist in one process.
+    Returns how many tables were copied.
+    """
     moved = 0
     for module in model.modules():
         cache = getattr(module, "_position_cache", None)
         if not cache:
             continue
-        for key, value in list(cache.items()):
-            cache[key] = value.to(device=device, dtype=dtype or value.dtype)
+        target = module._position_cache_device
+        for key, value in cache.items():
+            target[key] = value.to(device=device, dtype=dtype or value.dtype)
             moved += 1
     return moved
 
@@ -176,6 +197,10 @@ def cache_reference_points(model: torch.nn.Module, level_shapes) -> None:
     asserted here rather than assumed -- so the grid is fixed, and the ``meshgrid`` plus
     non-contiguous ``reshape`` that the device refuses never runs.
     """
+    if _applied.get("reference_points") == list(level_shapes):
+        return
+    _applied["reference_points"] = list(level_shapes)
+
     from transformers.models.oneformer import modeling_oneformer as m
 
     cls = m.OneFormerPixelDecoderEncoderOnly
@@ -196,9 +221,10 @@ def cache_reference_points(model: torch.nn.Module, level_shapes) -> None:
             f"valid_ratios covers {valid_ratios.shape[1]} levels but this patch was "
             f"installed for {len(level_shapes)}",
         )
-        moved = _reference_cache.get("device")
-        if moved is not None:
-            return moved
+        if valid_ratios.device.type != "cpu":
+            moved = _reference_cache.get("device")
+            if moved is not None:
+                return moved
 
         host = _reference_cache.get("host")
         if host is None:
@@ -235,6 +261,15 @@ def constant_fold_pixel_decoder_split(level_shapes) -> None:
     and the result is compiled in the module's namespace. A copy would drift silently;
     this way an upstream edit that moves any of the three lines fails loudly instead.
     """
+    if _applied.get("pixel_decoder_split") == list(level_shapes):
+        return
+    _check(
+        "pixel_decoder_split" not in _applied,
+        "the pixel decoder was already patched for different level shapes; build one "
+        "process per input size",
+    )
+    _applied["pixel_decoder_split"] = list(level_shapes)
+
     from transformers.models.oneformer import modeling_oneformer as m
 
     cls = m.OneFormerPixelDecoder
@@ -290,6 +325,9 @@ def detensorize_mask_threshold() -> None:
 
     Applied as a source transform on upstream's own method, like patch 7.
     """
+    if _applied.get("detensorize_mask_threshold"):
+        return
+    _applied["detensorize_mask_threshold"] = True
     from transformers.models.oneformer import modeling_oneformer as m
 
     cls = m.OneFormerTransformerDecoder
@@ -326,6 +364,9 @@ def relax_shape_assert() -> None:
     whenever the condition can be evaluated on the host, which includes the whole CPU
     parity pass.
     """
+    if _applied.get("relax_shape_assert"):
+        return
+    _applied["relax_shape_assert"] = True
     from transformers.models.oneformer import modeling_oneformer as m
 
     original = m.torch_compilable_check
@@ -375,6 +416,9 @@ def install(level_shapes: list[tuple[int, int]]) -> None:
     now cross-checks the caller's own ``value_spatial_shapes`` whenever it can do so
     without a device sync.
     """
+    if _applied.get("install"):
+        return
+    _applied["install"] = True
     from transformers.models.oneformer import modeling_oneformer as m
 
     # ---------------------------------------------------------------- 1. deformable

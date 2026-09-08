@@ -6,10 +6,11 @@ a task token at inference. This directory brings `shi-labs/oneformer_coco_swin_l
 up on Trn2.
 
 **Status: working.** The whole model compiles to a single graph and runs on one
-NeuronCore in **3 ms**, and its panoptic segmentation is **pixel-for-pixel identical**
-to HuggingFace on CPU — same segments, same order, same scores to four decimals. Eight
-patches were needed; every one of them is a compiler constraint, and all of them
-together leave the model numerically unchanged on CPU.
+NeuronCore, and its panoptic segmentation is **pixel-for-pixel identical** to
+HuggingFace on CPU on every image tried — same segments, same order, same scores to
+four decimals. A forward is **333 ms**, about **2.2x** the same forward on this box's
+12 CPU cores. Eight patches were needed; every one is a compiler constraint, and all of
+them together leave the model numerically unchanged on CPU.
 
 ## Why this is not a vllm-neuron model
 
@@ -193,8 +194,9 @@ python contrib/oneformer-swin-l/run_device.py --ref /tmp/of_ref/hf_panoptic_384.
     --dump-dtypes         # trace only, then report float64 nodes
 ```
 
-**Swin-L: works.** One graph, zero breaks, 246 s to compile, **2 ms warm**, and every
-feature map matches CPU:
+**Swin-L: works.** One graph, zero breaks, 246 s to compile, and every feature map
+matches CPU (the sub-graph latencies from that run were dispatch-only; see the
+correction below):
 
 | feature map | rel |
 |---|---|
@@ -206,7 +208,7 @@ feature map matches CPU:
 The growth with depth is fp32 reassociation accumulating over 24 blocks, not a defect.
 
 **Swin-L plus the pixel decoder: also works.** One graph, zero breaks, 697 s to
-compile, **2 ms warm**, and all four outputs match CPU — mask features
+compile, and all four outputs match CPU — mask features
 `(1, 256, 96, 96)` at rel 8.6e-06, and the three multi-scale maps at 2.6e-04, 1.0e-04
 and 1.7e-05. This is the result that matters most so far: the `grid_sample`-free
 deformable attention is not just correct in isolation, it is correct inside six real
@@ -223,8 +225,14 @@ Two candidates from that graph have been probed and **cleared**: `nn.MultiheadAt
 7.7e-07). So the promotion is elsewhere in those thousand nodes, and the next cut is by
 decoder layer count rather than by op.
 
-**The full model: works.** One graph, zero breaks, **782 s** to compile, **3 ms warm**
-against 0.9 s for the same forward on this box's 12 CPU cores.
+**The full model: works.** One graph, zero breaks, **782 s** to compile.
+
+> **A correction worth reading before trusting any latency here.** Earlier versions of
+> this file quoted 2-3 ms "warm" figures. Those were wrong: Neuron execution is
+> asynchronous, and `run_device.py` timed a call whose outputs it never read, so it was
+> measuring *dispatch*. Any graph, at any size, looks like single-digit milliseconds
+> that way. The script now reads an element back before stopping the clock, and the
+> real numbers are in "Real images, per stage" below.
 
 | against CPU, same input, fp32 | |
 |---|---|
@@ -252,6 +260,41 @@ four segments in the same order with identical pixel counts and scores:
 ```
 
 Treat the logit tolerances as bring-up tripwires and the segmentation as the criterion.
+
+## Real images, per stage
+
+`segment.py` runs whole images and times the three stages separately, in steady state
+(two calls discarded, then the median of ten). Only the middle one is on the device:
+
+```bash
+python contrib/oneformer-swin-l/segment.py --image cat.png dog.jpg car.jpg \
+    --compare-cpu --iterations 10 --out /tmp/of_seg
+```
+
+| stage | cat.png | dog.jpg | car.jpg | what it is |
+|---|---|---|---|---|
+| preprocess | 4.79 ms | 2.21 ms | 1.98 ms | resize + normalize + task token, host (scales with the source image) |
+| **forward, device** | **332.98 ms** | **333.01 ms** | **332.99 ms** | the compiled graph |
+| postprocess | 24.67 ms | 22.92 ms | 21.94 ms | sigmoid, threshold, argmax, upsample, host |
+| end to end | 362.44 ms | 358.15 ms | 356.91 ms | |
+| forward, CPU (12 cores) | 727.36 ms | 719.05 ms | 731.01 ms | the same model, same input |
+
+The device forward is flat to **0.5 ms across images** — static shapes, one graph, no
+data-dependent work — and **2.2x** the CPU forward. That ratio is modest for an
+accelerator and the reason is not mysterious: nothing here uses a NKI kernel, Swin's
+attention is plain SDPA, and the deformable attention is four gathers per level per
+layer. It is a correctness-first port, and the headroom is in kernels.
+
+Segmentation is identical on all three, including a six-segment image:
+
+| | CPU | Neuron |
+|---|---|---|
+| cat.png | couch 0.994, pillow 0.941, cat 0.999, remote 0.948 | identical |
+| dog.jpg | road 0.994, dog 1.000, door-stuff 0.881, pavement 0.986, skateboard 1.000, potted plant 0.893 | identical |
+| car.jpg | road 0.997, sky 0.999 | identical |
+
+`same segments: True | pixel agreement: 100.000%` for each, with pixel counts equal to
+the last pixel and scores equal to three decimals.
 
 ### How the f64 was found, since the error names nothing
 
@@ -315,6 +358,7 @@ contrib/oneformer-swin-l/
 ├── check_hf_reference.py   — HuggingFace on CPU: the reference, and something to look at
 ├── check_patches_vs_hf.py  — patched vs unpatched, on CPU
 ├── check_segmentation_vs_hf.py — the criterion: same segments, same pixels?
+├── segment.py              — real images: overlays, per-stage latency, CPU comparison
 ├── run_device.py           — compile and diff on device; bisects by module, dumps dtypes
 └── src/
     ├── bilinear.py         — grid_sample-free bilinear sampling + deformable attention
@@ -338,7 +382,8 @@ contrib/oneformer-swin-l/
       cannot hold the flat gather index), now fixed by keeping coordinate arithmetic in
       float32
 - [x] **The whole model on device: one graph, 3 ms, segmentation identical to CPU**
-- [ ] Post-processing and a CLI worth shipping (`segment.py`: image in, overlay out)
+- [x] `segment.py`: real images in, overlays out, per-stage steady-state latency, and
+      the CPU comparison — three images, all pixel-identical to HuggingFace
 - [ ] Other input sizes (768x768 is the interesting one for segmentation quality) and
       the semantic / instance tasks, which share the graph but not the post-processing
 - [ ] Latency beyond one image: batching, and whether the 782 s compile can be cut

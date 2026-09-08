@@ -285,6 +285,27 @@ accelerator and the reason is not mysterious: nothing here uses a NKI kernel, Sw
 attention is plain SDPA, and the deformable attention is four gathers per level per
 layer. It is a correctness-first port, and the headroom is in kernels.
 
+### The images
+
+Input, HuggingFace on CPU, and Neuron — in that order. The two segmentations are not
+merely similar, they are the same array: `pixel agreement: 100.000%`, so a difference
+map would be entirely black and is not included.
+
+**cat.png** — couch, pillow, cat, remote
+
+![cat: input, CPU, Neuron](samples/cat_panoptic.png)
+
+**dog.jpg** — road, dog, door-stuff, pavement, skateboard, potted plant
+
+![dog: input, CPU, Neuron](samples/dog_panoptic.png)
+
+**car.jpg** — road, sky
+
+![car: input, CPU, Neuron](samples/car_panoptic.png)
+
+Colours are per segment id from a fixed palette, so the same segment gets the same
+colour in both columns; they carry no class meaning.
+
 Segmentation is identical on all three, including a six-segment image:
 
 | | CPU | Neuron |
@@ -359,6 +380,7 @@ contrib/oneformer-swin-l/
 ├── check_patches_vs_hf.py  — patched vs unpatched, on CPU
 ├── check_segmentation_vs_hf.py — the criterion: same segments, same pixels?
 ├── segment.py              — real images: overlays, per-stage latency, CPU comparison
+├── samples/                — the three comparisons shown above
 ├── run_device.py           — compile and diff on device; bisects by module, dumps dtypes
 └── src/
     ├── bilinear.py         — grid_sample-free bilinear sampling + deformable attention

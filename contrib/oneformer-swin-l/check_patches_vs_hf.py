@@ -54,11 +54,19 @@ def build_inputs(size, task, seed=0):
     return {"pixel_values": pixel_values, "task_inputs": task_inputs}
 
 
-def run(model_path, inputs):
+def run(model_path, inputs, replace_gelu=None):
     from transformers import OneFormerForUniversalSegmentation
 
     model = OneFormerForUniversalSegmentation.from_pretrained(model_path)
     model.eval()
+    if replace_gelu is not None:
+        from src import patches as _p
+
+        print(f"      replaced {replace_gelu(model)} GELU activation(s), "
+              f"cached {_p.cache_position_embeddings(model)} position table(s)")
+        _p.cache_reference_points(model, _p._installed_level_shapes)
+        _p.relax_shape_assert()
+        _p.constant_fold_pixel_decoder_split(_p._installed_level_shapes)
     with torch.no_grad():
         out = model(**inputs)
     return out.class_queries_logits, out.masks_queries_logits
@@ -86,7 +94,7 @@ def main():
     importlib.reload(patches)
     patches.install(level_shapes)
     assert patches.is_installed()
-    got_cls, got_mask = run(args.model, inputs)
+    got_cls, got_mask = run(args.model, inputs, replace_gelu=patches.replace_gelu)
 
     failures = []
     for name, got, ref in (("class_queries_logits", got_cls, ref_cls),

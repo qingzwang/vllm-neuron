@@ -5,9 +5,11 @@ one model, one set of weights, three tasks (semantic / instance / panoptic) sele
 a task token at inference. This directory brings `shi-labs/oneformer_coco_swin_large`
 up on Trn2.
 
-**Status: the patched model is verified on CPU.** The compiler blockers are found and
-solved, the two required patches provably do not change the model, and HuggingFace's
-own output is recorded as the reference. Compiling the whole thing is next.
+**Status: the backbone runs on device; the whole model traces but does not yet
+compile.** Swin-L compiles to one graph and matches CPU (2 ms warm). The full model
+now traces as a single graph too, after seven patches, and stops at a compiler-side
+`f64 dtype is not supported` that the traced graph does not contain — see "Where this
+stands".
 
 ## Why this is not a vllm-neuron model
 
@@ -154,6 +156,74 @@ matching totals but compares the order element by element whenever the caller's
 to diff our deformable attention against **HuggingFace's own**, which is the check
 that was missing. Ours matches upstream to **3.8e-07** on CPU.
 
+## What the compiler forced, patch by patch
+
+`src/patches.py` is the whole port so far. Nothing in it is a preference; each entry
+exists because the device or the compiler rejected the upstream form, and each is
+verified not to change the model on CPU (`check_patches_vs_hf.py`, rel 7e-07 end to
+end with per-query argmax unchanged).
+
+| # | upstream | why it cannot stay | replacement |
+|---|---|---|---|
+| 1 | `F.grid_sample` in deformable attention | runtime aborts: `PjRt buffer is null in TransferFromDevice` | `bilinear.py`, matching `grid_sample` to 1.2e-07 on CPU and to 3.8e-07 against HF's own deformable attention |
+| 2 | `attention_mask[torch.where(mask.sum(-1) == n)] = False` | data-dependent index; Dynamo refuses under `fullgraph` | `mask & ~mask.all(-1, keepdim=True)`, same effect, static |
+| 3 | `F.gelu` / `nn.GELU` (24 of them) | `apply() takes no keyword arguments` | exact GELU via `erf`, 2.8e-07 from `F.gelu` |
+| 4 | `OneFormerSinePositionEmbedding` | `[NCC_IBIR243] Access pattern out of bounds` from its strided-slice + stack + flatten | constant at a pinned size: computed on the host, cached, moved to device once |
+| 5 | `get_reference_points` | `Expected self.is_contiguous() to be true` on `meshgrid(...).reshape(-1)` | same treatment; the constant is checked against upstream's own output on CPU first |
+| 6 | `torch_compilable_check(tensor_condition, ...)` | asserting on a tensor creates an unbacked symbol: `PendingUnbackedSymbolNotFound {u0}` | run the check on the host, skip it on device |
+| 7 | the pixel decoder's per-level `split` and `view` | sizes taken from tensors: `Could not guard on data-dependent expression 256*u0 < 2` | upstream's own source, transformed by three asserted substitutions, using Python ints |
+
+Patch 7 is a **source transform**, not a hand copy: the function's text is read with
+`inspect.getsource`, three exact substitutions are applied and asserted, and the result
+is compiled in the module's own namespace. A copy would drift silently against a
+transformers upgrade; this way an upstream edit that moves any of the three lines fails
+loudly at install time. (The constants have to live on the real module, not a copied
+namespace — Dynamo resolves a traced function's globals against the module it came
+from, and a copy fails the moment tracing starts.)
+
+## Where this stands on device
+
+```bash
+python contrib/oneformer-swin-l/run_device.py --ref /tmp/of_ref/hf_panoptic_384.pt \
+    --module backbone     # Swin-L alone
+    --module pixel        # ... plus the pixel decoder
+    --module full         # everything
+    --fullgraph           # fail on a graph break instead of running it eagerly
+    --dump-dtypes         # trace only, then report float64 nodes
+```
+
+**Swin-L: works.** One graph, zero breaks, 246 s to compile, **2 ms warm**, and every
+feature map matches CPU:
+
+| feature map | rel |
+|---|---|
+| `(1, 192, 96, 96)` | 1.7e-06 |
+| `(1, 384, 48, 48)` | 2.4e-06 |
+| `(1, 768, 24, 24)` | 2.5e-05 |
+| `(1, 1536, 12, 12)` | 1.2e-04 |
+
+The growth with depth is fp32 reassociation accumulating over 24 blocks, not a defect.
+
+**The full model: traces, does not compile.** With all seven patches it reaches the
+compiler as **one graph with no breaks**, and `neuronx-cc` then rejects it with
+
+```
+[NCC_ESPP004] f64 dtype is not supported.
+```
+
+`--dump-dtypes` says the traced graph contains **zero** float64 nodes, so the f64 is
+introduced below Dynamo, in the lowering to HLO — most likely a scalar constant. That
+is the open item; `--module pixel` narrows it to one half of the model, which is the
+cheap next step rather than reading a protobuf HLO.
+
+Two smaller things worth knowing, both already handled: a no-output subgraph (upstream
+builds `pixel_mask = torch.ones(...)` inside the forward, Dynamo isolates that line,
+and the backend rejects a graph with no outputs — pass `pixel_mask` explicitly), and
+`unimplemented _copy_from xla:0neuron:0`, which is what happens if a host constant is
+moved to "the device" *inside* the traced region: during tracing the device
+HuggingFace passes around is an XLA device, so constants have to be moved before
+compiling.
+
 ## Layout
 
 ```
@@ -162,9 +232,10 @@ contrib/oneformer-swin-l/
 ├── probe_device_ops.py     — op-level device probes
 ├── check_hf_reference.py   — HuggingFace on CPU: the reference, and something to look at
 ├── check_patches_vs_hf.py  — patched vs unpatched, on CPU
+├── run_device.py           — compile and diff on device; bisects by module, dumps dtypes
 └── src/
     ├── bilinear.py         — grid_sample-free bilinear sampling + deformable attention
-    └── patches.py          — the two substitutions, with version-drift assertions
+    └── patches.py          — the seven substitutions, with version-drift assertions
 ```
 
 ## Plan
@@ -175,7 +246,11 @@ contrib/oneformer-swin-l/
 - [x] HuggingFace reference on CPU at a pinned 384x384, saved as logits and images
 - [x] The two patches — deformable attention, mask guard — proved not to change the
       model (rel 6e-07 end to end, argmax unchanged)
-- [ ] The same patched model compiled and run on device, diffed against that reference
+- [x] Swin-L compiled and run on device, matching CPU on all four feature maps
+- [ ] **Open: `[NCC_ESPP004] f64 dtype is not supported` on the full model**, with no
+      f64 in the traced graph. Next: `--module pixel` to say which half, then find the
+      scalar the lowering promotes
+- [ ] The whole model on device, diffed against the CPU reference
 - [ ] End-to-end on device, against HF on CPU: class logits and mask logits
 - [ ] Post-processing on the host (semantic / instance / panoptic), and sample outputs
 - [ ] Latency, and whether the 76 s `interpolate` compile is worth avoiding by doing

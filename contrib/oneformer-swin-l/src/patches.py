@@ -58,6 +58,14 @@ Both are forced by ``probe_device_ops.py``, not by taste:
    splits are constants, so upstream's own source is transformed -- three exact string
    substitutions, asserted to apply -- to use Python ints.
 
+8. **A comparison against a Python float.** `forward_prediction_heads` ends with
+   ``... < 0.5`` to turn mask logits into a boolean attention mask. Comparing a tensor
+   with a Python float makes the lowering materialize that scalar as **f64**, and the
+   compiler then refuses the whole graph with ``[NCC_ESPP004] f64 dtype is not
+   supported``. Comparing against a same-dtype scalar *tensor* is identical in result
+   (verified bit-for-bit) and lowers cleanly. This is the only such comparison in the
+   model, and it is the one that blocked the full model for six compile attempts.
+
 All patches assert that the upstream code still looks the way they assume. A
 transformers upgrade that moves either line turns into a loud failure at install time
 rather than a silently unpatched model.
@@ -269,6 +277,43 @@ def constant_fold_pixel_decoder_split(level_shapes) -> None:
         namespace.pop("forward", None)
     else:
         namespace["forward"] = previous
+
+
+def detensorize_mask_threshold() -> None:
+    """Replace ``mask_logits < 0.5`` with a comparison against a scalar *tensor*.
+
+    Measured, in isolation: ``(x < 0.5)`` fails to compile with ``[NCC_ESPP004] f64
+    dtype is not supported``, while ``(x < torch.tensor(0.5, dtype=x.dtype))`` compiles
+    and is bit-identical. Every other op in the same chain -- interpolate, sigmoid,
+    repeat, flatten -- is fine, and so is arithmetic with Python floats elsewhere; it is
+    specifically the comparison that promotes the constant to f64.
+
+    Applied as a source transform on upstream's own method, like patch 7.
+    """
+    from transformers.models.oneformer import modeling_oneformer as m
+
+    cls = m.OneFormerTransformerDecoder
+    source = textwrap.dedent(inspect.getsource(cls.forward_prediction_heads))
+    old = (
+        "attention_mask.sigmoid().flatten(2).unsqueeze(1)"
+        ".repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5"
+    )
+    new = (
+        "attention_mask.sigmoid().flatten(2).unsqueeze(1)"
+        ".repeat(1, self.num_heads, 1, 1).flatten(0, 1) "
+        "< torch.tensor(0.5, dtype=attention_mask.dtype, device=attention_mask.device)"
+    )
+    _check(old in source, "the mask threshold comparison is not where it used to be")
+    source = source.replace(old, new)
+
+    namespace = vars(m)
+    previous = namespace.get("forward_prediction_heads")
+    exec(compile(source, "<oneformer forward_prediction_heads, patched>", "exec"), namespace)
+    cls.forward_prediction_heads = namespace["forward_prediction_heads"]
+    if previous is None:
+        namespace.pop("forward_prediction_heads", None)
+    else:
+        namespace["forward_prediction_heads"] = previous
 
 
 def relax_shape_assert() -> None:

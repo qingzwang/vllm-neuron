@@ -41,7 +41,8 @@ def parse_args():
     ap.add_argument("--ref", required=True, help=".pt written by check_hf_reference.py")
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
     ap.add_argument("--module", default="full",
-                    choices=("full", "backbone", "pixel", "decoder"),
+                    choices=("full", "backbone", "pixel", "decoder", "layers",
+                             "query"),
                     help="what to compile: the whole model, Swin-L alone, Swin-L plus "
                          "the pixel decoder, or the transformer half on its own. "
                          "Bisecting in that order is how a whole-model compiler "
@@ -50,6 +51,10 @@ def parse_args():
                     help="fail instead of breaking the graph; off by default so a "
                          "first run reports how many graphs it took")
     ap.add_argument("--save", default=None, help="write device logits here")
+    ap.add_argument("--decoder-layers", type=int, default=0,
+                    help="with --module layers: how many masked-attention layers to "
+                         "keep. 0 leaves the query transformer and the prediction "
+                         "heads, which is the cut that says whether the layers matter")
     ap.add_argument("--dump-dtypes", action="store_true",
                     help="trace with a no-op backend and report any float64 nodes, "
                          "which the compiler rejects outright ([NCC_ESPP004])")
@@ -80,6 +85,72 @@ class Heads(nn.Module):
             pixel_mask=pixel_mask,
         )
         return out.class_queries_logits, out.masks_queries_logits
+
+
+class QueryTransformer(nn.Module):
+    """Just ``transformer_module.decoder.query_transformer``.
+
+    OneFormer builds its object queries with a second, DETR-style decoder conditioned on
+    the task token. It is separate code from the masked-attention layers, so it gets its
+    own bisect step. Its inputs are *captured* from a real CPU forward rather than
+    reconstructed, so this harness cannot drift from how the model actually calls it.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.query_transformer = model.model.transformer_module.decoder.query_transformer
+
+    def forward(self, src, query_embed, pos_embed, task_token):
+        out = self.query_transformer(src, None, query_embed, pos_embed, task_token)
+        return (out[0],)
+
+
+def capture_query_transformer_inputs(model, pixel_out, task_token):
+    """Run the transformer module on CPU and record what query_transformer receives."""
+    captured = {}
+    target = model.model.transformer_module.decoder.query_transformer
+
+    def hook(_module, args):
+        # (src, mask, query_embed, pos_embed, task_token)
+        captured["args"] = args
+        return None
+
+    handle = target.register_forward_pre_hook(hook)
+    try:
+        with torch.no_grad():
+            model.model.transformer_module(
+                multi_scale_features=list(pixel_out.decoder_features),
+                mask_features=pixel_out.decoder_last_feature,
+                task_token=task_token,
+            )
+    finally:
+        handle.remove()
+    src, _mask, query_embed, pos_embed, captured_task = captured["args"]
+    return [src, query_embed, pos_embed,
+            captured_task if captured_task is not None else task_token]
+
+
+class DecoderLayers(nn.Module):
+    """The masked-attention layers only, truncated to ``layers`` of them.
+
+    Truncating is the cheap cut between "one of the nine layers does it" and "the
+    prediction heads or the query transformer does it": each extra layer is the same
+    code again, so if zero layers already fails the layers are innocent.
+    """
+
+    def __init__(self, model, layers):
+        super().__init__()
+        self.model = model.model
+        kept = self.model.transformer_module.decoder.layers[:layers]
+        self.model.transformer_module.decoder.layers = nn.ModuleList(kept)
+
+    def forward(self, mask_features, level0, level1, level2, task_token):
+        out = self.model.transformer_module(
+            multi_scale_features=[level0, level1, level2],
+            mask_features=mask_features,
+            task_token=task_token,
+        )
+        return out.prediction_class[-1], out.prediction_masks[-1]
 
 
 class Decoder(nn.Module):
@@ -174,16 +245,31 @@ def main():
     # keep it on the host, where it still catches level-shape mistakes.
     patches.relax_shape_assert()
     patches.constant_fold_pixel_decoder_split(level_shapes)
+    # `mask_logits < 0.5` promotes 0.5 to f64 in the lowering ([NCC_ESPP004]).
+    patches.detensorize_mask_threshold()
 
     builders = {"full": Heads, "backbone": Backbone, "pixel": PixelLevel,
                 "decoder": Decoder}
-    wrapper = builders[args.module](model).to(dtype)
-    inputs = [ref["pixel_values"].to(dtype)]
+    if args.module == "query":
+        with torch.no_grad():
+            pixel_out = model.model.pixel_level_module(ref["pixel_values"].to(dtype))
+            task_token = model.model.task_encoder(ref["task_inputs"].to(dtype))
+        wrapper = QueryTransformer(model).to(dtype)
+        inputs = capture_query_transformer_inputs(model, pixel_out, task_token)
+        print("[query] captured inputs: "
+              + ", ".join(str(tuple(x.shape)) for x in inputs))
+    elif args.module == "layers":
+        wrapper = DecoderLayers(model, args.decoder_layers).to(dtype)
+        print(f"[layers] kept {args.decoder_layers} masked-attention layer(s)")
+    else:
+        wrapper = builders[args.module](model).to(dtype)
+    if args.module != "query":
+        inputs = [ref["pixel_values"].to(dtype)]
     if args.module == "full":
         inputs.append(ref["task_inputs"])
         # float32 ones, which is exactly what upstream's default would build.
         inputs.append(torch.ones(1, size, size))
-    elif args.module == "decoder":
+    elif args.module in ("decoder", "layers"):
         # Run the pixel half on CPU once to get this half's real inputs.
         with torch.no_grad():
             pixel_out = model.model.pixel_level_module(ref["pixel_values"].to(dtype))
@@ -198,6 +284,7 @@ def main():
         cpu_out = wrapper(*inputs)
     if args.module in ("full", "decoder"):
         # Sanity: this dtype on CPU must still match the fp32 reference the .pt holds.
+        # (Not for --module layers: a truncated decoder is a different model.)
         compare("cpu class vs ref", cpu_out[0], ref["class_queries_logits"], dtype)
         compare("cpu mask vs ref", cpu_out[1], ref["masks_queries_logits"], dtype)
 
@@ -270,7 +357,7 @@ def main():
 
     print("\n[compare] device vs CPU, same dtype, same input")
     ok = True
-    if args.module in ("full", "decoder"):
+    if args.module in ("full", "decoder", "layers"):
         ok &= compare("class_queries_logits", device_out[0], cpu_out[0], dtype)
         ok &= compare("masks_queries_logits", device_out[1], cpu_out[1], dtype)
         same = torch.equal(device_out[0].argmax(-1), cpu_out[0].float().argmax(-1))

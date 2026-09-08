@@ -5,11 +5,11 @@ one model, one set of weights, three tasks (semantic / instance / panoptic) sele
 a task token at inference. This directory brings `shi-labs/oneformer_coco_swin_large`
 up on Trn2.
 
-**Status: the backbone runs on device; the whole model traces but does not yet
-compile.** Swin-L compiles to one graph and matches CPU (2 ms warm). The full model
-now traces as a single graph too, after seven patches, and stops at a compiler-side
-`f64 dtype is not supported` that the traced graph does not contain — see "Where this
-stands".
+**Status: working.** The whole model compiles to a single graph and runs on one
+NeuronCore in **3 ms**, and its panoptic segmentation is **pixel-for-pixel identical**
+to HuggingFace on CPU — same segments, same order, same scores to four decimals. Eight
+patches were needed; every one of them is a compiler constraint, and all of them
+together leave the model numerically unchanged on CPU.
 
 ## Why this is not a vllm-neuron model
 
@@ -172,6 +172,7 @@ end with per-query argmax unchanged).
 | 5 | `get_reference_points` | `Expected self.is_contiguous() to be true` on `meshgrid(...).reshape(-1)` | same treatment; the constant is checked against upstream's own output on CPU first |
 | 6 | `torch_compilable_check(tensor_condition, ...)` | asserting on a tensor creates an unbacked symbol: `PendingUnbackedSymbolNotFound {u0}` | run the check on the host, skip it on device |
 | 7 | the pixel decoder's per-level `split` and `view` | sizes taken from tensors: `Could not guard on data-dependent expression 256*u0 < 2` | upstream's own source, transformed by three asserted substitutions, using Python ints |
+| 8 | `mask_logits ... < 0.5` | comparing against a Python float promotes it to f64: `[NCC_ESPP004] f64 dtype is not supported` | compare against `torch.tensor(0.5, dtype=...)`, bit-identical |
 
 Patch 7 is a **source transform**, not a hand copy: the function's text is read with
 `inspect.getsource`, three exact substitutions are applied and asserted, and the result
@@ -222,20 +223,58 @@ Two candidates from that graph have been probed and **cleared**: `nn.MultiheadAt
 7.7e-07). So the promotion is elsewhere in those thousand nodes, and the next cut is by
 decoder layer count rather than by op.
 
-**The full model: traces, does not compile.** With all seven patches it reaches the
-compiler as **one graph with no breaks**, and `neuronx-cc` then rejects it with
+**The full model: works.** One graph, zero breaks, **782 s** to compile, **3 ms warm**
+against 0.9 s for the same forward on this box's 12 CPU cores.
+
+| against CPU, same input, fp32 | |
+|---|---|
+| `class_queries_logits` | rel 1.4e-03, mean 8.7e-06 |
+| `masks_queries_logits` | rel 3.8e-03, mean 2.6e-05 |
+| per-query argmax label | unchanged |
+| **panoptic segmentation** | **identical, 100.000% of pixels** |
+
+The mask-logit figure is above `run_device.py`'s 2e-03 tripwire, and it does not
+matter: mask logits are sigmoided and thresholded at 0.5, so a 3.8e-03 relative
+difference on a logit whose scale is ~89 changes nothing downstream.
+`check_segmentation_vs_hf.py` is the check that decides that, and it reports the same
+four segments in the same order with identical pixel counts and scores:
 
 ```
-[NCC_ESPP004] f64 dtype is not supported.
+    CPU (HuggingFace)                 Neuron
+0   couch 0.994  64850 px             couch 0.994  64850 px
+1   pillow 0.941  44774 px            pillow 0.941  44774 px
+2   cat 0.999  36939 px               cat 0.999  36939 px
+3   remote 0.948  835 px              remote 0.948  835 px
+
+  same segments, same order : True
+  pixel-for-pixel agreement : 100.000%
+  largest score difference  : 0.0000
 ```
 
-`--dump-dtypes` says the traced graph contains **zero** float64 nodes, so the f64 is
-introduced below Dynamo, in the lowering to HLO — most likely a scalar constant. The
-`--module pixel` run above narrows it to the transformer-decoder half. The failing
-graph's op histogram is otherwise unremarkable (464 `convert`, 24 `mhlo.erf` from the
-GELU replacement, and 118 `batch_norm_training`, which is how XLA lowers LayerNorm),
-so the next step is a decoder-only harness fed the pixel decoder's outputs, bisected
-the same way rather than by reading a protobuf HLO.
+Treat the logit tolerances as bring-up tripwires and the segmentation as the criterion.
+
+### How the f64 was found, since the error names nothing
+
+`[NCC_ESPP004] f64 dtype is not supported` cost six compile attempts, and the useful
+part is the method. `--dump-dtypes` established that the *traced* graph contains zero
+float64 nodes, so the promotion happens below Dynamo, in the lowering. Then the module
+bisect: `pixel` compiled, `decoder` did not; inside the decoder, `query_transformer`
+compiled clean (rel 6.0e-07) and so did `nn.MultiheadAttention` (2.4e-06) and
+`einsum` (7.7e-07); truncating to a single masked-attention layer still failed, which
+pointed at the shared code rather than the layers; and the attention-mask construction
+in `forward_prediction_heads` -- a chain with no parameters at all -- reproduced it.
+One more split inside that chain:
+
+| | |
+|---|---|
+| `x < 0.5` (a Python float) | **fails: f64 not supported** |
+| `x < torch.tensor(0.5, dtype=x.dtype)` | compiles, bit-identical |
+| `sigmoid`, `repeat`, `flatten`, `interpolate` | all fine |
+
+**Comparing a tensor against a Python float is what promotes the constant to f64.**
+Arithmetic with Python floats is fine (`* 0.5` appears in the GELU replacement), and
+`masked_fill(..., float("-inf"))` is fine; it is specifically the comparison. There is
+exactly one such comparison in OneFormer, and it was blocking the entire model.
 
 Two smaller things worth knowing, both already handled: a no-output subgraph (upstream
 builds `pixel_mask = torch.ones(...)` inside the forward, Dynamo isolates that line,
@@ -275,6 +314,7 @@ contrib/oneformer-swin-l/
 ├── probe_device_ops.py     — op-level device probes
 ├── check_hf_reference.py   — HuggingFace on CPU: the reference, and something to look at
 ├── check_patches_vs_hf.py  — patched vs unpatched, on CPU
+├── check_segmentation_vs_hf.py — the criterion: same segments, same pixels?
 ├── run_device.py           — compile and diff on device; bisects by module, dumps dtypes
 └── src/
     ├── bilinear.py         — grid_sample-free bilinear sampling + deformable attention
@@ -292,14 +332,16 @@ contrib/oneformer-swin-l/
 - [x] Swin-L compiled and run on device, matching CPU on all four feature maps
 - [x] Swin-L + pixel decoder on device (697 s compile, 2 ms warm, rel <= 2.6e-04),
       which is the deformable-attention replacement working in situ
-- [x] Bisected the f64: `--module decoder` reproduces it on the transformer half alone,
-      and `nn.MultiheadAttention` and `einsum` are cleared as the cause
+- [x] Found and fixed the f64: a tensor compared against a Python float
 - [x] bfloat16 evaluated: does not avoid the f64, and costs rel 0.38/0.54 on the two
-      heads on CPU. It did expose a real indexing bug (bf16 cannot hold the flat gather
-      index), now fixed by keeping coordinate arithmetic in float32
-- [ ] **Open: `[NCC_ESPP004] f64 dtype is not supported`.** Next cut: truncate the
-      decoder to one layer, then two, to separate the layers from the prediction heads
-- [ ] The whole model on device, diffed against the CPU reference
+      heads on CPU, so fp32 is the default. It did expose a real indexing bug (bf16
+      cannot hold the flat gather index), now fixed by keeping coordinate arithmetic in
+      float32
+- [x] **The whole model on device: one graph, 3 ms, segmentation identical to CPU**
+- [ ] Post-processing and a CLI worth shipping (`segment.py`: image in, overlay out)
+- [ ] Other input sizes (768x768 is the interesting one for segmentation quality) and
+      the semantic / instance tasks, which share the graph but not the post-processing
+- [ ] Latency beyond one image: batching, and whether the 782 s compile can be cut
 - [ ] End-to-end on device, against HF on CPU: class logits and mask logits
 - [ ] Post-processing on the host (semantic / instance / panoptic), and sample outputs
 - [ ] Latency, and whether the 76 s `interpolate` compile is worth avoiding by doing

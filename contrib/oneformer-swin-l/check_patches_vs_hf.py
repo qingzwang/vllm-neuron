@@ -67,6 +67,7 @@ def run(model_path, inputs, replace_gelu=None):
         _p.cache_reference_points(model, _p._installed_level_shapes)
         _p.relax_shape_assert()
         _p.constant_fold_pixel_decoder_split(_p._installed_level_shapes)
+        _p.detensorize_mask_threshold()
     with torch.no_grad():
         out = model(**inputs)
     return out.class_queries_logits, out.masks_queries_logits

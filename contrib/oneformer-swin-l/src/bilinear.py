@@ -41,6 +41,15 @@ def bilinear_sample(value: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     n, c, h, w = value.shape
     _, q, p, _ = grid.shape
 
+    # Coordinate arithmetic runs in float32 whatever the model's dtype is. In bfloat16
+    # only integers up to 256 are exact, so the flattened index `y * w + x` -- which
+    # reaches 2303 for a 48x48 level -- rounds, and the gather then reads the wrong
+    # element or goes out of bounds outright ("index 576 is out of bounds for dimension
+    # 2 with size 576"). The *values* stay in the model's dtype; only the addressing is
+    # promoted.
+    coord_dtype = torch.float32
+    grid = grid.to(coord_dtype)
+
     # Normalized -> pixel coordinates, align_corners=False.
     ix = ((grid[..., 0] + 1) * w - 1) / 2  # (N, Q, P)
     iy = ((grid[..., 1] + 1) * h - 1) / 2
@@ -57,7 +66,7 @@ def bilinear_sample(value: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     wy0 = 1 - wy1
 
     def inside(x, y):
-        return ((x >= 0) & (x <= w - 1) & (y >= 0) & (y <= h - 1)).to(value.dtype)
+        return ((x >= 0) & (x <= w - 1) & (y >= 0) & (y <= h - 1)).to(coord_dtype)
 
     corners = (
         (x0, y0, wx0 * wy0),
@@ -71,7 +80,9 @@ def bilinear_sample(value: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
     for x, y, weight in corners:
         # Zeros padding lives in the weight; the index is clamped so the gather is
         # always in range. Both are needed: clamping alone would replicate edges.
-        weight = (weight * inside(x, y)).reshape(n, 1, q * p)
+        # Weights are computed in float32 with the coordinates and cast at the end, so
+        # a bfloat16 model still gets bilinear weights worth the name.
+        weight = (weight * inside(x, y)).reshape(n, 1, q * p).to(value.dtype)
         xc = x.clamp(0, w - 1)
         yc = y.clamp(0, h - 1)
         index = (yc * w + xc).reshape(n, 1, q * p).to(torch.int64).expand(n, c, q * p)

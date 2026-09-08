@@ -213,7 +213,14 @@ pixel-decoder layers on device.
 
 It also **localizes the open blocker**: since `pixel` compiles and `full` does not, the
 f64 comes from the other half — the ten transformer-decoder layers, the task MLP and
-the prediction heads.
+the prediction heads. `--module decoder` compiles exactly that half (fed the pixel
+half's outputs from a CPU pass) and reproduces the same `[NCC_ESPP004]`, on a graph of
+~1000 FX nodes instead of the whole model.
+
+Two candidates from that graph have been probed and **cleared**: `nn.MultiheadAttention`
+(13 calls, rel 2.4e-06 on device, masked and unmasked) and `torch.einsum` (10 calls,
+7.7e-07). So the promotion is elsewhere in those thousand nodes, and the next cut is by
+decoder layer count rather than by op.
 
 **The full model: traces, does not compile.** With all seven patches it reaches the
 compiler as **one graph with no breaks**, and `neuronx-cc` then rejects it with
@@ -237,6 +244,28 @@ and the backend rejects a graph with no outputs — pass `pixel_mask` explicitly
 moved to "the device" *inside* the traced region: during tracing the device
 HuggingFace passes around is an XLA device, so constants have to be moved before
 compiling.
+
+## bfloat16: does not help, and costs accuracy
+
+Worth recording, since "just use bf16" is the obvious reaction to a dtype error:
+
+* **It does not fix the f64.** `--dtype bfloat16` fails with the identical
+  `[NCC_ESPP004]`, so the promotion has nothing to do with the model's dtype — it is a
+  constant introduced by the lowering.
+* **It is expensive here.** On CPU, before any device involvement, bf16 against the
+  fp32 reference is rel **0.38** on class logits and **0.54** on mask logits (mean
+  1.1e-02 / 2.4e-02). Those are logits that post-processing thresholds and argmaxes, so
+  fp32 stays the default until someone shows the segmentation is insensitive to that.
+* **It did find a real bug in this port**, which is the useful part. The flattened
+  gather index in `bilinear_sample` was computed in the model's dtype, and bfloat16
+  represents integers exactly only up to 256 — the index reaches 2303 for a 48x48
+  level, so it rounded and the gather went out of bounds outright:
+  `index 576 is out of bounds for dimension 2 with size 576`. Coordinate arithmetic and
+  the interpolation weights now run in float32 regardless of the model dtype, and only
+  the sampled *values* stay in it. fp32 is unchanged at ~1e-06 against `grid_sample`;
+  bf16 lands at 4.6e-02 (24x24) to 1.9e-01 (96x96), which is value rounding plus the
+  coarseness of bf16 *coordinates* — another reason bf16 is a poor fit for deformable
+  attention specifically.
 
 ## Layout
 
@@ -263,9 +292,13 @@ contrib/oneformer-swin-l/
 - [x] Swin-L compiled and run on device, matching CPU on all four feature maps
 - [x] Swin-L + pixel decoder on device (697 s compile, 2 ms warm, rel <= 2.6e-04),
       which is the deformable-attention replacement working in situ
-- [ ] **Open: `[NCC_ESPP004] f64 dtype is not supported` on the full model**, with no
-      f64 in the traced graph. Bisected to the transformer-decoder half; next is a
-      decoder-only harness to find the scalar the lowering promotes
+- [x] Bisected the f64: `--module decoder` reproduces it on the transformer half alone,
+      and `nn.MultiheadAttention` and `einsum` are cleared as the cause
+- [x] bfloat16 evaluated: does not avoid the f64, and costs rel 0.38/0.54 on the two
+      heads on CPU. It did expose a real indexing bug (bf16 cannot hold the flat gather
+      index), now fixed by keeping coordinate arithmetic in float32
+- [ ] **Open: `[NCC_ESPP004] f64 dtype is not supported`.** Next cut: truncate the
+      decoder to one layer, then two, to separate the layers from the prediction heads
 - [ ] The whole model on device, diffed against the CPU reference
 - [ ] End-to-end on device, against HF on CPU: class logits and mask logits
 - [ ] Post-processing on the host (semantic / instance / panoptic), and sample outputs

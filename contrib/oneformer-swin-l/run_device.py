@@ -40,10 +40,12 @@ def parse_args():
     ap.add_argument("--model", default="/mnt/nvme/models/oneformer_coco_swin_large")
     ap.add_argument("--ref", required=True, help=".pt written by check_hf_reference.py")
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
-    ap.add_argument("--module", default="full", choices=("full", "backbone", "pixel"),
-                    help="what to compile: the whole model, Swin-L alone, or Swin-L "
-                         "plus the pixel decoder. Bisecting in that order is how a "
-                         "whole-model compiler failure gets localized cheaply")
+    ap.add_argument("--module", default="full",
+                    choices=("full", "backbone", "pixel", "decoder"),
+                    help="what to compile: the whole model, Swin-L alone, Swin-L plus "
+                         "the pixel decoder, or the transformer half on its own. "
+                         "Bisecting in that order is how a whole-model compiler "
+                         "failure gets localized cheaply")
     ap.add_argument("--fullgraph", action="store_true",
                     help="fail instead of breaking the graph; off by default so a "
                          "first run reports how many graphs it took")
@@ -78,6 +80,31 @@ class Heads(nn.Module):
             pixel_mask=pixel_mask,
         )
         return out.class_queries_logits, out.masks_queries_logits
+
+
+class Decoder(nn.Module):
+    """The other half: the transformer module, fed the pixel decoder's outputs.
+
+    Splitting the model here is what localizes a whole-model compiler failure: the
+    pixel half compiles, so anything left is in these ten layers, the task MLP and the
+    prediction heads. The inputs come from a CPU forward of the pixel half, so this
+    harness needs no device work of its own to set up.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model.model
+
+    def forward(self, mask_features, level0, level1, level2, task_token):
+        out = self.model.transformer_module(
+            multi_scale_features=[level0, level1, level2],
+            mask_features=mask_features,
+            task_token=task_token,
+        )
+        # The transformer module names these prediction_class / prediction_masks; the
+        # top-level model renames the last entry of each to the *_queries_logits it
+        # returns, which is what the reference .pt holds.
+        return out.prediction_class[-1], out.prediction_masks[-1]
 
 
 class PixelLevel(nn.Module):
@@ -148,18 +175,28 @@ def main():
     patches.relax_shape_assert()
     patches.constant_fold_pixel_decoder_split(level_shapes)
 
-    builders = {"full": Heads, "backbone": Backbone, "pixel": PixelLevel}
+    builders = {"full": Heads, "backbone": Backbone, "pixel": PixelLevel,
+                "decoder": Decoder}
     wrapper = builders[args.module](model).to(dtype)
     inputs = [ref["pixel_values"].to(dtype)]
     if args.module == "full":
         inputs.append(ref["task_inputs"])
         # float32 ones, which is exactly what upstream's default would build.
         inputs.append(torch.ones(1, size, size))
+    elif args.module == "decoder":
+        # Run the pixel half on CPU once to get this half's real inputs.
+        with torch.no_grad():
+            pixel_out = model.model.pixel_level_module(ref["pixel_values"].to(dtype))
+            task_token = model.model.task_encoder(ref["task_inputs"].to(dtype))
+        inputs = [pixel_out.decoder_last_feature, *pixel_out.decoder_features, task_token]
+        print(f"[decoder] inputs: mask_features {tuple(inputs[0].shape)}, "
+              f"levels {[tuple(x.shape) for x in inputs[1:4]]}, "
+              f"task_token {tuple(inputs[4].shape)}")
 
     print("[cpu] reference forward in this dtype (so the diff is compiler-only)")
     with torch.no_grad():
         cpu_out = wrapper(*inputs)
-    if args.module == "full":
+    if args.module in ("full", "decoder"):
         # Sanity: this dtype on CPU must still match the fp32 reference the .pt holds.
         compare("cpu class vs ref", cpu_out[0], ref["class_queries_logits"], dtype)
         compare("cpu mask vs ref", cpu_out[1], ref["masks_queries_logits"], dtype)
@@ -233,7 +270,7 @@ def main():
 
     print("\n[compare] device vs CPU, same dtype, same input")
     ok = True
-    if args.module == "full":
+    if args.module in ("full", "decoder"):
         ok &= compare("class_queries_logits", device_out[0], cpu_out[0], dtype)
         ok &= compare("masks_queries_logits", device_out[1], cpu_out[1], dtype)
         same = torch.equal(device_out[0].argmax(-1), cpu_out[0].float().argmax(-1))

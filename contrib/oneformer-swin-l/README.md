@@ -204,6 +204,17 @@ feature map matches CPU:
 
 The growth with depth is fp32 reassociation accumulating over 24 blocks, not a defect.
 
+**Swin-L plus the pixel decoder: also works.** One graph, zero breaks, 697 s to
+compile, **2 ms warm**, and all four outputs match CPU — mask features
+`(1, 256, 96, 96)` at rel 8.6e-06, and the three multi-scale maps at 2.6e-04, 1.0e-04
+and 1.7e-05. This is the result that matters most so far: the `grid_sample`-free
+deformable attention is not just correct in isolation, it is correct inside six real
+pixel-decoder layers on device.
+
+It also **localizes the open blocker**: since `pixel` compiles and `full` does not, the
+f64 comes from the other half — the ten transformer-decoder layers, the task MLP and
+the prediction heads.
+
 **The full model: traces, does not compile.** With all seven patches it reaches the
 compiler as **one graph with no breaks**, and `neuronx-cc` then rejects it with
 
@@ -212,9 +223,12 @@ compiler as **one graph with no breaks**, and `neuronx-cc` then rejects it with
 ```
 
 `--dump-dtypes` says the traced graph contains **zero** float64 nodes, so the f64 is
-introduced below Dynamo, in the lowering to HLO — most likely a scalar constant. That
-is the open item; `--module pixel` narrows it to one half of the model, which is the
-cheap next step rather than reading a protobuf HLO.
+introduced below Dynamo, in the lowering to HLO — most likely a scalar constant. The
+`--module pixel` run above narrows it to the transformer-decoder half. The failing
+graph's op histogram is otherwise unremarkable (464 `convert`, 24 `mhlo.erf` from the
+GELU replacement, and 118 `batch_norm_training`, which is how XLA lowers LayerNorm),
+so the next step is a decoder-only harness fed the pixel decoder's outputs, bisected
+the same way rather than by reading a protobuf HLO.
 
 Two smaller things worth knowing, both already handled: a no-output subgraph (upstream
 builds `pixel_mask = torch.ones(...)` inside the forward, Dynamo isolates that line,
@@ -247,9 +261,11 @@ contrib/oneformer-swin-l/
 - [x] The two patches — deformable attention, mask guard — proved not to change the
       model (rel 6e-07 end to end, argmax unchanged)
 - [x] Swin-L compiled and run on device, matching CPU on all four feature maps
+- [x] Swin-L + pixel decoder on device (697 s compile, 2 ms warm, rel <= 2.6e-04),
+      which is the deformable-attention replacement working in situ
 - [ ] **Open: `[NCC_ESPP004] f64 dtype is not supported` on the full model**, with no
-      f64 in the traced graph. Next: `--module pixel` to say which half, then find the
-      scalar the lowering promotes
+      f64 in the traced graph. Bisected to the transformer-decoder half; next is a
+      decoder-only harness to find the scalar the lowering promotes
 - [ ] The whole model on device, diffed against the CPU reference
 - [ ] End-to-end on device, against HF on CPU: class logits and mask logits
 - [ ] Post-processing on the host (semantic / instance / panoptic), and sample outputs

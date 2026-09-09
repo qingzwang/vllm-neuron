@@ -8,17 +8,19 @@ up on Trainium — developed on Trn2, since re-run unchanged on Trn1.
 **Status: working.** The whole model compiles to a single graph and runs on one
 NeuronCore, and its panoptic segmentation is **pixel-for-pixel identical** to
 HuggingFace on CPU on every image tried — same segments, same order, same scores to
-four decimals. A forward is **333 ms on trn2.3xlarge, 244 ms on trn1.2xlarge**, about
-2-3x the same forward on 12 CPU cores. Eight patches were needed; every one is a
-compiler constraint, and all of them together leave the model numerically unchanged on
-CPU.
+four decimals. A forward is **230 ms on trn1.2xlarge** (244 ms before the tuning below)
+and 333 ms on trn2.3xlarge, about 2-3x the same forward on 12 CPU cores. Nine patches
+were needed; every one is a compiler constraint, and all of them together leave the model
+numerically unchanged on CPU.
 
 That ratio is modest for an accelerator, and the port has now been profiled rather than
 guessed about, so the reason is specific: **54% of the forward is DMA and 34% of it is
 one op** — the gather inside deformable attention. The tensor engine is idle 83% of the
-time. The headroom is in kernels, and "Where the 240 ms goes" says which one and how much
-it is worth. (bfloat16 was measured too: 10% faster, and not worth its accuracy cost
-while DMA dominates.)
+time. "Where the 240 ms goes" says what that buys and what was taken: `--optlevel 1` and
+an exact power-of-two resize are worth 10.5 ms together (241.0 → 230.5) at unchanged
+segmentation, and the 83 ms gather is a *hardware generation* boundary, not a missing
+kernel — the NKI kernel for it is written and needs Trainium2. bfloat16 is 9% faster and
+opt-in, because it loses a whole small object.
 
 ## Why this is not a vllm-neuron model
 
@@ -45,7 +47,10 @@ Validated on **trn2.3xlarge** (`logical-neuroncore-config: 2`) and, later and
 independently, on **trn1.2xlarge** (LNC 1) — same software on both: vllm-neuron
 0.24.0.1.1.0, `libtorch-neuronx-lite` 2.11.0.1.0.1284, neuronx-cc 2.27.5334.0,
 transformers 5.15.0, torch 2.11.0. Nothing in the port needed changing to move between
-them: same eight patches, one graph, zero breaks, segmentation identical to CPU on both.
+them: the same patches, one graph, zero breaks, segmentation identical to CPU on both.
+(Patch 9 and the compiler flags came later, on trn1, and have not been re-measured on
+trn2 — the table below is the eight-patch build on both boxes, so it is a fair
+comparison.)
 
 They do not agree on the numbers, so every figure below says which box it is from:
 
@@ -213,14 +218,20 @@ end with per-query argmax unchanged).
 | 6 | `torch_compilable_check(tensor_condition, ...)` | asserting on a tensor creates an unbacked symbol: `PendingUnbackedSymbolNotFound {u0}` | run the check on the host, skip it on device |
 | 7 | the pixel decoder's per-level `split` and `view` | sizes taken from tensors: `Could not guard on data-dependent expression 256*u0 < 2` | upstream's own source, transformed by three asserted substitutions, using Python ints |
 | 8 | `mask_logits ... < 0.5` | comparing against a Python float promotes it to f64: `[NCC_ESPP004] f64 dtype is not supported` | compare against `torch.tensor(0.5, dtype=...)`, bit-identical |
+| 9 | `F.interpolate(..., "bilinear")`, 2 sites | *compiles*; the generic lowering makes it a dense resample **matmul** — one is 9216x144 fp32, 10.0 ms and 1.7 GB of spill on its own | `resize.py`: at power-of-two ratios `align_corners=False` fixes every weight, so it is shifts and adds. rel 0.0 against `F.interpolate` on device |
 
-Patch 7 is a **source transform**, not a hand copy: the function's text is read with
-`inspect.getsource`, three exact substitutions are applied and asserted, and the result
-is compiled in the module's own namespace. A copy would drift silently against a
-transformers upgrade; this way an upstream edit that moves any of the three lines fails
-loudly at install time. (The constants have to live on the real module, not a copied
-namespace — Dynamo resolves a traced function's globals against the module it came
-from, and a copy fails the moment tracing starts.)
+Patches 7, 8 and 9 are **source transforms**, not hand copies: the function's text is read
+with `inspect.getsource`, exact substitutions are applied and asserted, and the result is
+compiled in the module's own namespace. A copy would drift silently against a transformers
+upgrade; this way an upstream edit that moves any of the substituted lines fails loudly at
+install time. (The constants have to live on the real module, not a copied namespace —
+Dynamo resolves a traced function's globals against the module it came from, and a copy
+fails the moment tracing starts. And a method can only be transformed once: afterwards
+`inspect.getsource` sees the synthetic filename the transform compiled under, so all
+substitutions on one method are installed together.)
+
+Patch 9 is the only entry that is not forced by a failure. It is forced by the profile,
+and it is in the table because the cost is not marginal: see "Where the 240 ms goes".
 
 ## Where this stands on device
 
@@ -313,8 +324,9 @@ python contrib/oneformer-swin-l/segment.py --image cat.png dog.jpg car.jpg \
 ```
 
 The table below is **trn2.3xlarge**. The same run on trn1.2xlarge is 244 ms for the
-forward, 20-24 ms to post-process and 730 ms on CPU; see "Two machines" above for why
-the device figure differs and "Where the 240 ms goes" for what it consists of.
+forward — 232.9 ms once `--optlevel 1` and the fixed resize went in, which is what the
+defaults now do — 20-24 ms to post-process and 730 ms on CPU; see "Two machines" above
+for why the device figure differs and "Where the 240 ms goes" for what it consists of.
 
 | stage | cat.png | dog.jpg | car.jpg | what it is |
 |---|---|---|---|---|
@@ -328,7 +340,9 @@ The device forward is flat to **0.5 ms across images** — static shapes, one gr
 data-dependent work — and **2.2x** the CPU forward. That ratio is modest for an
 accelerator and the reason is not mysterious: nothing here uses a NKI kernel, Swin's
 attention is plain SDPA, and the deformable attention is four gathers per level per
-layer. It is a correctness-first port, and the headroom is in kernels.
+layer. It is a correctness-first port, and the headroom looked like it was in kernels.
+The profile below says where it actually is — and that on this box the one kernel worth
+writing cannot run.
 
 ### The images
 
@@ -424,10 +438,53 @@ forward, so halving it cannot buy more than about 20 ms no matter how it is done
 The price is the whole numerical margin. `--auto-cast=matmult` still leaves the per-query
 argmax unchanged, so it might well still segment identically — but it moves the logits
 from rel 3.6e-06 to rel 0.52, which spends every bit of headroom the port has for a
-tenth of the runtime, so its segmentation was not chased. Model-level bf16 is worse than
+tenth of the runtime. Whether that shows up in the segmentation is the next subsection,
+which settles it. Model-level bf16 is worse than
 merely inaccurate: **class logits come back NaN** and the argmax changes, which is the
 fully-masked-softmax hazard from "A fully masked attention row is not NaN here" firing
 for real.
+
+### Judged on segmentation, which is the criterion that actually matters
+
+Logit relative error is the wrong yardstick for a model whose output is a label per pixel,
+and the ConvNeXt-XL port of this same model ships bf16 on the strength of 99.98% semantic
+pixel agreement. So the question was reopened properly: `segment.py --compare-cpu` on the
+three sample images, at `--optlevel 1` with the fixed resize, comparing the device
+segmentation against the same patched model on CPU.
+
+| | forward | semantic pixel agreement | panoptic pixel agreement |
+|---|---|---|---|
+| fp32 | 232.9 ms | **100.000 / 100.000 / 100.000%** | **100.000 / 100.000 / 100.000%** |
+| `--auto-cast=matmult` | 211.4 ms | 99.843 / 99.960 / 99.990% | **24.203** / 99.968 / 99.995% |
+| `--auto-cast=all` | 211.5 ms | 99.843 / 99.960 / 99.990% | **24.203** / 99.968 / 99.995% |
+
+(car / cat / dog. fp32 is exact on all six: not "close", *identical*.)
+
+**`matmult` and `all` are indistinguishable** — same latency to 0.1 ms, same agreement to
+five decimals, on two genuinely different builds with different cache keys. As the older
+table above already suggested, the matmuls are the only thing being cast either way, so
+there is no gentler setting that keeps the speed.
+
+The 24.203% is the interesting number, and it is *not* an id-numbering artifact being
+unfair to bf16 — it is one, seen through such an artifact. The panoptic segment table for
+that image agrees with CPU on segments 0 through 12 to within a handful of pixels, and then:
+
+```
+  12    person 0.973 2744px          person 0.973 2735px
+  13    tennis racket 0.996 2009px    person 0.944 1793px     <- CPU's racket is gone
+  14    person 0.945 1793px          backpack 0.764 1147px
+```
+
+bf16 loses a 2009-pixel tennis racket that fp32 detects at confidence 0.996. Panoptic ids
+are assigned in confidence order, so every segment after it renumbers and the id-map
+agreement collapses; the honest size of the error is the 1.4% of the frame that changed
+label, which is also what the semantic run reports as 99.843%.
+
+So: **9.2% for losing a small object, on one image in three.** That is a bad trade for a
+segmentation model, and it is exactly the failure mode a single aggregate agreement figure
+hides — 99.84% sounds like rounding and is in fact a missing object. bf16 stays a
+documented flag, not the default. It is the right flag to reach for if throughput matters
+more than the small objects; it should not be reached for silently.
 
 Two corrections to what this file used to say, both worth keeping:
 
@@ -466,7 +523,9 @@ And two things that were already true and still are:
 
 All trn1.2xlarge. The port is correctness-first and 244 ms is slow, so this is the
 measurement that says what would actually make it faster — and, first, that the answer is
-not in this repository's Python.
+not in the *harness*: it is all inside the compiled graph. (This section is the 244 ms
+baseline throughout. What came out of it — `--optlevel 1` and the fixed resize, 230.5 ms
+— is at the end.)
 
 The NEFF can be run without any of it. Every compile leaves one in the cache, and
 `neuron-bench` executes it directly, which separates the graph from the harness:
@@ -555,26 +614,140 @@ attribution and not an exact decomposition — the compiler schedules the two di
 It is close enough to act on: no plausible scheduling difference turns 10.5 ms of gather
 into 83 ms.)
 
+### Compiler flags, swept
+
+Before changing the model, the free thing: ask the compiler. Every flag below is a
+full-model `--fullgraph` build, benchmarked with `neuron-bench -n 200 -w 20` (the spread
+within a run is ~40 µs, so differences of 0.1 ms are real and differences of 3 ms are
+large):
+
+| flag | device latency | vs baseline | compile |
+|---|---|---|---|
+| *(none)* | 241.05 ms | — | 637 s |
+| `--optlevel 3` | 241.04 ms | −0.01 | 578 s |
+| **`--optlevel 1`** | **237.91 ms** | **−3.14** | **202 s** |
+| `--enable-dge --internal-enable-dge-levels=…` (3 variants) | 241.10 ms | +0.05 | 576 s |
+| `--vectorize-strided-dma` | — | — | does not exist in neuronx-cc 2.27 |
+
+`--optlevel 1` is both the fastest and 3x cheaper to compile, and it is *slightly more
+accurate* (rel 3.008e-06 / 3.634e-06 against CPU, versus 3.619e-06 / 4.597e-06 at the
+default). Its profile says where the 3 ms came from: transposes 230.9 → 154.3 GFLOP
+(−33%), spill *save* 3.42 → 2.19 GB (−36%), save+reload 7.29 → 5.75 GB (−21%). Less
+scheduling freedom, less shuffling.
+
+**DGE (descriptor generation engine) is inert here.** Every counter in the DGE builds is
+the same integer as the baseline's, and `hardware_dynamic_dma_packet_percent` is 0 in all
+of them — the gather never reaches the hardware descriptor path, so there is nothing for
+the flag to enable. (One caveat on the sweep itself: `--internal-enable-dge-levels` is a
+*store*, not an append, so repeating the flag keeps only the last value. The "all levels"
+variant therefore built the same graph as the transpose-only one and hit its cache key.
+That variant is untested, not measured.)
+
+The number that matters is the one that does **not** move: software dynamic DMA is
+83.0 ms at the default and 84.0 ms at `--optlevel 1`, and 83.0–84.0 ms in every other
+build in the sweep. The gather is not a scheduling problem. No flag can fix it, which is
+what sends the work back into the model.
+
+### Fixed resize: −6.9 ms, for two substitutions
+
+Then the first thing the profile pointed at that is *in the model*: `%dot.2`, a 9216x144
+fp32 matrix — the one HLO whose `load_weight_bytes` is exactly `(96*96) x (12*12)` — which
+is `F.interpolate(outputs_mask, size=(12,12), "bilinear")` in `forward_prediction_heads`,
+compiled as a dense resample matmul. 10.03 ms and 1.735 GB of spill (24% of all spill) for
+one resize, and `forward_prediction_heads` runs 11 times per forward.
+
+`src/resize.py` replaces it (patch 9). `neuron-bench`, same conditions as the table above:
+
+| | default optlevel | `--optlevel 1` |
+|---|---|---|
+| baseline | 241.05 ms | 237.91 ms |
+| **+ fixed resize** | **234.13 ms** | **230.46 ms** |
+| Δ | −6.92 | −7.45 |
+
+Accuracy is unchanged (rel 3.478e-06 / 4.510e-06 against CPU at the default, 3.071e-06 /
+3.503e-06 at `--optlevel 1`, per-query argmax identical), and the CPU-side check is
+exact: the fixed weights reproduce `F.interpolate` to 1e-07 on the host and to **0.00e+00**
+on device (probe `fixed_resize`). −6.9 ms is less than the 10.0 ms the op cost because the
+replacement is not free — but it is 3% of the forward for two string substitutions, and it
+generalises: every one of this model's resize ratios is a power of two.
+
+The profile says it was the right op, and it moved what it was supposed to move:
+
+| | baseline | + fixed resize |
+|---|---|---|
+| matmul instructions | 398,138 | **310,513** (−22%) |
+| spill save + reload | 7.29 GB | **5.78 GB** (−21%) |
+| transpose FLOP | 230.9 G | 222.5 G |
+| gather (software dynamic DMA) | 83.0 ms | 81.2 ms |
+
+87,625 matmul instructions and 1.5 GB of spill traffic, for eleven resizes per forward
+that were never arithmetic in the first place.
+
+### The NKI deformable-attention kernel needs gen3, and this is gen2
+
+`nkilib.experimental.deformable_attention.ms_deformable_attention` is a shipped, tested
+NKI kernel for exactly the 83 ms op, and the ConvNeXt-XL port of this same model uses it
+to get its whole pixel decoder — six of these layers — down to 70 ms. `src/nki_msda.py`
+wires it in (`--msda nki`), and it does not run here:
+
+```
+error: assertion failed: 'dma_transpose with indirect access (dma_gather_transpose)'
+is supported for nc_version.gen3+, but current target is nc_version.gen2
+    nkilib/.../ms_deformable_attention.py:686:  nisa.dma_transpose(
+```
+
+The kernel's whole method is a **single DMA that gathers and transposes at once**
+(`nisa.dma_transpose(..., vector_offset=..., indirect_dim=0)`), and that instruction is
+Trainium2 (NeuronCore-v3) and later. trn1's NeuronCore-v2 is gen2. There is no fallback
+path and no flag: the assert fires while tracing the kernel, at every tile size, in both
+the forward and the backward kernel. The same generation boundary shows up in the profile
+already — `hardware_dynamic_dma_packet_percent` is 0 on this machine because hardware
+descriptor generation (`dge_mode.hwdge`) is also gen3+, so every one of those 3.7 M
+gather descriptors is generated in *software*.
+
+So the 83 ms is not a missing kernel, it is the machine. Two consequences worth being
+precise about:
+
+* **On trn2 this is a `--msda nki` away.** The code is written, the conventions are
+  verified against the kernel's source (see `src/nki_msda.py` for the row/column question,
+  which square feature maps would have hidden), and the probes are in
+  `probe_device_ops.py`, including a deliberately non-square one.
+* **On trn1, a hand-written kernel is unlikely to beat the compiler at this.** The gen2-legal
+  gather primitives are `nisa.local_gather` (GpSimd, partition offsets within 16-partition
+  groups, ≤4096 indices per core) and `nisa.nc_n_gather`. Both would gather one sample's
+  32-channel row at a time: 128 bytes per descriptor. The compiler's current lowering
+  already averages **552 bytes** per gather packet, because it coalesces across
+  neighbouring queries. Writing a kernel to make the packets four times *smaller* is not
+  a plan, and DMA time here is per packet.
+
 ### What would actually be worth doing
 
-In descending order of measured value:
+What has been done, and what the numbers say is left. Everything above is now the
+default: `--optlevel=1` plus the fixed resize takes the fp32 forward from **241.0 ms to
+230.5 ms (−4.4%)** with segmentation still 100.000% pixel-identical to CPU.
 
-1. **A NKI kernel for the deformable attention** — 83 ms, 34%. This is what "the headroom
-   is in kernels" at the top of this file meant, now with a number on it. The target is
-   not arithmetic: it is packet count. Four neighbours are currently four independent
-   gathers, so a bilinear sample of one point is four scattered ~550-byte reads. Fetching
-   the 2x2 neighbourhood as one block is a 4x reduction on its own, and more if
-   neighbouring sample points share rows — which, for a learned offset field, they often
-   do. This is also the one op where the port already owns the source.
-2. **Spill** — 52 ms, 21%. Static DMA (7.46 GB) is almost exactly the spill traffic
-   (7.29 GB), so essentially all of it is the working set not fitting SBUF and being
-   written to HBM and read back. bf16 helped here, which is a hint that anything reducing
-   live bytes helps; `--optlevel`, or one fewer pixel-decoder level, are the cheap things
-   to try.
-3. **bfloat16, but afterwards.** 20 ms of tensor-engine time is real, it is just
-   invisible behind 131 ms of DMA. Once DMA stops dominating, that 20 ms becomes a much
-   larger fraction — and the accuracy question can be settled properly then, against
-   segmentation rather than against logits.
+1. **Run it on trn2, which is where the 83 ms lives.** This is not a code change — the
+   code is written. Both halves of the gather problem are the same generation boundary:
+   the NKI kernel needs gen3, *and* hardware descriptor generation needs gen3, which is
+   why 3.7 M descriptors are built in software on this box. The ConvNeXt-XL port's whole
+   pixel decoder — six of these layers — is 70 ms on trn2. That is the single largest
+   lever available and it costs a `--msda nki`. (Note the other trn2 fact from "Two
+   machines": trn2 was *slower* here, 333 ms against 244, so this needs measuring on trn2
+   rather than assuming; the point is that only trn2 can even try it.)
+2. **More ops that are not really arithmetic.** The resize was worth 6.9 ms and 87,625
+   matmul instructions for two string substitutions, and the profile still says
+   **310,513 matmul instructions averaging 180 ns** and **222 GFLOP of transposes** —
+   46% of all tensor-engine FLOP — against 273 GFLOP of actual model arithmetic. The
+   resize was the largest single such op; whether the rest is one more findable op or a
+   long tail of layout churn is unknown, and `%dot` load-weight sizes in the profile are
+   how to find out.
+3. **Spill, still** — 5.78 GB of save+reload after the resize, down from 7.29 GB, and
+   static DMA is still ~50 ms. Anything that reduces live bytes helps: one fewer
+   pixel-decoder level is the untried structural change.
+4. **bfloat16 is available and should stay opt-in.** −21.5 ms (232.9 → 211.4 ms, −9.2%),
+   for one lost 2009-pixel object. That is a deliberate trade a caller can make with
+   `--compiler-args '--auto-cast=matmult --auto-cast-type=bf16'`; it is not a default,
+   because the fp32 default is exactly CPU and this is not.
 
 Batching is not on this list because nothing here has been measured at batch > 1; a
 DMA-bound graph may well amortise better than a compute-bound one, which makes it worth
@@ -594,11 +767,14 @@ contrib/oneformer-swin-l/
 ├── run_device.py           — compile and diff on device; bisects by module, dumps dtypes
 └── src/
     ├── bilinear.py         — grid_sample-free bilinear sampling + deformable attention
-    └── patches.py          — the eight substitutions, with version-drift assertions
+    ├── nki_msda.py         — the same attention through the NKI library's kernel
+    ├── resize.py           — exact bilinear resize at power-of-two ratios
+    └── patches.py          — the nine substitutions, with version-drift assertions
 ```
 
-`run_device.py` and `segment.py` both take `--dtype {float32,bfloat16}` (casts the model)
-and `--compiler-args` (passed verbatim to `neuronx-cc`, e.g.
+`run_device.py` and `segment.py` both take `--dtype {float32,bfloat16}` (casts the model),
+`--msda {torch,nki}` (which deformable attention runs on device) and `--compiler-args`
+(passed verbatim to `neuronx-cc`, e.g.
 `'--auto-cast=matmult --auto-cast-type=bf16'` to leave the weights in fp32 and only run
 the matmuls in bf16). `--compiler-args` is part of the compile-cache key, so each setting
 gets its own NEFF and cannot silently reuse a previous build.
@@ -630,10 +806,27 @@ gets its own NEFF and cannot silently reuse a previous build.
 - [x] **Where the 244 ms goes, profiled rather than guessed**: 54% DMA, 34% of the whole
       forward in the deformable-attention gather alone, tensor engine idle 83% of the
       time at 1.24% MFU. Backbone-only control run to attribute it
-- [ ] **A NKI kernel for the deformable attention.** The measured 83 ms, and the one op
-      this port already owns the source of. Target packet count, not FLOPs
-- [ ] Cut spill: 7.3 GB of save+reload is ~52 ms of static DMA. `--optlevel`, or one
-      fewer pixel-decoder level
+- [x] **Compiler flags swept** on the whole model, benchmarked on the NEFF rather than
+      through the harness: `--optlevel 1` is 237.9 ms against 241.0, compiles 3x quicker
+      and is slightly *more* accurate, so it is now the default `--compiler-args`. DGE is
+      inert on this box (gen2), and the 83 ms of dynamic DMA does not move under any flag
+- [x] **The fixed power-of-two resize** (patch 9): the profile's 9216x144 `%dot` was
+      `F.interpolate` to 12x12, eleven times per forward. Replaced with the exact fixed
+      weights — **234.1 ms at the default optlevel, 230.5 at `--optlevel 1`**, −22% matmul
+      instructions, −21% spill, and 0.00e+00 against `F.interpolate` on device
+- [x] **The NKI deformable-attention kernel: written, and blocked by the hardware.**
+      `src/nki_msda.py` + `--msda nki` wire in `nkilib`'s kernel with its conventions
+      verified against its source, and it needs `dma_transpose` with indirect access,
+      which is gen3+. trn1 is gen2. A hand-written gen2 kernel is argued against on
+      packet size in "The NKI deformable-attention kernel needs gen3". Ready for trn2
+- [x] **bfloat16 re-judged on segmentation**, which is the criterion: 211.4 ms against
+      232.9 (−9.2%) for 99.843% of pixels, and the diff is one whole 2009-px object the
+      device does not find. `--auto-cast=matmult` and `--auto-cast=all` are
+      indistinguishable, so the entire effect is in the matmuls. Opt-in, not default
+- [ ] Cut spill further: 5.8 GB of save+reload is still ~50 ms of static DMA. One fewer
+      pixel-decoder level is the untried structural change
+- [ ] Find the next resize-shaped op: 310 k matmul instructions at 180 ns and 222 GFLOP
+      of transposes say there is more layout churn than arithmetic left
 - [ ] Other input sizes (768x768 is the interesting one for segmentation quality) and
       the semantic / instance tasks, which share the graph but not the post-processing
 - [ ] Batching, which is unmeasured — a DMA-bound graph may amortise better than a

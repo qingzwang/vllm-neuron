@@ -50,9 +50,15 @@ def parse_args():
                     help="also run the same model on CPU and diff the segmentation")
     ap.add_argument("--cpu-iterations", type=int, default=3)
     ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
-    ap.add_argument("--compiler-args", default=None,
-                    help="passed verbatim to neuronx-cc, e.g. "
-                         "'--auto-cast=matmult --auto-cast-type=bf16'")
+    ap.add_argument("--msda", default="torch", choices=("torch", "nki"),
+                    help="which multi-scale deformable attention runs on device: our "
+                         "PyTorch one (src/bilinear.py) or the NKI library kernel "
+                         "(src/nki_msda.py). --compare-cpu always runs the PyTorch one "
+                         "on the host")
+    ap.add_argument("--compiler-args", default="--optlevel=1",
+                    help="passed verbatim to neuronx-cc. Defaults to --optlevel=1, the "
+                         "fastest setting measured; pass '' for the compiler's own "
+                         "default, or add '--auto-cast=all --auto-cast-type=bf16'")
     ap.add_argument("--out", default=None)
     return ap.parse_args()
 
@@ -69,12 +75,12 @@ class Heads(nn.Module):
         return out.class_queries_logits, out.masks_queries_logits
 
 
-def build(model_path, size):
-    """Load, patch, and return (model, wrapper). See src/patches.py for the eight."""
+def build(model_path, size, msda="torch"):
+    """Load, patch, and return (model, wrapper). See src/patches.py for the nine."""
     from src import patches
 
     level_shapes = [(size // s, size // s) for s in (32, 16, 8)]
-    patches.install(level_shapes)
+    patches.install(level_shapes, msda=msda)
 
     from transformers import OneFormerForUniversalSegmentation
 
@@ -83,8 +89,8 @@ def build(model_path, size):
     patches.cache_position_embeddings(model)
     patches.cache_reference_points(model, level_shapes)
     patches.relax_shape_assert()
-    patches.constant_fold_pixel_decoder_split(level_shapes)
-    patches.detensorize_mask_threshold()
+    patches.patch_pixel_decoder_forward(level_shapes)
+    patches.patch_prediction_heads()
     return model, Heads(model), patches
 
 
@@ -150,7 +156,7 @@ def main():
 
     # Two independent instances when comparing: one stays on the host, one moves to the
     # device. They cannot be the same object -- moving it would take the CPU side with it.
-    dev_model, device_wrapper, patches = build(args.model, args.size)
+    dev_model, device_wrapper, patches = build(args.model, args.size, msda=args.msda)
     cpu_wrapper = build(args.model, args.size)[1] if args.compare_cpu else None
 
     pixel_mask = torch.ones(1, args.size, args.size)
@@ -164,7 +170,12 @@ def main():
         device_wrapper(warm["pixel_values"], warm["task_inputs"], pixel_mask)
 
     dtype = getattr(torch, args.dtype)
-    device_wrapper = device_wrapper.to(device=DEVICE, dtype=dtype)
+    # Cast on the host, *then* move. In one call it fails: OneFormer carries a float64
+    # parameter it never uses in inference (`criterion.logit_scale`, a scalar in the
+    # training loss), and casting f64 -> f32 as part of the device transfer trips
+    # "Expected self.dtype() == dst.dtype()". Casting first makes it f32 on the host,
+    # after which the move is a plain copy.
+    device_wrapper = device_wrapper.to(dtype=dtype).to(device=DEVICE)
     print(f"[setup] copied {patches.move_position_cache(dev_model, DEVICE, dtype)} "
           f"position table(s) to the device, reference grid: "
           f"{patches.move_reference_cache(DEVICE, dtype)}")

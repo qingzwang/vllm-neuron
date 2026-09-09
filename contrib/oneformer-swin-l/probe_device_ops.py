@@ -17,6 +17,9 @@ static-shape ahead-of-time compiler has a reason to struggle with:
   grid_sample          the core of multi-scale deformable attention: a gather at
                        *computed float* coordinates with bilinear weights
   ms_deform_attn       HF's own pure-PyTorch deformable attention, end to end
+  ms_deform_attn_nki   the NKI library's kernel for the same thing, against ours --
+                       including at non-square levels, which the real model never has
+                       and which is the only way a row/column mix-up shows up
   window_partition     Swin's rank-6 view+permute, and its inverse
   roll                 Swin's shifted windows
   interpolate          mask logits upsampled to image resolution
@@ -190,6 +193,41 @@ def probe_bilinear_sample():
     return fn, (value, grid)
 
 
+def probe_fixed_resize():
+    """Our exact power-of-two resize, against ``F.interpolate`` as the reference.
+
+    All four ratios the model actually uses, in one graph: the three mask downsamples
+    in the decoder head (96 to 48, 24, 12) and the pixel decoder's FPN 2x up.
+    """
+    sys.path.insert(0, str(pathlib.Path(__file__).parent / "src"))
+    from resize import fixed_bilinear_resize
+
+    masks = torch.rand(1, 150, 96, 96, dtype=DEVICE_DTYPE)
+    feats = torch.rand(1, 256, 48, 48, dtype=DEVICE_DTYPE)
+    sizes = [(48, 48), (24, 24), (12, 12)]
+
+    def reference(masks, feats):
+        return [
+            *(F.interpolate(masks, size=s, mode="bilinear", align_corners=False) for s in sizes),
+            F.interpolate(feats, size=(96, 96), mode="bilinear", align_corners=False),
+        ]
+
+    def fn(masks, feats):
+        return [
+            *(fixed_bilinear_resize(masks, s) for s in sizes),
+            fixed_bilinear_resize(feats, (96, 96)),
+        ]
+
+    # On CPU first: if the arithmetic does not already reproduce F.interpolate there,
+    # the device number says nothing about the device.
+    worst = max(
+        ((a - b).abs().max() / b.abs().max()).item()
+        for a, b in zip(fn(masks, feats), reference(masks, feats))
+    )
+    print(f"       (vs CPU F.interpolate, on CPU: rel={worst:.2e})")
+    return fn, (masks, feats)
+
+
 def probe_ms_deform_attn_ours():
     """Our whole multi-scale deformable attention, at the pixel decoder's shapes."""
     sys.path.insert(0, str(pathlib.Path(__file__).parent / "src"))
@@ -209,14 +247,69 @@ def probe_ms_deform_attn_ours():
     return fn, (value, locations, weights)
 
 
+def _nki_msda_probe(shapes, queries, heads=8, head_dim=32, points=4):
+    """Build a probe of the NKI kernel against ``bilinear.py`` at the given shapes."""
+    sys.path.insert(0, str(pathlib.Path(__file__).parent / "src"))
+    from bilinear import multi_scale_deformable_attention
+    from nki_msda import multi_scale_deformable_attention_nki, sanitize_far_oob_samples
+
+    total = sum(h * w for h, w in shapes)
+    value = torch.rand(1, total, heads, head_dim, dtype=DEVICE_DTYPE)
+    # Deliberately out of [0, 1]: learned offsets do sample outside the feature map, and
+    # that is the path where the kernel's clamping and our sanitizing have to agree with
+    # grid_sample's zeros padding.
+    locations = torch.rand(1, queries, heads, len(shapes), points, 2, dtype=DEVICE_DTYPE)
+    locations = locations * 1.6 - 0.3
+    weights = torch.rand(1, queries, heads, len(shapes), points, dtype=DEVICE_DTYPE)
+    weights = weights / weights.sum(-1, keepdim=True)
+
+    reference = multi_scale_deformable_attention(value, shapes, locations, weights)
+
+    # Sanitizing claims to be an identity on the output. Check that claim on CPU, where
+    # both sides are our own code, before blaming or crediting the kernel for anything.
+    safe_locations, safe_weights = sanitize_far_oob_samples(locations, weights, shapes)
+    sanitized = multi_scale_deformable_attention(
+        value, shapes, safe_locations, safe_weights
+    )
+    rel = ((sanitized - reference).abs().max() / reference.abs().max()).item()
+    print(f"       (sanitize is an identity, on CPU: rel={rel:.2e})")
+
+    def fn(value, locations, weights):
+        return multi_scale_deformable_attention_nki(value, shapes, locations, weights)
+
+    # The expected value is bilinear.py's, not fn's: fn cannot run on CPU at all (a NKI
+    # kernel only exists on device), so the driver's CPU pass has to be bypassed.
+    return fn, (value, locations, weights), reference
+
+
+def probe_ms_deform_attn_nki():
+    """The NKI kernel at the pixel decoder's real shapes: 3024 queries over 3 levels."""
+    return _nki_msda_probe([(12, 12), (24, 24), (48, 48)], queries=3024)
+
+
+def probe_ms_deform_attn_nki_hw():
+    """The same kernel at *non-square* levels.
+
+    Every level in OneFormer at a pinned square input is square, so this is the only
+    probe that can tell whether ``sampling_locations[..., 0]`` means the column (as
+    HuggingFace intends) or the row (as the kernel's docstring pseudocode reads). If the
+    two conventions disagree, the real model would still compile and still look
+    plausible; this is where it fails loudly instead.
+    """
+    return _nki_msda_probe([(6, 10), (12, 20)], queries=64)
+
+
 PROBES = {
     "grid_sample": probe_grid_sample,
     "bilinear_sample": probe_bilinear_sample,
     "ms_deform_attn_ours": probe_ms_deform_attn_ours,
+    "ms_deform_attn_nki": probe_ms_deform_attn_nki,
+    "ms_deform_attn_nki_hw": probe_ms_deform_attn_nki_hw,
     "ms_deform_attn": probe_ms_deform_attn,
     "window_partition": probe_window_partition,
     "roll": probe_roll,
     "interpolate": probe_interpolate,
+    "fixed_resize": probe_fixed_resize,
     "masked_fill_neg_inf": probe_masked_fill_neg_inf,
     "softmax_all_masked": probe_softmax_all_masked,
 }
@@ -239,14 +332,19 @@ def run_in_process(name):
     TransferFromDevice`` when a graph produced no real output. That is a SIGABRT, not
     an exception, which is why :func:`main` runs every probe in a subprocess.
     """
-    build = PROBES[name]
-    fn, inputs = build()
+    built = PROBES[name]()
+    fn, inputs = built[0], built[1]
     if fn is None:
         print("SKIP   not available in this transformers version")
         return "SKIP"
 
-    with torch.no_grad():
-        expected = fn(*inputs)
+    # A probe may supply its own expected value. Probes that call a NKI kernel have to:
+    # the kernel exists only on device, so there is no CPU pass to compare against and
+    # the reference must come from an equivalent host implementation instead.
+    expected = built[2] if len(built) > 2 else None
+    if expected is None:
+        with torch.no_grad():
+            expected = fn(*inputs)
 
     # fullgraph=True on purpose: a graph break here means part of the op would run on
     # the host in the real model, which is worth knowing now rather than later.

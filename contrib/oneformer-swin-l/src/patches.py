@@ -9,6 +9,11 @@ Both are forced by ``probe_device_ops.py``, not by taste:
    per-level ``split`` is a compile-time constant. Since the input resolution is
    pinned anyway, the sizes are known at install time and are passed in.
 
+   With ``msda="nki"`` the *device* half of that replacement becomes
+   :mod:`nki_msda` -- the NKI library's hand-written kernel for the same op -- because
+   :mod:`bilinear`'s four-corner gather is 83 ms of the 241 ms forward and no compiler
+   flag touches it. The host half stays :mod:`bilinear` either way.
+
 2. **The fully-masked-row guard.** Upstream writes
 
        attention_mask[torch.where(attention_mask.sum(-1) == attention_mask.shape[-1])] = False
@@ -66,6 +71,14 @@ Both are forced by ``probe_device_ops.py``, not by taste:
    (verified bit-for-bit) and lowers cleanly. This is the only such comparison in the
    model, and it is the one that blocked the full model for six compile attempts.
 
+9. **Bilinear resize.** The only patch here that is not forced -- ``F.interpolate``
+   compiles fine. It is forced by the *profile*: the generic lowering builds a dense
+   resample matrix and does the resize as a matmul, and one such op (``%dot.2``, the
+   96x96 mask logits taken to 12x12 as a 9216x144 fp32 matmul) costs 10.0 ms and
+   1.7 GB of spill by itself. Every ratio in this model is a power of two, where
+   ``align_corners=False`` makes the interpolation weights fixed, so :mod:`resize`
+   does both sites in shifts and adds. See that module for why the ratios matter.
+
 All patches assert that the upstream code still looks the way they assume. A
 transformers upgrade that moves either line turns into a loud failure at install time
 rather than a silently unpatched model.
@@ -80,6 +93,7 @@ import types
 import torch
 
 from .bilinear import multi_scale_deformable_attention as _msda
+from .resize import fixed_bilinear_resize as _fixed_resize
 
 
 class ErfGELU(torch.nn.Module):
@@ -253,105 +267,140 @@ def cache_reference_points(model: torch.nn.Module, level_shapes) -> None:
     cls.get_reference_points = staticmethod(cached_reference_points)
 
 
-def constant_fold_pixel_decoder_split(level_shapes) -> None:
-    """Give the pixel decoder's per-level split and view Python-int sizes.
+def _transform_method(cls, name: str, substitutions: list[tuple[str, str]]) -> None:
+    """Recompile ``cls.name`` from upstream's own source with exact substitutions.
 
-    Implemented as a source transform rather than a hand copy: upstream's own function
-    text is read, three exact substitutions are applied (and asserted to have applied),
-    and the result is compiled in the module's namespace. A copy would drift silently;
-    this way an upstream edit that moves any of the three lines fails loudly instead.
+    Every source-transform patch below goes through here, for two reasons. A hand copy
+    of upstream's body would drift silently across a transformers upgrade, whereas an
+    asserted substitution fails loudly at install time. And the result has to be
+    compiled in ``modeling_oneformer``'s *own* namespace: Dynamo resolves a function's
+    globals against the module it claims to come from, so a copied dict is not enough --
+    it fails with "module ... has no attribute '_NEURON_LEVEL_SHAPES'" the moment
+    tracing starts.
+
+    All substitutions for one method must be applied in a single call. Transforming a
+    method twice does not work: after the first pass ``inspect.getsource`` is looking at
+    a synthetic filename, not upstream's file.
     """
-    if _applied.get("pixel_decoder_split") == list(level_shapes):
+    from transformers.models.oneformer import modeling_oneformer as m
+
+    source = textwrap.dedent(inspect.getsource(getattr(cls, name)))
+    for old, new in substitutions:
+        _check(old in source, f"{cls.__name__}.{name} no longer contains: {old}")
+        source = source.replace(old, new)
+
+    namespace = vars(m)
+    previous = namespace.get(name)
+    exec(compile(source, f"<oneformer {name}, patched>", "exec"), namespace)
+    setattr(cls, name, namespace[name])
+    # Do not leave a stray module-level function behind under the method's name.
+    if previous is None:
+        namespace.pop(name, None)
+    else:
+        namespace[name] = previous
+
+
+def patch_pixel_decoder_forward(level_shapes) -> None:
+    """Constant-fold the pixel decoder's per-level split, and fix its FPN resize.
+
+    Two unrelated problems in one method, applied together because a method can only be
+    source-transformed once (see :func:`_transform_method`):
+
+    * the ``split`` and ``view`` sizes come from tensors, which Dynamo refuses;
+    * the FPN's ``interpolate`` is an exact 2x upsample (48x48 to 96x96 at a pinned
+      384 input) being paid for as a generic resize. :mod:`resize` does it in shifts
+      and adds.
+    """
+    if _applied.get("pixel_decoder_forward") == list(level_shapes):
         return
     _check(
-        "pixel_decoder_split" not in _applied,
+        "pixel_decoder_forward" not in _applied,
         "the pixel decoder was already patched for different level shapes; build one "
         "process per input size",
     )
-    _applied["pixel_decoder_split"] = list(level_shapes)
+    _applied["pixel_decoder_forward"] = list(level_shapes)
 
     from transformers.models.oneformer import modeling_oneformer as m
-
-    cls = m.OneFormerPixelDecoder
-    source = textwrap.dedent(inspect.getsource(cls.forward))
-
-    substitutions = [
-        (
-            "split_size_or_sections[i] = level_start_index[i + 1] - level_start_index[i]",
-            "split_size_or_sections[i] = _NEURON_LEVEL_STARTS[i + 1] - _NEURON_LEVEL_STARTS[i]",
-        ),
-        (
-            "split_size_or_sections[i] = y.shape[1] - level_start_index[i]",
-            "split_size_or_sections[i] = y.shape[1] - _NEURON_LEVEL_STARTS[i]",
-        ),
-        (
-            "z.transpose(1, 2).view(bs, -1, spatial_shapes[i][0], spatial_shapes[i][1])",
-            "z.transpose(1, 2).view(bs, -1, _NEURON_LEVEL_SHAPES[i][0], _NEURON_LEVEL_SHAPES[i][1])",
-        ),
-    ]
-    for old, new in substitutions:
-        _check(old in source, f"pixel decoder forward no longer contains: {old}")
-        source = source.replace(old, new)
 
     starts = [0]
     for height, width in level_shapes[:-1]:
         starts.append(starts[-1] + height * width)
-
-    # The constants go on the real module, and the transformed function is compiled in
-    # the module's own namespace: Dynamo resolves a function's globals against the
-    # module it claims to come from, so a copied namespace is not enough (it fails with
-    # "module ... has no attribute '_NEURON_LEVEL_SHAPES'" the moment tracing starts).
     m._NEURON_LEVEL_SHAPES = [tuple(int(v) for v in s) for s in level_shapes]
     m._NEURON_LEVEL_STARTS = starts
-    namespace = vars(m)
-    previous = namespace.get("forward")
-    exec(compile(source, "<oneformer pixel decoder forward, patched>", "exec"), namespace)
-    cls.forward = namespace["forward"]
-    # Do not leave a stray module-level `forward` behind.
-    if previous is None:
-        namespace.pop("forward", None)
-    else:
-        namespace["forward"] = previous
+    m._neuron_fixed_resize = _fixed_resize
+
+    _transform_method(
+        m.OneFormerPixelDecoder,
+        "forward",
+        [
+            (
+                "split_size_or_sections[i] = level_start_index[i + 1] - level_start_index[i]",
+                "split_size_or_sections[i] = _NEURON_LEVEL_STARTS[i + 1] - _NEURON_LEVEL_STARTS[i]",
+            ),
+            (
+                "split_size_or_sections[i] = y.shape[1] - level_start_index[i]",
+                "split_size_or_sections[i] = y.shape[1] - _NEURON_LEVEL_STARTS[i]",
+            ),
+            (
+                "z.transpose(1, 2).view(bs, -1, spatial_shapes[i][0], spatial_shapes[i][1])",
+                "z.transpose(1, 2).view(bs, -1, _NEURON_LEVEL_SHAPES[i][0], _NEURON_LEVEL_SHAPES[i][1])",
+            ),
+            (
+                # The dedented text, so the indents below are upstream's minus four.
+                "nn.functional.interpolate(\n"
+                "            out[-1], size=cur_fpn.shape[-2:], mode=\"bilinear\","
+                " align_corners=False\n"
+                "        )",
+                "_neuron_fixed_resize(out[-1], cur_fpn.shape[-2:])",
+            ),
+        ],
+    )
 
 
-def detensorize_mask_threshold() -> None:
-    """Replace ``mask_logits < 0.5`` with a comparison against a scalar *tensor*.
+def patch_prediction_heads() -> None:
+    """Fix the decoder head's f64 comparison, and its mask downsample.
 
-    Measured, in isolation: ``(x < 0.5)`` fails to compile with ``[NCC_ESPP004] f64
-    dtype is not supported``, while ``(x < torch.tensor(0.5, dtype=x.dtype))`` compiles
-    and is bit-identical. Every other op in the same chain -- interpolate, sigmoid,
-    repeat, flatten -- is fine, and so is arithmetic with Python floats elsewhere; it is
-    specifically the comparison that promotes the constant to f64.
+    Again two things in one method, for the same reason:
 
-    Applied as a source transform on upstream's own method, like patch 7.
+    * ``mask_logits < 0.5``. Measured, in isolation: ``(x < 0.5)`` fails to compile with
+      ``[NCC_ESPP004] f64 dtype is not supported``, while
+      ``(x < torch.tensor(0.5, dtype=x.dtype))`` compiles and is bit-identical. Every
+      other op in the same chain -- interpolate, sigmoid, repeat, flatten -- is fine,
+      and so is arithmetic with Python floats elsewhere; it is specifically the
+      comparison that promotes the constant to f64.
+    * the ``interpolate`` that takes the 96x96 mask logits down to a level's size. The
+      generic lowering does it as a dense resample matmul: in the profile, ``%dot.2``
+      loads a 9216x144 fp32 weight and costs 10.0 ms and 1.7 GB of spill on its own.
+      The factors here are 2, 4 and 8, so :mod:`resize` does it exactly in four strided
+      reads. This method runs eleven times per forward.
     """
-    if _applied.get("detensorize_mask_threshold"):
+    if _applied.get("prediction_heads"):
         return
-    _applied["detensorize_mask_threshold"] = True
+    _applied["prediction_heads"] = True
     from transformers.models.oneformer import modeling_oneformer as m
 
-    cls = m.OneFormerTransformerDecoder
-    source = textwrap.dedent(inspect.getsource(cls.forward_prediction_heads))
-    old = (
-        "attention_mask.sigmoid().flatten(2).unsqueeze(1)"
-        ".repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5"
-    )
-    new = (
-        "attention_mask.sigmoid().flatten(2).unsqueeze(1)"
-        ".repeat(1, self.num_heads, 1, 1).flatten(0, 1) "
-        "< torch.tensor(0.5, dtype=attention_mask.dtype, device=attention_mask.device)"
-    )
-    _check(old in source, "the mask threshold comparison is not where it used to be")
-    source = source.replace(old, new)
+    m._neuron_fixed_resize = _fixed_resize
 
-    namespace = vars(m)
-    previous = namespace.get("forward_prediction_heads")
-    exec(compile(source, "<oneformer forward_prediction_heads, patched>", "exec"), namespace)
-    cls.forward_prediction_heads = namespace["forward_prediction_heads"]
-    if previous is None:
-        namespace.pop("forward_prediction_heads", None)
-    else:
-        namespace["forward_prediction_heads"] = previous
+    _transform_method(
+        m.OneFormerTransformerDecoder,
+        "forward_prediction_heads",
+        [
+            (
+                "nn.functional.interpolate(\n"
+                "        outputs_mask, size=attention_mask_target_size,"
+                " mode=\"bilinear\", align_corners=False\n"
+                "    )",
+                "_neuron_fixed_resize(outputs_mask, attention_mask_target_size)",
+            ),
+            (
+                "attention_mask.sigmoid().flatten(2).unsqueeze(1)"
+                ".repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5",
+                "attention_mask.sigmoid().flatten(2).unsqueeze(1)"
+                ".repeat(1, self.num_heads, 1, 1).flatten(0, 1) "
+                "< torch.tensor(0.5, dtype=attention_mask.dtype, device=attention_mask.device)",
+            ),
+        ],
+    )
 
 
 def relax_shape_assert() -> None:
@@ -401,7 +450,7 @@ def _check(condition: bool, message: str) -> None:
         )
 
 
-def install(level_shapes: list[tuple[int, int]]) -> None:
+def install(level_shapes: list[tuple[int, int]], msda: str = "torch") -> None:
     """Patch ``transformers.models.oneformer.modeling_oneformer`` in place.
 
     Args:
@@ -409,6 +458,11 @@ def install(level_shapes: list[tuple[int, int]]) -> None:
             **in the order the model itself uses**, which is smallest map first:
             stride 32, then 16, then 8. For a pinned 384x384 input that is
             ``[(12, 12), (24, 24), (48, 48)]``.
+        msda: which deformable attention to use *on device* -- ``"torch"`` for
+            :mod:`bilinear`, ``"nki"`` for the NKI library kernel (see :mod:`nki_msda`).
+            Either way the host still runs :mod:`bilinear`, because a NKI kernel does not
+            exist off the device; that is what keeps ``run_device.py``'s CPU reference
+            forward working, and it makes its comparison a direct kernel-vs-PyTorch diff.
 
     The order matters and getting it wrong is silent: the reversed list sums to the
     same number of positions, so the shapes still "fit" while every level is sampled
@@ -434,6 +488,18 @@ def install(level_shapes: list[tuple[int, int]]) -> None:
 
     total = sum(h * w for h, w in level_shapes)
 
+    _check(msda in ("torch", "nki"), f"unknown msda implementation {msda!r}")
+    device_msda = _msda
+    if msda == "nki":
+        from . import nki_msda
+
+        _check(
+            nki_msda.available(),
+            "the NKI deformable-attention kernel cannot be imported (needs nkilib and "
+            "libtorch_neuronx_lite)",
+        )
+        device_msda = nki_msda.multi_scale_deformable_attention_nki
+
     def patched_msda(value, value_spatial_shapes, sampling_locations, attention_weights):
         # value: (B, sum(H*W), heads, dim). The shapes argument cannot be *used* — it
         # arrives as a device tensor and reading it would put a host sync in the middle
@@ -456,7 +522,10 @@ def install(level_shapes: list[tuple[int, int]]) -> None:
                 f"with {[list(s) for s in level_shapes]}. Same total, different order "
                 "or sizes: every level would be sampled from the wrong feature map",
             )
-        return _msda(value, level_shapes, sampling_locations, attention_weights)
+        # The host always takes the PyTorch path: a NKI kernel exists only on device, and
+        # the CPU forward is the reference the device is compared against.
+        impl = device_msda if value.device.type == "neuron" else _msda
+        return impl(value, level_shapes, sampling_locations, attention_weights)
 
     m.multi_scale_deformable_attention = patched_msda
 

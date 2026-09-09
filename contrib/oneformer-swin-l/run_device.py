@@ -55,12 +55,19 @@ def parse_args():
                     help="with --module layers: how many masked-attention layers to "
                          "keep. 0 leaves the query transformer and the prediction "
                          "heads, which is the cut that says whether the layers matter")
-    ap.add_argument("--compiler-args", default=None,
-                    help="passed verbatim to neuronx-cc, e.g. "
-                         "'--auto-cast=matmult --auto-cast-type=bf16' to run fp32 "
-                         "matmuls in bf16 while leaving everything else alone. Part of "
-                         "the compile-cache key, so it cannot collide with a previous "
-                         "build")
+    ap.add_argument("--msda", default="torch", choices=("torch", "nki"),
+                    help="which multi-scale deformable attention runs on device: our "
+                         "PyTorch one (src/bilinear.py) or the NKI library kernel "
+                         "(src/nki_msda.py). The CPU side of the comparison is always "
+                         "the PyTorch one, so 'nki' makes this a kernel-vs-PyTorch diff")
+    ap.add_argument("--compiler-args", default="--optlevel=1",
+                    help="passed verbatim to neuronx-cc. Defaults to --optlevel=1, which "
+                         "measured fastest (237.9 ms against 241.0 at the compiler's "
+                         "default), compiles 3x quicker and is slightly more accurate; "
+                         "pass '' for the compiler's own default. Add "
+                         "'--auto-cast=all --auto-cast-type=bf16' for bf16 arithmetic. "
+                         "Part of the compile-cache key, so a setting cannot collide "
+                         "with a previous build")
     ap.add_argument("--dump-dtypes", action="store_true",
                     help="trace with a no-op backend and report any float64 nodes, "
                          "which the compiler rejects outright ([NCC_ESPP004])")
@@ -232,8 +239,9 @@ def main():
 
     from src import patches
 
-    patches.install(level_shapes)
-    print(f"patched for {size}x{size}, deformable levels {level_shapes}, {args.dtype}\n")
+    patches.install(level_shapes, msda=args.msda)
+    print(f"patched for {size}x{size}, deformable levels {level_shapes}, {args.dtype}, "
+          f"device deformable attention: {args.msda}\n")
 
     from transformers import OneFormerForUniversalSegmentation
 
@@ -250,9 +258,11 @@ def main():
     # Upstream's tensor-valued shape assert becomes an unbacked symbol under Dynamo;
     # keep it on the host, where it still catches level-shape mistakes.
     patches.relax_shape_assert()
-    patches.constant_fold_pixel_decoder_split(level_shapes)
-    # `mask_logits < 0.5` promotes 0.5 to f64 in the lowering ([NCC_ESPP004]).
-    patches.detensorize_mask_threshold()
+    # Tensor-valued split/view sizes, plus the FPN's 2x resize as shifts and adds.
+    patches.patch_pixel_decoder_forward(level_shapes)
+    # `mask_logits < 0.5` promotes 0.5 to f64 in the lowering ([NCC_ESPP004]), and the
+    # mask downsample is a 9216x144 matmul unless it is written out.
+    patches.patch_prediction_heads()
 
     builders = {"full": Heads, "backbone": Backbone, "pixel": PixelLevel,
                 "decoder": Decoder}

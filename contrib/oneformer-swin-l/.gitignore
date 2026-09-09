@@ -1,0 +1,6 @@
+__pycache__/
+
+# neuronx-cc drops these next to the working directory when it compiles: one
+# directory per private NKI kernel it caches, plus a metrics file.
+/c[0-9a-f]*/
+/global_metric_store.json

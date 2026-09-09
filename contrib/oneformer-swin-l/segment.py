@@ -49,6 +49,10 @@ def parse_args():
     ap.add_argument("--compare-cpu", action="store_true",
                     help="also run the same model on CPU and diff the segmentation")
     ap.add_argument("--cpu-iterations", type=int, default=3)
+    ap.add_argument("--dtype", default="float32", choices=("float32", "bfloat16"))
+    ap.add_argument("--compiler-args", default=None,
+                    help="passed verbatim to neuronx-cc, e.g. "
+                         "'--auto-cast=matmult --auto-cast-type=bf16'")
     ap.add_argument("--out", default=None)
     return ap.parse_args()
 
@@ -159,11 +163,18 @@ def main():
     with torch.no_grad():
         device_wrapper(warm["pixel_values"], warm["task_inputs"], pixel_mask)
 
-    device_wrapper = device_wrapper.to(DEVICE)
-    print(f"[setup] copied {patches.move_position_cache(dev_model, DEVICE, torch.float32)} "
+    dtype = getattr(torch, args.dtype)
+    device_wrapper = device_wrapper.to(device=DEVICE, dtype=dtype)
+    print(f"[setup] copied {patches.move_position_cache(dev_model, DEVICE, dtype)} "
           f"position table(s) to the device, reference grid: "
-          f"{patches.move_reference_cache(DEVICE, torch.float32)}")
-    compiled = torch.compile(device_wrapper, backend="neuron_libtorch", fullgraph=True)
+          f"{patches.move_reference_cache(DEVICE, dtype)}")
+    compile_options = {"compiler_args": args.compiler_args} if args.compiler_args else {}
+    if compile_options:
+        print(f"[setup] neuronx-cc args: {args.compiler_args}")
+    compiled = torch.compile(
+        device_wrapper, backend="neuron_libtorch", fullgraph=True,
+        options=compile_options,
+    )
 
     for path in args.image:
         image = Image.open(path).convert("RGB")
@@ -176,12 +187,15 @@ def main():
         inputs = preprocess()
         pv = inputs["pixel_values"]
         ti = inputs["task_inputs"]
-        dev_inputs = [pv.to(DEVICE), ti.to(DEVICE), pixel_mask.to(DEVICE)]
+        # task_inputs stays integral: they are token ids, not activations.
+        dev_inputs = [pv.to(device=DEVICE, dtype=dtype), ti.to(DEVICE),
+                      pixel_mask.to(device=DEVICE, dtype=dtype)]
 
         def forward_device():
             with torch.no_grad():
                 cls, msk = compiled(*dev_inputs)
-            return cls.float().cpu(), msk.float().cpu()
+            # .cpu() first: casting bf16 on the device fails with a dtype mismatch.
+            return cls.cpu().float(), msk.cpu().float()
 
         dev_cls, dev_msk = forward_device()
 

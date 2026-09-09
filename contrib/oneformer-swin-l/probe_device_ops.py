@@ -255,7 +255,8 @@ def run_in_process(name):
     try:
         with torch.no_grad():
             got = compiled(*[x.to(DEVICE) for x in inputs])
-        got = [t.float().cpu() for t in flat(got)]
+        # .cpu() before .float(): casting bf16 on the device fails with a dtype mismatch.
+        got = [t.cpu().float() for t in flat(got)]
     except Exception as exc:  # noqa: BLE001 — the point is to report, not to handle
         msg = str(exc).replace("\n", " ")[:200]
         print(f"FAIL   {type(exc).__name__}: {msg}")
@@ -264,7 +265,7 @@ def run_in_process(name):
 
     worst = 0.0
     for a, b in zip(got, flat(expected)):
-        b32 = b.float().cpu()
+        b32 = b.cpu().float()
         scale = max(b32.abs().max().item(), 1e-6)
         worst = max(worst, (a - b32).abs().max().item() / scale)
 

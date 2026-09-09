@@ -55,6 +55,12 @@ def parse_args():
                     help="with --module layers: how many masked-attention layers to "
                          "keep. 0 leaves the query transformer and the prediction "
                          "heads, which is the cut that says whether the layers matter")
+    ap.add_argument("--compiler-args", default=None,
+                    help="passed verbatim to neuronx-cc, e.g. "
+                         "'--auto-cast=matmult --auto-cast-type=bf16' to run fp32 "
+                         "matmuls in bf16 while leaving everything else alone. Part of "
+                         "the compile-cache key, so it cannot collide with a previous "
+                         "build")
     ap.add_argument("--dump-dtypes", action="store_true",
                     help="trace with a no-op backend and report any float64 nodes, "
                          "which the compiler rejects outright ([NCC_ESPP004])")
@@ -204,8 +210,8 @@ class Backbone(nn.Module):
 
 
 def compare(name, got, ref, dtype):
-    got = got.float().cpu()
-    ref = ref.float().cpu()
+    got = got.cpu().float()
+    ref = ref.cpu().float()
     scale = max(ref.abs().max().item(), 1e-6)
     rel = (got - ref).abs().max().item() / scale
     mean = (got - ref).abs().mean().item() / scale
@@ -296,7 +302,13 @@ def main():
     print(f"[device] moved {patches.move_position_cache(model, DEVICE, dtype)} "
           f"cached position table(s), reference grid moved: "
           f"{patches.move_reference_cache(DEVICE, dtype)}")
-    compiled = torch.compile(wrapper, backend="neuron_libtorch", fullgraph=args.fullgraph)
+    compile_options = {"compiler_args": args.compiler_args} if args.compiler_args else {}
+    if compile_options:
+        print(f"[device] neuronx-cc args: {args.compiler_args}")
+    compiled = torch.compile(
+        wrapper, backend="neuron_libtorch", fullgraph=args.fullgraph,
+        options=compile_options,
+    )
 
     if args.dump_dtypes:
         # Trace only: capture the graph Dynamo would hand the backend, then look at
@@ -338,7 +350,9 @@ def main():
     start = time.perf_counter()
     with torch.no_grad():
         device_out = compiled(*[x.to(DEVICE) for x in inputs])
-    device_out = tuple(t.float().cpu() for t in device_out)
+    # .cpu() before .float(): casting a bf16 tensor while it is still on the device
+    # fails with "Expected self.dtype() == dst.dtype()".
+    device_out = tuple(t.cpu().float() for t in device_out)
     print(f"[device] first call (compile included): {time.perf_counter() - start:.0f} s")
 
     from torch._dynamo.utils import counters

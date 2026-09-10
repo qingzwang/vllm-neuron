@@ -27,8 +27,8 @@ All three are on by default and all three leave the output **bit-for-bit unchang
 last one is the interesting one, and its lesson is that the 83 ms was not a missing kernel
 and not the hardware: it was asking for the same data four times. The NKI kernel for this
 op *is* written (`--msda nki`) and does need Trainium2, but it is now competing against
-30.9 ms rather than 83. bfloat16 is a further ~9% and stays opt-in, because it loses a
-whole small object.
+30.9 ms rather than 83. bfloat16 is a further 15% (121.7 ms) and stays opt-in, because it
+loses a whole small object.
 
 ## Why this is not a vllm-neuron model
 
@@ -495,6 +495,47 @@ hides — 99.84% sounds like rounding and is in fact a missing object. bf16 stay
 documented flag, not the default. It is the right flag to reach for if throughput matters
 more than the small objects; it should not be reached for silently.
 
+#### Re-measured on top of the packed gather
+
+The numbers above are against the four-corner build. Once the gather stopped dominating,
+bf16 was worth re-measuring — the tensor engine is a larger share of a smaller total, so
+the *fraction* should grow:
+
+| on top of `--gather packed`, `--optlevel 1` | fp32 | bf16 matmuls | Δ |
+|---|---|---|---|
+| **device latency** | 143.11 ms | **121.65 ms** | **−21.46 (−15.0%)** |
+| Tensor engine | 36.1 ms | 18.7 ms | −17.4 |
+| software dynamic DMA | 30.9 ms | 30.2 ms | **−0.7** |
+| its packets | 1.34 M × 1612 B | 1.51 M × 1079 B | *more, smaller* |
+| DMA active, all of it | 71.3 ms | 56.5 ms | −14.8 |
+| spill save + reload | 5.35 GB | 2.94 GB | −2.4 GB |
+| transpose FLOP | 142.7 G | 66.5 G | −76 G |
+| matmul instructions | 317,401 | 220,027 | −97 k |
+| semantic pixel agreement | 100.000 / 100.000 / 100.000% | 99.843 / 99.960 / 99.990% | |
+| panoptic pixel agreement | 100.000 / 100.000 / 100.000% | 24.203 / 99.968 / 99.995% | |
+
+Four things fall out of this, and only the first was expected:
+
+* **The fraction grew, the saving did not.** 15.0% against 9.2% — but the *absolute*
+  saving is 21.46 ms against 21.5 ms, the same number twice. It is the tensor engine's
+  work, which is a fixed quantity; the percentage moved only because the denominator did.
+  A guess that bf16 "might be worth more" on the faster graph was simply wrong.
+* **The gather is untouched a third time.** 30.9 → 30.2 ms, with **more** packets
+  (1.34 M → 1.51 M) of smaller payload. This is now the third graph on which halving the
+  bytes has moved that number by less than 1 ms, which is about as directly as a profile
+  can say *per packet, not per byte*.
+* **`matmult` and `all` are not merely indistinguishable, they are identical.** 121.65 vs
+  121.63 ms, and **every profile counter agrees to the integer** — packet count, matmul
+  count, spill bytes, transpose FLOP — on two builds with different cache keys. The
+  earlier reading was right: the matmuls are the only thing cast either way.
+* **The accuracy cost is byte-for-byte the same as before.** 99.843 / 99.960 / 99.990 and
+  24.203 / 99.968 / 99.995, the same digits as on the corners build. Which is a third,
+  independent confirmation that the packed gather contributes exactly zero error: bf16's
+  error is in the matmuls, and it did not change when the sampler underneath it did.
+
+The verdict is therefore unchanged. It is a better deal than it was — 15% instead of 9% —
+and it still loses the 2009-pixel tennis racket, so it stays a flag.
+
 Two corrections to what this file used to say, both worth keeping:
 
 * **bf16 does compile now.** This section previously reported that `--dtype bfloat16`
@@ -811,10 +852,9 @@ started at 2.2x. What is left, in descending order of what the numbers support:
    profile are how to find the next one.
 4. **Spill** — 5.35 GB of save+reload, ~44 ms of static DMA. One fewer pixel-decoder level
    is the untried structural change.
-5. **bfloat16 stays opt-in.** It was −21.5 ms *on the corners build* and has not been
-   re-measured on top of the packed gather, where the tensor engine is a larger share of a
-   smaller total and it might well be worth more. It costs one lost 2009-pixel object
-   either way, which is why it is a flag.
+5. **bfloat16 stays opt-in**, now measured on top of the packed gather: 121.65 ms, −15.0%.
+   The saving is the same absolute 21.5 ms it was before — it is the tensor engine's work,
+   which is fixed — and it still costs one lost 2009-pixel object. A flag, not a default.
 
 Batching is not on this list because nothing here has been measured at batch > 1; a
 DMA-bound graph may well amortise better than a compute-bound one, which makes it worth
@@ -902,8 +942,12 @@ gets its own NEFF and cannot silently reuse a previous build.
       pixel-decoder level is the untried structural change
 - [ ] Find the next resize-shaped op: 317 k matmul instructions at 180 ns and 143 GFLOP
       of transposes say there is still more layout churn than arithmetic
-- [ ] Re-measure bf16 on top of the packed gather: its −21.5 ms was against the corners
-      build, and the tensor engine is now a larger share of a smaller total
+- [x] **bf16 re-measured on top of the packed gather**: 143.1 -> 121.65 ms, −15.0%. The
+      same absolute 21.5 ms as before, so the fraction grew and the saving did not; the
+      gather moved 0.7 ms on *more, smaller* packets for the third time; `--auto-cast`
+      `matmult` and `all` agree to the integer on every counter; and the accuracy cost is
+      the same digits as on the corners build, which is a third confirmation that the
+      packed gather adds no error. Still a flag, still that tennis racket
 - [ ] Other input sizes (768x768 is the interesting one for segmentation quality) and
       the semantic / instance tasks, which share the graph but not the post-processing
 - [ ] Batching, which is unmeasured — a DMA-bound graph may amortise better than a

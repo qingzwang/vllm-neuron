@@ -67,6 +67,13 @@ def parse_args():
                          "packed is 466.7 ms against 614.8 at 640x640, and 143 against "
                          "230 at 384, because it issues 60%% fewer DMA packets for the "
                          "same bytes. Defaults to packed")
+    ap.add_argument("--cross-attn", default="per_head", choices=("batched", "per_head"),
+                    help="how the decoder's masked cross attention runs on device: "
+                         "'per_head' loops over the eight heads, 'batched' is upstream's "
+                         "nn.MultiheadAttention. Same arithmetic, not bit-for-bit (the "
+                         "reduction over keys reassociates, 3.4e-08 on CPU); per_head "
+                         "keeps one 3.66 MiB slice live where batched keeps two 29.3 MiB "
+                         "tensors, against 24 MiB of SBUF. Defaults to per_head")
     ap.add_argument("--compiler-args", default="--optlevel=1",
                     help="passed verbatim to neuronx-cc. Defaults to --optlevel=1, which "
                          "measured fastest (237.9 ms against 241.0 at the compiler's "
@@ -246,9 +253,11 @@ def main():
 
     from src import patches
 
-    patches.install(level_shapes, msda=args.msda, gather=args.gather)
+    patches.install(level_shapes, msda=args.msda, gather=args.gather,
+                    cross_attn=args.cross_attn)
     print(f"patched for {size}x{size}, deformable levels {level_shapes}, {args.dtype}, "
-          f"device deformable attention: {args.msda}/{args.gather}\n")
+          f"device deformable attention: {args.msda}/{args.gather}, "
+          f"cross attention: {args.cross_attn}\n")
 
     from transformers import OneFormerForUniversalSegmentation
 

@@ -79,6 +79,27 @@ Both are forced by ``probe_device_ops.py``, not by taste:
    ``align_corners=False`` makes the interpolation weights fixed, so :mod:`resize`
    does both sites in shifts and adds. See that module for why the ratios matter.
 
+10. **Masked cross attention, one head at a time.** Also not forced -- also forced by
+    the profile, and at 640x640 it is the largest single item in it. The decoder's ten
+    layers cycle three feature levels, so layers 2, 5 and 8 attend over the 80x80 level:
+    6400 keys. ``nn.MultiheadAttention`` is called with the default
+    ``need_weights=True``, which takes ``torch.baddbmm(attn_mask, q_scaled, k^T)`` -- so
+    a float32 ``(8, 150, 6400)`` mask *and* a float32 ``(8, 150, 6400)`` score matrix
+    are live at once, 29.3 MiB each against a 24 MiB SBUF; at 384 the same pair is
+    10.5 MiB each and fits. 91% of every byte read from HBM in the 640 forward is a spill
+    reload, and the compiler's ``DMAProfiler`` names these two: three 791.25 MiB
+    ``divide.*_spill`` reloads, one per layer at that level. Heads are independent, so
+    :func:`_cross_attention_per_head` runs the same arithmetic in a Python loop over the
+    eight of them and never has more than one 3.66 MiB slice live. It also drops the
+    ``.view(bsz, heads, L, S).mean(dim=1)`` that ``need_weights=True`` does at the end of
+    every layer to produce attention weights OneFormer discards. Worth 7.8 ms at
+    ``--optlevel=1`` and 9.4 at ``--optlevel=2`` -- real but not proportional to the
+    tensor, because ``matmul_instruction_count`` comes out *identical to the digit*: the
+    compiler was already tiling the batched form into the same schedule, so all this
+    changes is what stays live across it, and the entire win is 1.56 GB less spill.
+    Unlike the gather patches this one is *not* bit-for-bit: see that function for what
+    reassociates and by how much.
+
 All patches assert that the upstream code still looks the way they assume. A
 transformers upgrade that moves either line turns into a loud failure at install time
 rather than a silently unpatched model.
@@ -452,10 +473,92 @@ def _check(condition: bool, message: str) -> None:
         )
 
 
+def _cross_attention_per_head(mha, query, key, value, attn_mask, key_padding_mask):
+    """``nn.MultiheadAttention``'s own math, one head at a time instead of all eight.
+
+    A transcription of the ``need_weights=True`` branch of
+    ``F.multi_head_attention_forward``, with the batched ``baddbmm``/``bmm`` pair split
+    into a Python loop over ``bsz * num_heads``. Heads are independent -- neither matmul
+    reduces over the head axis -- so the arithmetic is the same one, term for term:
+
+    * ``baddbmm(mask, q_scaled, k^T)`` per batch element is ``mm(q_scaled[h], k[h]^T)``
+      plus ``mask[h]``, and the reduction it performs is over ``head_dim`` either way;
+    * ``softmax(dim=-1)`` is per row;
+    * ``bmm(attn, v)`` per batch element is ``mm(attn[h], v[h])``, reducing over ``S``.
+
+    Being the same arithmetic is not the same as being bit-identical, and this one is
+    not. The QK matmul agrees exactly at every level. The AV matmul does not once ``S``
+    is large: ``bmm`` and ``mm`` are different kernels, they block the reduction over
+    ``S`` differently, and the sum comes out reassociated. On CPU that is exact at
+    ``S=400`` and 3.4e-08 at 1600 and 6400 -- five orders of magnitude under the 2e-3
+    tripwire ``run_device.py`` checks, and the same *kind* of difference as running the
+    model on a different machine. Both gather strategies in :mod:`bilinear` are bit-exact
+    and this is not; do not read the three as interchangeable.
+
+    The reason to accept it is what is *live*. Upstream materializes a float32 ``(bsz * heads, L, S)``
+    mask and a score matrix of the same shape at the same time; at 640x640 the decoder's
+    80x80 level makes those 29.3 MiB each, against 24 MiB of SBUF, and the graph spends
+    more than half its time spilling them. Here the widest thing alive is one head's
+    ``(150, 6400)`` slice: 3.66 MiB.
+
+    Two small things go with it, and both are free:
+
+    * **The mask is filled, not added.** Upstream's ``_canonical_mask`` turns the boolean
+      mask into a float32 tensor of ``0`` and ``-inf`` and adds it. ``masked_fill`` is
+      bit-identical -- ``x + 0.0 == x`` and ``x + -inf == -inf`` for every finite ``x``,
+      and the one case where the two differ, ``-0.0 + 0.0 == +0.0`` against ``-0.0``,
+      cannot survive ``exp`` -- and it never builds the tensor.
+    * **No averaged weights.** ``need_weights=True`` ends by reducing the score matrix
+      over heads to return attention weights. ``output_attentions`` is off in this port,
+      so those are computed and dropped, once per layer.
+
+    Returns ``(attn_output, None)``: the caller's second element is only ever forwarded
+    when ``output_attentions`` is set, which this port does not support.
+    """
+    _check(not mha.batch_first, "nn.MultiheadAttention is batch_first now")
+    _check(mha.bias_k is None and mha.bias_v is None, "the decoder's attention has bias_k/bias_v")
+    _check(not mha.add_zero_attn, "the decoder's attention adds a zero-attention slot")
+    _check(mha._qkv_same_embed_dim, "the decoder's attention has separate q/k/v projections")
+    _check(key_padding_mask is None, "the decoder now passes a key_padding_mask")
+    _check(not mha.training, "this path drops dropout; it is inference only")
+
+    tgt_len, bsz, embed_dim = query.shape
+    src_len = key.shape[0]
+    heads = mha.num_heads
+    head_dim = embed_dim // heads
+
+    weight, bias = mha.in_proj_weight, mha.in_proj_bias
+    q = torch.nn.functional.linear(query, weight[:embed_dim], bias[:embed_dim])
+    k = torch.nn.functional.linear(
+        key, weight[embed_dim:embed_dim * 2], bias[embed_dim:embed_dim * 2]
+    )
+    v = torch.nn.functional.linear(value, weight[embed_dim * 2:], bias[embed_dim * 2:])
+
+    # (L, N, E) -> (N * heads, L, head_dim), which is upstream's layout exactly.
+    q = q.view(tgt_len, bsz * heads, head_dim).transpose(0, 1)
+    k = k.view(src_len, bsz * heads, head_dim).transpose(0, 1)
+    v = v.view(src_len, bsz * heads, head_dim).transpose(0, 1)
+    # Upstream scales q by sqrt(1 / head_dim) before the matmul, not the product after.
+    q = q * (head_dim ** -0.5)
+
+    per_head = []
+    for h in range(bsz * heads):
+        scores = torch.mm(q[h], k[h].transpose(0, 1))  # (L, S)
+        if attn_mask is not None:
+            scores = scores.masked_fill(attn_mask[h], float("-inf"))
+        per_head.append(torch.mm(scores.softmax(dim=-1), v[h]))
+
+    out = torch.stack(per_head, dim=0)  # (N * heads, L, head_dim)
+    out = out.transpose(0, 1).contiguous().view(tgt_len * bsz, embed_dim)
+    out = torch.nn.functional.linear(out, mha.out_proj.weight, mha.out_proj.bias)
+    return out.view(tgt_len, bsz, embed_dim), None
+
+
 def install(
     level_shapes: list[tuple[int, int]],
     msda: str = "torch",
     gather: str = "packed",
+    cross_attn: str = "per_head",
 ) -> None:
     """Patch ``transformers.models.oneformer.modeling_oneformer`` in place.
 
@@ -475,6 +578,14 @@ def install(
             (see :func:`bilinear.bilinear_sample_packed`). The two are bit-for-bit equal,
             so this is purely a DMA-descriptor question. The host stays on ``"corners"``
             either way, which makes the device comparison a direct diff between them.
+        cross_attn: how the decoder's masked cross attention runs *on device* --
+            ``"per_head"`` for :func:`_cross_attention_per_head`, ``"batched"`` for
+            upstream's ``nn.MultiheadAttention`` call. The same arithmetic, but *not*
+            bit-for-bit -- ``bmm`` and ``mm`` reassociate the reduction over the key axis
+            differently, 3.4e-08 on CPU -- bought for a much smaller live set, which at
+            640x640 is the difference between fitting in SBUF and not. The host stays
+            batched either way, so the device comparison is again a direct diff between
+            the two.
 
     The order matters and getting it wrong is silent: the reversed list sums to the
     same number of positions, so the shapes still "fit" while every level is sampled
@@ -612,6 +723,38 @@ def install(
 
     layer_cls.forward = patched_forward
     layer_cls._oneformer_neuron_patched = True
+
+    # -------------------------------------------------------- 3. the cross attention
+    _check(
+        cross_attn in ("batched", "per_head"),
+        f"unknown cross-attention strategy {cross_attn!r}",
+    )
+    if cross_attn == "per_head":
+        cross_cls = m.OneFormerTransformerDecoderCrossAttentionLayer
+
+        def dispatch_cross_attention(mha, query, key, value, attn_mask, key_padding_mask):
+            # The host keeps upstream's batched call: it is the reference the device is
+            # compared against, and on a host the wide intermediate costs nothing that
+            # matters.
+            if query.device.type != "neuron":
+                return mha(
+                    query=query,
+                    key=key,
+                    value=value,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                )
+            return _cross_attention_per_head(
+                mha, query, key, value, attn_mask, key_padding_mask
+            )
+
+        m._NEURON_CROSS_ATTENTION = dispatch_cross_attention
+        for name in ("forward_post", "forward_pre"):
+            _transform_method(
+                cross_cls,
+                name,
+                [("self.multihead_attn(", "_NEURON_CROSS_ATTENTION(self.multihead_attn, ")],
+            )
 
     global _installed_level_shapes
     _installed_level_shapes = list(level_shapes)

@@ -8,12 +8,15 @@ up on Trainium — developed on Trn2, since re-run unchanged on Trn1.
 **Status: working.** The whole model compiles to a single graph and runs on one
 NeuronCore, and its panoptic segmentation is **pixel-for-pixel identical** to
 HuggingFace on CPU on every image tried — same segments, same order, same scores to
-four decimals. Nine patches were needed; every one is a compiler constraint, and all of
-them together leave the model numerically unchanged on CPU.
+four decimals. Ten patches were needed; the first eight are compiler constraints and the
+last two are the profile's, and all of them together leave the model numerically
+unchanged on CPU.
 
-**The default test size is 640x640**, where a forward is **466.7 ms on trn1.2xlarge**,
-**6.1x faster than the same model on 12 CPU cores** (2871 ms). The optimization work
-below was done at **384x384**, where the same build is **143 ms and 5x CPU**; both sizes
+**The default test size is 640x640**, where a forward is **458.9 ms on trn1.2xlarge** —
+**435.5 ms** with `--compiler-args=--optlevel=2` — against 2871 ms for the same model on
+12 CPU cores: **6.3x and 6.6x**. The optimization work
+below was done at **384x384**, where the same build is **143 ms and 5x CPU** (measured
+before the table's last row, which was not re-run at 384); both sizes
 still run, and "640x640: the default test size" near the end is the re-measurement,
 including what changes about the bottleneck.
 
@@ -24,11 +27,16 @@ of the time. "Where the 240 ms goes" is that measurement and what came out of it
 
 | | at 384 | at 640 | |
 |---|---|---|---|
-| `--optlevel 1` | −3.1 ms | not re-measured | the compiler asked, once |
+| `--optlevel 1` | −3.1 ms | **+21.8 ms** — 640 wants `--optlevel 2` | the compiler asked, once, at one size |
 | exact power-of-two resize | −7.5 ms | not re-measured | an `F.interpolate` was compiling to a 9216x144 matmul |
 | **one gather instead of four** | **−87.4 ms** | **−148.1 ms** | fold the 2x2 neighbourhood into the table |
+| cross attention one head at a time | not measured | −9.4 ms | stop holding a 29.3 MiB score matrix |
 
-All three are on by default and all three leave the output **bit-for-bit unchanged**. The
+All four are on by default. The first three leave the output **bit-for-bit unchanged**; the
+fourth reassociates one reduction and is the only patch here that does not (3.4e-08, and
+"Cutting the widest tensor" is explicit about it). The
+first row is the one that did not survive the size change, and "Compiler flags, swept
+again at 640" says why. The
 last one is the interesting one, and its lesson is that the 83 ms was not a missing kernel
 and not the hardware: it was asking for the same data four times. The NKI kernel for this
 op *is* written (`--msda nki`) and does need Trainium2, but it is now competing against
@@ -927,7 +935,9 @@ the packed gather is bit-exact rather than merely close.
 
 ### The numbers
 
-`neuron-bench exec -n 200 -w 20 --fixed-nc-count=1`, trn1.2xlarge, `--optlevel 1`:
+`neuron-bench exec -n 200 -w 20 --fixed-nc-count=1`, trn1.2xlarge, `--optlevel 1`,
+`--cross-attn batched` throughout so the two sizes are the same program — the two
+subsections after this one are what moves the 640 column from 466.66 to 435.45:
 
 | | 384 packed | 640 corners | **640 packed** | 640 packed + bf16 |
 |---|---|---|---|---|
@@ -1001,6 +1011,140 @@ flips *something* on a photograph with close calls in it is not a default, whate
 98 ms says. `--dtype bfloat16` and `--compiler-args '--auto-cast=all --auto-cast-type=bf16'`
 remain available and remain opt-in.
 
+### Why 640 spills: two tensors that fit in 24 MiB at 384 and do not at 640
+
+"Spill grew 6.1x" is a symptom. What the profile is downstream of: `spill_reload_bytes` is
+22.75 GB of the 24.98 GB read from HBM (**91%**) and `spill_save_bytes` is 9.957 GB of the
+9.973 GB written (**99.8%**). The forward at 640 is almost entirely a spill-moving program.
+`mm_arithmetic_intensity` is 31.4 against a `peak_flops_bandwidth_ratio` of 223.8 — 7x off
+the machine's own balance point — while the compiler's front end prints `Found compute bound
+graph`, which is worth knowing it gets wrong here.
+
+Two tensors cross the 24 MiB SBUF between the two sizes, and both can be sized with a
+calculator.
+
+**The decoder's masked cross attention.** The ten layers cycle three feature levels
+(`level_index = index % 3`), the levels are ordered coarsest first, so layers 2, 5 and 8
+attend over the 80x80 level: **6400 keys**. `nn.MultiheadAttention` is called without
+`need_weights`, so it takes the `torch.baddbmm(attn_mask, q_scaled, k^T)` path, which needs
+two float32 `(8, 150, 6400)` tensors live at the same time — the mask that
+`_canonical_mask` builds out of 0 and `-inf`, and the score matrix. **29.3 MiB each.** At
+384 the same pair is 10.5 MiB each and fits. The compiler's `DMAProfiler` names them
+without being asked: the top five spill reloads in the decoder partition are
+`divide.21_spill`, `divide.27_spill`, `divide.33_spill` at 791.25 MiB (**three of them, one
+per layer at that level**) and `divide.14/16_spill` at 576 MiB, together **67% of that
+partition's estimated DMA time**. `--cross-attn per_head` attacks this one, and
+"Cutting the widest tensor" below reports what that was actually worth — less than this
+paragraph would lead you to expect, which is the more useful half of the result.
+
+**The packed gather's table, at the 80x80 level.** `(8 heads x 32 dim) x 82² x 4 slots x
+4 B` = **26.3 MiB**, also over. At 384's 48x48 level it is 9.8 MiB and fits. So the
+optimization that won 87 ms at 384 crossed the same line at 640, which is the real reason
+its *share* of the forward fell rather than rose. Those gathers run at an estimated
+52.6 GB/s where sequential loads in the same partition run at 180–300.
+
+### Compiler flags, swept again at 640
+
+The 384 sweep predates all of this, and its winner does not survive. Same harness as
+before, `--gather packed`, fp32, `n=200`:
+
+| | median | Δ vs `--optlevel 1` | |
+|---|---|---|---|
+| `--optlevel=1` | 466.66 ms | — | the 384 winner |
+| **`--optlevel=2`** | **444.86 ms** | **−21.8 ms, −4.7%** | the compiler's own default |
+| `--layer-unroll-factor=2` | 464.25 ms | −2.4 ms | noise-adjacent |
+| `--enable-parallel-queues` | 466.63 ms | −0.03 ms | a no-op, provably |
+| `--optlevel=3` | — | — | compile host OOM |
+| `--experimental-multi-level-tensorization` | — | — | needs an internal-only package |
+| `--vectorize-strided-dma` | — | — | not a flag this version accepts |
+
+At 384, `--optlevel 1` was 3.1 ms *faster* than the default and 3x cheaper to compile. At
+640 the default is 21.8 ms faster, at 2.7x the compile time (754 s against 284 s). Output
+is unaffected: `class_queries_logits rel=3.068e-06` at both, the same digits, per-query
+argmax identical. The default in `run_device.py` and `segment.py` is still `--optlevel=1`,
+because it is what the 384 numbers throughout this file were measured at; **at 640, pass
+`--compiler-args=--optlevel=2`**.
+
+How `--optlevel 2` wins is not how it looks like it should:
+
+| | `--optlevel 1` | `--optlevel 2` |
+|---|---|---|
+| total | 467.14 ms | **445.37 ms** |
+| static DMA | 245.1 ms | **220.9 ms** |
+| DMA queues | 338 | **210** |
+| spill save + reload | 32.70 GB | 36.80 GB ↑ |
+| transpose FLOP | 283.4 G | 404.1 G ↑ |
+| `mm_arithmetic_intensity` | 31.4 | 19.9 ↓ |
+
+It spills **4.1 GB more**, does 43% more transpose work, and is further off the balance
+point — and still wins, by moving what it spills through 38% fewer queues. That is the
+per-packet thesis again, on a fifth graph. It changes no tensor's size, so it composes with
+`--cross-attn per_head` rather than competing with it.
+
+Two of the three failures are environment, not model, and are recorded so they are not
+retried: `--optlevel=3` ran for 1120 s and then `[F137] neuronx-cc was forcibly killed`,
+which is the *compile host* running out of its 32 GB, and
+`--experimental-multi-level-tensorization` reports that it `requires the 'marlin' package,
+which is only available in the internal Neuron compiler image`.
+`--vectorize-strided-dma` is in the driver binary's string table but
+`neuronx-cc` rejects it (`NCC_EARG002`).
+
+### Cutting the widest tensor: −9.4 ms, and a prediction that was too optimistic
+
+The 29.3 MiB score matrix above is the largest single intermediate at 640, so it is the
+obvious thing to remove. The eight attention heads are independent, so there is no reason
+all eight scores have to exist at once: `_cross_attention_per_head` transcribes
+`nn.MultiheadAttention`'s own arithmetic and runs it in a Python loop, one head at a time,
+never holding more than a 3.66 MiB slice. It also drops the
+`.view(bsz, heads, L, S).mean(dim=1)` that `need_weights=True` does at the end of every
+layer to average attention weights OneFormer immediately discards. `--cross-attn
+{per_head,batched}`, default `per_head`; the host side always stays batched, so
+`run_device.py`'s diff is a direct comparison of the two.
+
+Measured, `--gather packed`, fp32, `n=200`:
+
+| | batched | `per_head` | |
+|---|---|---|---|
+| `--optlevel 1` | 466.66 ms | **458.88 ms** | −7.78 ms, −1.7% |
+| `--optlevel 2` | 444.86 ms | **435.45 ms** | −9.41 ms, −2.1% |
+
+It composes with `--optlevel 2` almost additively, and the two together are **466.66 ->
+435.45 ms, −31.2 ms, −6.7%**. What it is not is the 100 ms the "largest tensor in the
+profile" framing invites you to expect, and the counters say why the ceiling is where it is:
+
+| at `--optlevel 1` | batched | `per_head` |
+|---|---|---|
+| spill save + reload | 32.70 GB | 31.14 GB (−4.8%) |
+| static DMA | 245.1 ms | 237.7 ms (−7.4 ms) |
+| `matmul_instruction_count` | 902543 | **902543** |
+| `mm_arithmetic_intensity` | 31.4 | 33.0 |
+
+The matmul instruction count is **identical to the digit**. The compiler was already tiling
+the batched `baddbmm` into exactly the same schedule of small matmuls; writing the loop by
+hand changed nothing about the arithmetic, only about what has to stay live across it — and
+that bought 1.56 GB of spill traffic, essentially all of the 7.8 ms, and nothing else. The
+whole win is `static_dma_active_time`. Spill also only fell 4.8%, not the third that one
+tensor of that size suggests, because this cut one of the two tensors that cross 24 MiB and
+the packed gather's 26.3 MiB table is still there.
+
+Worth stating plainly, because the earlier draft of the section above overclaimed it: the
+compiler's `MemoryAnalysis` "peak intermediate memory demand" line, 56,533,200 bytes at 640
+against 20,351,952 at 384, is **byte-for-byte unchanged** by this patch. That line is the
+HLO partitioner's live-range accounting across its 16 split points, not the SBUF working
+set, and it should not have been read as the latter. The evidence that these two tensors are
+the problem is the arithmetic — 29.3 and 26.3 MiB against 24 — and `DMAProfiler` naming the
+spills; it is not that line.
+
+This is the **only** patch in this port that is not bit-for-bit. `bmm` and `mm` block the
+reduction over the key axis differently, so the AV product reassociates: identical at
+S = 400, 3.4e-08 at S = 1600 and 2.4e-08 at S = 6400 on CPU, five orders of magnitude
+inside `run_device.py`'s 2e-03 tripwire. The QK product is exact at every size (it reduces
+over `head_dim = 32`, which is one tile either way), and replacing the `0`/`-inf` additive
+mask with `masked_fill` is exact too, since `x + 0.0 == x` and no `-0.0` can survive `exp`.
+On device: `class_queries_logits rel=3.005e-06` against 3.068e-06 for batched, per-query
+argmax unchanged, and both gather strategies remain bit-exact — the three flags are not
+interchangeable and `patches.py` says so at each one.
+
 ## Layout
 
 ```
@@ -1017,13 +1161,16 @@ contrib/oneformer-swin-l/
     ├── bilinear.py         — grid_sample-free bilinear sampling (four gathers, or one)
     ├── nki_msda.py         — the same attention through the NKI library's kernel
     ├── resize.py           — exact bilinear resize at power-of-two ratios
-    └── patches.py          — the nine substitutions, with version-drift assertions
+    └── patches.py          — the ten substitutions, with version-drift assertions
 ```
 
 `run_device.py` and `segment.py` both take `--dtype {float32,bfloat16}` (casts the model),
 `--gather {packed,corners}` (one gather per bilinear sample or four — identical output,
 148 ms apart at 640 and 87 at 384), `--msda {torch,nki}` (which deformable attention runs
-on device) and
+on device), `--cross-attn {per_head,batched}` (whether the decoder's masked cross attention
+loops over the eight heads or goes through `nn.MultiheadAttention` as upstream does — the
+only knob of the four whose two settings are *not* bit-identical to each other, see above)
+and
 `--compiler-args`
 (passed verbatim to `neuronx-cc`, e.g.
 `'--auto-cast=matmult --auto-cast-type=bf16'` to leave the weights in fp32 and only run
@@ -1086,9 +1233,26 @@ reference it is diffed against cannot disagree about it.
       packets against 3.70 M, dynamic DMA 30.9 ms against 81.2. No kernel, no accuracy
       cost, ~40 lines. This also **retracts** the conclusion above it — the 83 ms was
       never the hardware, it was asking for the data four times
-- [ ] Cut spill further — now the **largest** item, not the fourth: 5.35 GB / ~44 ms of
-      static DMA at 384, but **32.7 GB / 245 ms at 640**, which is 53% of that forward.
-      One fewer pixel-decoder level is the untried structural change
+- [x] **Why 640 spills, named rather than guessed**: two tensors cross the 24 MiB SBUF
+      between the sizes, and the compiler's `DMAProfiler` names both. The decoder's
+      cross-attention mask and score matrix, 29.3 MiB each at the 80x80 level against 10.5
+      at 384, and the packed gather's own table, 26.3 MiB against 9.8. 91% of every byte
+      read from HBM in the forward is a spill reload
+- [x] **Compiler flags swept again at 640, and the 384 winner does not survive**:
+      `--optlevel=2` is **444.86 ms against 466.66**, −21.8 ms, at 2.7x the compile time
+      and identical output. It gets there by spilling 4.1 GB *more* through 38% fewer
+      queues, so it does not address the cause and composes with the patch below.
+      `--optlevel=3` OOMs the compile host, and two flags that looked aimed at exactly
+      this are unavailable in the public compiler
+- [x] **Cross attention one head at a time: −7.8 ms at `--optlevel 1`, −9.4 at
+      `--optlevel 2`**, and with the flag **466.66 -> 435.45 ms, −6.7%**. The 29.3 MiB
+      score matrix is gone and `matmul_instruction_count` is unchanged to the digit, which
+      is the finding: the compiler had already tiled it, so the win is 1.56 GB less spill
+      and nothing more. The only non-bit-exact patch in the port (3.4e-08)
+- [ ] Cut spill further — still the **largest** item: 31.1 GB / 238 ms at 640, 52% of the
+      forward, against 5.35 GB / ~44 ms at 384. The remaining tensor over 24 MiB is the
+      packed gather's own table (26.3 MiB), so a 2-slot table is now the targeted change
+      and one fewer pixel-decoder level the structural one
 - [ ] Find the next resize-shaped op: 317 k matmul instructions at 180 ns and 143 GFLOP
       of transposes say there is still more layout churn than arithmetic (903 k and
       283 GFLOP at 640)

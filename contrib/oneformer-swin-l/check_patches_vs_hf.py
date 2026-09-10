@@ -15,7 +15,7 @@ compiler is wrong", which are otherwise indistinguishable at the end.
 
 Usage:
     python contrib/oneformer-swin-l/check_patches_vs_hf.py \\
-        --model /mnt/nvme/models/oneformer_coco_swin_large --size 384
+        --model /mnt/nvme/models/oneformer_coco_swin_large --size 640
 """
 
 from __future__ import annotations
@@ -33,7 +33,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="/mnt/nvme/models/oneformer_coco_swin_large")
-    ap.add_argument("--size", type=int, default=384)
+    ap.add_argument("--size", type=int, default=640,
+                    help="square input side, a multiple of 32. This check is the cheap "
+                         "way to find out whether a new size works at all: at 640 Swin "
+                         "pads every stage up to the window size, and a padding bug "
+                         "would show up here before any compile time is spent")
     ap.add_argument("--task", default="panoptic")
     ap.add_argument("--tol", type=float, default=1e-5, help="relative tolerance")
     return ap.parse_args()

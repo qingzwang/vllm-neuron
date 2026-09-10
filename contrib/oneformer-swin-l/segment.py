@@ -43,7 +43,10 @@ def parse_args():
     ap.add_argument("--image", nargs="+", required=True)
     ap.add_argument("--task", default="panoptic",
                     choices=("panoptic", "semantic", "instance"))
-    ap.add_argument("--size", type=int, default=384)
+    ap.add_argument("--size", type=int, default=640,
+                    help="square input side, pinned for the compiler; a multiple of 32. "
+                         "640 is the default test size; 384 is what Swin-L was trained "
+                         "at and is where the README's optimization numbers were measured")
     ap.add_argument("--iterations", type=int, default=10)
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--compare-cpu", action="store_true",
@@ -59,8 +62,9 @@ def parse_args():
                     help="how src/bilinear.py fetches the 2x2 bilinear neighbourhood on "
                          "device: 'packed' is one gather into a 4x-wide table, 'corners' "
                          "four gathers at four indices. Bit-for-bit identical outputs; "
-                         "packed is 143 ms against 230 because it issues 64%% fewer DMA "
-                         "packets. Defaults to packed")
+                         "packed is 466.7 ms against 614.8 at 640x640, and 143 against "
+                         "230 at 384, because it issues 60%% fewer DMA packets for the "
+                         "same bytes. Defaults to packed")
     ap.add_argument("--compiler-args", default="--optlevel=1",
                     help="passed verbatim to neuronx-cc. Defaults to --optlevel=1, the "
                          "fastest setting measured; pass '' for the compiler's own "

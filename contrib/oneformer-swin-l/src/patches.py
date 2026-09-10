@@ -462,7 +462,8 @@ def install(
     Args:
         level_shapes: ``[(H_l, W_l), ...]`` for the pixel decoder's feature levels,
             **in the order the model itself uses**, which is smallest map first:
-            stride 32, then 16, then 8. For a pinned 384x384 input that is
+            stride 32, then 16, then 8. For a pinned 640x640 input -- the default test
+            size -- that is ``[(20, 20), (40, 40), (80, 80)]``; at 384 it is
             ``[(12, 12), (24, 24), (48, 48)]``.
         msda: which deformable attention to use *on device* -- ``"torch"`` for
             :mod:`bilinear`, ``"nki"`` for the NKI library kernel (see :mod:`nki_msda`).

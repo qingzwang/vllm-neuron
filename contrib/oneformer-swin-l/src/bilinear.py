@@ -107,10 +107,15 @@ def bilinear_sample_packed(value: torch.Tensor, grid: torch.Tensor) -> torch.Ten
     4x bigger and is built from four shifted slices of the original -- sequential traffic,
     which is the cheap kind.
 
-    Measured on the whole model: **1.34 M packets of 1612 B against 3.70 M of 552 B, and
-    30.9 ms of dynamic DMA against 81.2** -- 2.8x fewer gathers rather than the 4x the
-    arithmetic suggests, because the four-corner version was already being partly
+    Measured on the whole model at 384x384: **1.34 M packets of 1612 B against 3.70 M of
+    552 B, and 30.9 ms of dynamic DMA against 81.2** -- 2.8x fewer gathers rather than the
+    4x the arithmetic suggests, because the four-corner version was already being partly
     coalesced. 230.5 ms to 143.1 ms end to end, at bit-identical output.
+
+    At the default 640x640 the same change is worth more, and says the per-packet thing
+    more plainly than the 384 numbers do: **5.050 GB in 7.02 M packets becomes 5.066 GB in
+    2.79 M packets** -- slightly *more* bytes, 2.5x fewer packets -- and dynamic DMA goes
+    from 216.1 ms to 75.4. 614.8 ms to 466.7 end to end, again bit-identical.
 
     Two details make it exact rather than approximate:
 
@@ -194,7 +199,8 @@ def multi_scale_deformable_attention(
         attention_weights: ``(B, Q, heads, levels, points)``.
         gather: ``"packed"`` for one gather per sample (:func:`bilinear_sample_packed`),
             ``"corners"`` for the original four. Identical results, bit for bit; the
-            difference is 30.9 ms of DMA against 81.2. Defaults to packed.
+            difference is 75.4 ms of dynamic DMA against 216.1 at 640x640, and 30.9
+            against 81.2 at 384. Defaults to packed.
 
     Returns:
         ``(B, Q, heads * head_dim)``.

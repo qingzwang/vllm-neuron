@@ -8,27 +8,33 @@ up on Trainium — developed on Trn2, since re-run unchanged on Trn1.
 **Status: working.** The whole model compiles to a single graph and runs on one
 NeuronCore, and its panoptic segmentation is **pixel-for-pixel identical** to
 HuggingFace on CPU on every image tried — same segments, same order, same scores to
-four decimals. A forward is **143 ms on trn1.2xlarge**, about **5x faster than the same
-model on 12 CPU cores**. Nine patches were needed; every one is a compiler constraint, and
-all of them together leave the model numerically unchanged on CPU.
+four decimals. Nine patches were needed; every one is a compiler constraint, and all of
+them together leave the model numerically unchanged on CPU.
 
-It did not start there. The first working version was 244 ms — 2.2x CPU, which is modest
-for an accelerator — and profiling said why: **54% of the forward was DMA, and 34% of it
-was one op**, the gather inside deformable attention, with the tensor engine idle 83% of
-the time. "Where the 240 ms goes" is that measurement and what came out of it:
+**The default test size is 640x640**, where a forward is **466.7 ms on trn1.2xlarge**,
+**6.1x faster than the same model on 12 CPU cores** (2871 ms). The optimization work
+below was done at **384x384**, where the same build is **143 ms and 5x CPU**; both sizes
+still run, and "640x640: the default test size" near the end is the re-measurement,
+including what changes about the bottleneck.
 
-| | | |
-|---|---|---|
-| `--optlevel 1` | −3.1 ms | the compiler asked, once |
-| exact power-of-two resize | −7.5 ms | an `F.interpolate` was compiling to a 9216x144 matmul |
-| **one gather instead of four** | **−87.4 ms** | fold the 2x2 neighbourhood into the table |
+It did not start there. The first working version was 244 ms at 384 — 2.2x CPU, which is
+modest for an accelerator — and profiling said why: **54% of the forward was DMA, and 34%
+of it was one op**, the gather inside deformable attention, with the tensor engine idle 83%
+of the time. "Where the 240 ms goes" is that measurement and what came out of it:
+
+| | at 384 | at 640 | |
+|---|---|---|---|
+| `--optlevel 1` | −3.1 ms | not re-measured | the compiler asked, once |
+| exact power-of-two resize | −7.5 ms | not re-measured | an `F.interpolate` was compiling to a 9216x144 matmul |
+| **one gather instead of four** | **−87.4 ms** | **−148.1 ms** | fold the 2x2 neighbourhood into the table |
 
 All three are on by default and all three leave the output **bit-for-bit unchanged**. The
 last one is the interesting one, and its lesson is that the 83 ms was not a missing kernel
 and not the hardware: it was asking for the same data four times. The NKI kernel for this
 op *is* written (`--msda nki`) and does need Trainium2, but it is now competing against
-30.9 ms rather than 83. bfloat16 is a further 15% (121.7 ms) and stays opt-in, because it
-loses a whole small object.
+30.9 ms rather than 83 (75.4 against 216.1 at 640). bfloat16 stays opt-in because it loses
+a whole small object, but the price of that principle has gone up with the size: it is
+−15.0% at 384 and **−21.0% at 640** (368.6 ms).
 
 ## Why this is not a vllm-neuron model
 
@@ -245,13 +251,18 @@ and it is in the table because the cost is not marginal: see "Where the 240 ms g
 ## Where this stands on device
 
 ```bash
-python contrib/oneformer-swin-l/run_device.py --ref /tmp/of_ref/hf_panoptic_384.pt \
+python contrib/oneformer-swin-l/run_device.py --ref /tmp/of_ref/hf_panoptic_640.pt \
     --module backbone     # Swin-L alone
     --module pixel        # ... plus the pixel decoder
     --module full         # everything
     --fullgraph           # fail on a graph break instead of running it eagerly
     --dump-dtypes         # trace only, then report float64 nodes
 ```
+
+The bring-up below was done at 384x384 — feature maps 96/48/24/12 — because that is what
+`--size` defaulted to at the time. Only `--module full` has been re-run at 640 (see
+"640x640: the default test size"); the partial cuts are bisection tools and were not,
+since there is nothing to bisect while the whole model compiles.
 
 **Swin-L: works.** One graph, zero breaks, 246 s to compile, and every feature map
 matches CPU (the sub-graph latencies from that run were dispatch-only; see the
@@ -328,11 +339,14 @@ Treat the logit tolerances as bring-up tripwires and the segmentation as the cri
 ```bash
 python contrib/oneformer-swin-l/segment.py --image cat.png dog.jpg car.jpg \
     --compare-cpu --iterations 10 --out /tmp/of_seg
+    --size 640                                        # the default; 384 also works
     --dtype bfloat16                                  # cast the weights too
     --compiler-args '--auto-cast=matmult --auto-cast-type=bf16'   # or just the matmuls
 ```
 
-The table below is **trn2.3xlarge**. The same run on trn1.2xlarge is 244 ms for the
+The table below is **trn2.3xlarge at 384x384** (`--size 384`; the default is now 640, and
+the same runs at that size are in "640x640: the default test size"). The same run on
+trn1.2xlarge is 244 ms for the
 forward — 232.9 ms once `--optlevel 1` and the fixed resize went in, which is what the
 defaults now do — 20-24 ms to post-process and 730 ms on CPU; see "Two machines" above
 for why the device figure differs and "Where the 240 ms goes" for what it consists of.
@@ -355,35 +369,46 @@ writing cannot run.
 
 ### The images
 
-Input, HuggingFace on CPU, and Neuron — in that order. The two segmentations are not
-merely similar, they are the same array: `pixel agreement: 100.000%`, so a difference
-map would be entirely black and is not included.
+Regenerated at **640x640**, the current default. Input, HuggingFace on CPU, and Neuron —
+in that order. The two segmentations are not merely similar, they are the same array:
+`pixel agreement: 100.000%` on all three, so a difference map would be entirely black and
+is not included.
 
-**cat.png** — couch, pillow, cat, remote
+> The three filenames are leftovers and no longer describe their contents — the files
+> under `/mnt/nvme/images/` were replaced at some point and the names did not follow.
+> `car.jpg` is a group of children on a tennis court and `dog.jpg` is a bear. The names
+> are kept because that is what the tooling derives its output names from, and because
+> `car.jpg` is the image the bf16 failures happen on, at both sizes.
+
+**car.jpg** — a tennis court: 12 people found individually, plus net, two backpacks, a
+tennis racket, wall, trees, pavement and dirt. Twenty segments, and the hardest of the
+three.
+
+![car: input, CPU, Neuron](samples/car_panoptic.png)
+
+**cat.png** — couch, two cats, two remotes
 
 ![cat: input, CPU, Neuron](samples/cat_panoptic.png)
 
-**dog.jpg** — road, dog, door-stuff, pavement, skateboard, potted plant
+**dog.jpg** — bear, grass
 
 ![dog: input, CPU, Neuron](samples/dog_panoptic.png)
-
-**car.jpg** — road, sky
-
-![car: input, CPU, Neuron](samples/car_panoptic.png)
 
 Colours are per segment id from a fixed palette, so the same segment gets the same
 colour in both columns; they carry no class meaning.
 
-Segmentation is identical on all three, including a six-segment image:
+Segmentation is identical on all three, including the twenty-segment one:
 
 | | CPU | Neuron |
 |---|---|---|
-| cat.png | couch 0.994, pillow 0.941, cat 0.999, remote 0.948 | identical |
-| dog.jpg | road 0.994, dog 1.000, door-stuff 0.881, pavement 0.986, skateboard 1.000, potted plant 0.893 | identical |
-| car.jpg | road 0.997, sky 0.999 | identical |
+| car.jpg | pavement 0.802, wall-wood 0.893, tree 0.944, person 0.999 … ×12, net 0.988, backpack 0.982 / 0.965, tennis racket 0.998, dirt 0.869 — 20 segments | identical |
+| cat.png | couch 0.970, cat 0.999, cat 0.998, remote 0.998, remote 0.994 | identical |
+| dog.jpg | bear 1.000, grass 0.998 | identical |
 
-`same segments: True | pixel agreement: 100.000%` for each, with pixel counts equal to
-the last pixel and scores equal to three decimals.
+`same segments: True | pixel agreement: 100.000%` for each, and scores equal to three
+decimals. Pixel counts are equal to the last pixel everywhere except one `tree-merged`
+boundary on `car.jpg`, 34,836 against 34,834 — two pixels in 409,600, which is what
+"100.000%" is rounding.
 
 ### How the f64 was found, since the error names nothing
 
@@ -535,6 +560,12 @@ Four things fall out of this, and only the first was expected:
 
 The verdict is therefore unchanged. It is a better deal than it was — 15% instead of 9% —
 and it still loses the 2009-pixel tennis racket, so it stays a flag.
+
+> Re-measured a third time at the new default 640x640, where it is a **better** deal
+> still (−21.0%, 466.66 → 368.63 ms) and where the tennis racket survives but 36 k pixels
+> of ground change class instead. "Why bf16 is still a flag, with the reason changed",
+> below, is that run; the conclusion is the same and the second bullet above — that the
+> absolute saving is fixed — is the one thing 640 refutes.
 
 Two corrections to what this file used to say, both worth keeping:
 
@@ -822,8 +853,8 @@ already zeroed all four weights.
 
 ### What would actually be worth doing
 
-Everything above is now the default, and together it is **241.0 ms → 143.1 ms, −40.6%**,
-with segmentation still 100.000% pixel-identical to CPU:
+Everything above is now the default, and together it is **241.0 ms → 143.1 ms, −40.6%** at
+384x384, with segmentation still 100.000% pixel-identical to CPU:
 
 | | device latency | cumulative |
 |---|---|---|
@@ -860,6 +891,116 @@ Batching is not on this list because nothing here has been measured at batch > 1
 DMA-bound graph may well amortise better than a compute-bound one, which makes it worth
 measuring rather than assuming.
 
+## 640x640: the default test size, and a different bottleneck
+
+Everything above was measured at 384x384. **640x640 is now the default** for
+`check_hf_reference.py`, `check_patches_vs_hf.py` and `segment.py`; 384 is still a flag
+away, and this section is the whole configuration re-measured at the new size.
+
+**Nothing needed changing to get there**, which was not obvious in advance. What the port
+requires of the input size is divisibility by 32 — that makes the four Swin stage
+resolutions integers (160, 80, 40, 20 at 640) and keeps every resize ratio in the model a
+power of two, which is what `src/resize.py` depends on. 384 has a second property that 640
+does not: it is what Swin-L was trained at, and every stage divides by the window size 12,
+so **no window padding happens anywhere**. At 640 every stage is padded up — 160 → 168,
+80 → 84, 40 → 48, 20 → 24 — by Swin's own `maybe_pad`, and the padded stage also *shifts*:
+at 384 the last stage is 12x12, exactly one window, so `set_shift_and_window_size` zeroes
+the shift and that stage never runs shifted-window attention at all. At 640 it is 20x20 and
+does. So 640 exercises two code paths 384 never reached, and both compile into the same
+single graph with zero breaks.
+
+They are also still exact. `check_patches_vs_hf.py --size 640` puts the patched model at
+rel **1.25e-06 / 1.30e-06** against unpatched HuggingFace (it is 7.2e-07 / 1.28e-06 at
+384), and on device:
+
+| 640x640, fp32, packed gather | |
+|---|---|
+| compile | 1 graph, 0 breaks, 284 s (`--optlevel 1`) |
+| `class_queries_logits` vs CPU | rel 3.068e-06, mean 1.365e-07 |
+| `masks_queries_logits` vs CPU | rel 2.267e-06, mean 1.230e-07 |
+| per-query argmax label | unchanged |
+| **segmentation, 3 images x 2 tasks** | **same segments; 100.000% of pixels on five, 99.995% on one** |
+
+Those two rel figures are the *same digits* the `corners` build produces at 640 — one more
+independent confirmation, at a size and on Swin code paths neither sampler had seen, that
+the packed gather is bit-exact rather than merely close.
+
+### The numbers
+
+`neuron-bench exec -n 200 -w 20 --fixed-nc-count=1`, trn1.2xlarge, `--optlevel 1`:
+
+| | 384 packed | 640 corners | **640 packed** | 640 packed + bf16 |
+|---|---|---|---|---|
+| **device latency** | 143.11 ms | 614.79 ms | **466.66 ms** | 368.63 ms |
+| vs CPU (`segment.py`, end to end) | 5.1x | — | **6.1x** | 7.8x |
+| DMA active | 71.3 ms (50%) | 436.2 ms (71%) | 308.2 ms (66%) | 229.2 ms (62%) |
+| ├ software *dynamic* DMA | 30.9 ms | 216.1 ms | 75.4 ms | 72.3 ms |
+| │  its packets | 1.34 M x 1612 B | 7.02 M x 719 B | 2.79 M x 1815 B | 2.90 M x 1303 B |
+| └ static DMA | 44.0 ms | 234.9 ms | 245.1 ms | 168.2 ms |
+| Vector engine | 58.4 ms | 143.6 ms | 172.4 ms | 164.3 ms |
+| Tensor engine | 36.1 ms | 114.1 ms | 114.4 ms | 57.4 ms |
+| Scalar engine | 37.0 ms | 85.2 ms | 102.9 ms | 90.6 ms |
+| matmul instructions | 317 k | 898 k | 903 k | 618 k |
+| transpose FLOP | 142.7 G | 281.5 G | 283.4 G | 192.6 G |
+| **spill save + reload** | **5.35 GB** | 32.0 GB | **32.7 GB** | 23.0 GB |
+
+640 is 2.78x the pixels of 384 and 2.78x the pixel-decoder sequence (8400 positions against
+3024), but **3.26x the latency**. The superlinear part is entirely spill: 5.35 GB → 32.7 GB,
+**6.1x**, and static DMA with it, 44 ms → 245 ms. Nothing else in the table grows faster
+than the input.
+
+Three things follow.
+
+1. **The packed gather is worth more in milliseconds and less in percent.** −148.1 ms at
+   640 against −87.4 at 384, but that is 1.7x for 2.78x the pixels, and as a share of the
+   forward it *falls*, 37.9% → 24.1% (614.79 → 466.66) — because spill grew faster than
+   the gather did. What is unusually clean is the mechanism: `corners` moves **5.050 GB in
+   7.02 M packets**, `packed` moves **5.066 GB in 2.79 M packets**. Slightly *more* bytes,
+   2.5x fewer packets, 2.9x less time — 216.1 ms → 75.4 ms. That is the per-packet cost
+   thesis with the byte count held flat by accident, which is the cleanest form of it this
+   port has produced.
+2. **The bottleneck has moved.** At 384 the gather was the largest single item at 34% of
+   the forward; at 640 it is 16%, and **spill is the story** — 245 ms of static DMA, 53% of
+   the forward, against 114 ms of tensor engine. The list above still stands but its order
+   changes: at this size item 4 (spill) is item 1, and the untried structural change —
+   one fewer pixel-decoder level — is worth more here than the kernel is.
+3. **bfloat16 gets a lot more attractive and stays opt-in.** −98.0 ms, −21.0%, against
+   −15.0% at 384, because both of the things bf16 helps are now bigger shares: the tensor
+   engine halves exactly as before (114.4 → 57.4) and spill falls 32.7 → 23.0 GB, taking
+   static DMA from 245 to 168 ms. Dynamic DMA again does not move (75.4 → 72.3) on **more,
+   smaller** packets (2.90 M x 1303 B) — the fourth graph on which halving the payload has
+   moved that number by less than a millisecond.
+
+### Why bf16 is still a flag, with the reason changed
+
+At 384 the bf16 failure was panoptic: it lost a 2009-pixel tennis racket on `car.jpg` and
+pixel agreement collapsed to 24.2%. At 640 that specific failure is **gone** — panoptic
+keeps all 20 segments on the same image, tennis racket included (3060 px on CPU, 3059 on
+device), at 99.906% agreement. What appears instead is a *semantic* failure on the same
+image:
+
+```
+    CPU (HuggingFace)                 Neuron (bf16)
+2   tree-merged   1.000  48692 px     pavement-merged 1.000  53291 px
+3   playingfield  1.000  43568 px     tree-merged     1.000  48670 px
+5   pavement-merged 1.000 17135 px    net             1.000  10063 px
+6   net           1.000  10036 px     playingfield    1.000   7407 px
+
+  same segments: False | pixel agreement: 91.110%
+```
+
+36 k pixels of ground move from `playingfield` to `pavement-merged`. The fp32 build at the
+same size agrees with CPU on 99.995% of that image, so this is bf16's, not the port's.
+
+The useful reading is that neither failure is a fixed defect. That image is a group of
+children on a tennis court (the filename is a leftover; see "The images" above) — one
+large ground region that genuinely could be called either court or pavement, and one small
+racket — and bf16 resolves those near-ties differently depending on the resolution: 384
+lost the small object, 640 loses the ground label. A precision reduction that reliably
+flips *something* on a photograph with close calls in it is not a default, whatever the
+98 ms says. `--dtype bfloat16` and `--compiler-args '--auto-cast=all --auto-cast-type=bf16'`
+remain available and remain opt-in.
+
 ## Layout
 
 ```
@@ -881,19 +1022,26 @@ contrib/oneformer-swin-l/
 
 `run_device.py` and `segment.py` both take `--dtype {float32,bfloat16}` (casts the model),
 `--gather {packed,corners}` (one gather per bilinear sample or four — identical output,
-87 ms apart), `--msda {torch,nki}` (which deformable attention runs on device) and
+148 ms apart at 640 and 87 at 384), `--msda {torch,nki}` (which deformable attention runs
+on device) and
 `--compiler-args`
 (passed verbatim to `neuronx-cc`, e.g.
 `'--auto-cast=matmult --auto-cast-type=bf16'` to leave the weights in fp32 and only run
 the matmuls in bf16). `--compiler-args` is part of the compile-cache key, so each setting
 gets its own NEFF and cannot silently reuse a previous build.
 
+`check_hf_reference.py`, `check_patches_vs_hf.py` and `segment.py` take `--size`, which
+**defaults to 640**; it must be a multiple of 32. `run_device.py` has no `--size` on
+purpose — it reads the size out of the reference `.pt`, so the device build and the
+reference it is diffed against cannot disagree about it.
+
 ## Plan
 
 - [x] Checkpoint, and the architecture read off its real config
 - [x] Op probes: what compiles, what is silently wrong, what aborts
 - [x] `grid_sample` replacement, verified against `F.grid_sample` on CPU and on device
-- [x] HuggingFace reference on CPU at a pinned 384x384, saved as logits and images
+- [x] HuggingFace reference on CPU at a pinned size — 384x384 then, 640x640 now — saved
+      as logits and images
 - [x] The two patches — deformable attention, mask guard — proved not to change the
       model (rel 6e-07 end to end, argmax unchanged)
 - [x] Swin-L compiled and run on device, matching CPU on all four feature maps
@@ -938,17 +1086,28 @@ gets its own NEFF and cannot silently reuse a previous build.
       packets against 3.70 M, dynamic DMA 30.9 ms against 81.2. No kernel, no accuracy
       cost, ~40 lines. This also **retracts** the conclusion above it — the 83 ms was
       never the hardware, it was asking for the data four times
-- [ ] Cut spill further: 5.35 GB of save+reload is still ~44 ms of static DMA. One fewer
-      pixel-decoder level is the untried structural change
+- [ ] Cut spill further — now the **largest** item, not the fourth: 5.35 GB / ~44 ms of
+      static DMA at 384, but **32.7 GB / 245 ms at 640**, which is 53% of that forward.
+      One fewer pixel-decoder level is the untried structural change
 - [ ] Find the next resize-shaped op: 317 k matmul instructions at 180 ns and 143 GFLOP
-      of transposes say there is still more layout churn than arithmetic
+      of transposes say there is still more layout churn than arithmetic (903 k and
+      283 GFLOP at 640)
 - [x] **bf16 re-measured on top of the packed gather**: 143.1 -> 121.65 ms, −15.0%. The
       same absolute 21.5 ms as before, so the fraction grew and the saving did not; the
       gather moved 0.7 ms on *more, smaller* packets for the third time; `--auto-cast`
       `matmult` and `all` agree to the integer on every counter; and the accuracy cost is
       the same digits as on the corners build, which is a third confirmation that the
       packed gather adds no error. Still a flag, still that tennis racket
-- [ ] Other input sizes (768x768 is the interesting one for segmentation quality) and
-      the semantic / instance tasks, which share the graph but not the post-processing
+- [x] **640x640 is now the default test size**, and nothing had to change to get there:
+      one graph, zero breaks, **466.66 ms** and 6.1x CPU, segmentation 100.000%
+      pixel-identical to CPU on five of six image/task pairs and 99.995% on the sixth.
+      640 is not a multiple of 384, so Swin pads every stage (160 → 168, 80 → 84,
+      40 → 48, 20 → 24) *and* runs shifted-window attention in the last stage, which at
+      384 it never does — two new code paths, both exact. The packed gather scales
+      better than the size does (−148.1 ms, and 2.5x fewer packets for the *same* bytes),
+      spill becomes the dominant cost, and bf16 goes from −15.0% to −21.0%
+- [ ] Other input sizes (768x768 keeps 384's window divisibility, so it is the one that
+      separates "bigger" from "padded") and the semantic / instance tasks, which share
+      the graph but not the post-processing
 - [ ] Batching, which is unmeasured — a DMA-bound graph may amortise better than a
       compute-bound one — and whether the ~640 s compile can be cut

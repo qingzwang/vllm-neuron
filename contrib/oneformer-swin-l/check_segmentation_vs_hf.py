@@ -12,7 +12,7 @@ run) and post-processes both through the *same* processor.
 
 Usage:
     python contrib/oneformer-swin-l/check_segmentation_vs_hf.py \\
-        --ref /tmp/of_ref/hf_panoptic_384.pt --device /tmp/of_dev_logits.pt \\
+        --ref /tmp/of_ref/hf_panoptic_640.pt --device /tmp/of_dev_logits.pt \\
         --out /tmp/of_seg
 """
 

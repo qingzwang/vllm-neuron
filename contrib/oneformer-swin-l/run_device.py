@@ -13,7 +13,7 @@ chance of comparing against a differently preprocessed image.
 
 Usage:
     python contrib/oneformer-swin-l/check_hf_reference.py --image ... --out /tmp/of_ref
-    python contrib/oneformer-swin-l/run_device.py --ref /tmp/of_ref/hf_panoptic_384.pt
+    python contrib/oneformer-swin-l/run_device.py --ref /tmp/of_ref/hf_panoptic_640.pt
     ... run_device.py --ref ... --dtype bfloat16      # after fp32 agrees
     ... run_device.py --ref ... --module backbone     # bisect if the whole thing fails
 """
@@ -64,8 +64,9 @@ def parse_args():
                     help="how src/bilinear.py fetches the 2x2 bilinear neighbourhood on "
                          "device: 'packed' is one gather into a 4x-wide table, 'corners' "
                          "four gathers at four indices. Bit-for-bit identical outputs; "
-                         "packed is 143 ms against 230 because it issues 64%% fewer DMA "
-                         "packets. Defaults to packed")
+                         "packed is 466.7 ms against 614.8 at 640x640, and 143 against "
+                         "230 at 384, because it issues 60%% fewer DMA packets for the "
+                         "same bytes. Defaults to packed")
     ap.add_argument("--compiler-args", default="--optlevel=1",
                     help="passed verbatim to neuronx-cc. Defaults to --optlevel=1, which "
                          "measured fastest (237.9 ms against 241.0 at the compiler's "

@@ -10,14 +10,23 @@ against them rather than against a picture.
 The input size is **pinned**, which is the one thing this script does differently from
 the model card's usage. OneFormer's processor defaults to shortest_edge 800 /
 longest_edge 1333, i.e. a different shape per image, and an ahead-of-time compiler
-needs one shape. 384x384 is the natural choice for this checkpoint: it is what Swin-L
-was trained at, and it makes every stage's feature map (96, 48, 24, 12) divisible by
-the window size 12, so no window padding is needed anywhere.
+needs one shape.
+
+**640x640 is the default.** What the port actually requires of the size is divisibility
+by 32: that makes all four Swin stage resolutions integers (160, 80, 40, 20) and keeps
+every resize ratio in the model a power of two, which is what ``src/resize.py`` needs.
+384 has a second property 640 does not -- it is what Swin-L was trained at, and every
+stage divides by the window size 12, so no window padding happens anywhere. At 640 each
+stage is padded up (160 -> 168, 80 -> 84, 40 -> 48, 20 -> 24) by Swin's own
+``maybe_pad``, which compiles and traces fine, and ``check_patches_vs_hf.py --size 640``
+puts the patched model within 1.3e-06 of unpatched HuggingFace, so the padding costs
+nothing but the arithmetic it adds. 384 is still available with ``--size 384`` and every
+number in the README's optimization sections was measured there.
 
 Usage:
     python contrib/oneformer-swin-l/check_hf_reference.py \\
         --model /mnt/nvme/models/oneformer_coco_swin_large \\
-        --image /path/to/image.jpg --task panoptic --size 384 --out /tmp/of_ref
+        --image /path/to/image.jpg --task panoptic --size 640 --out /tmp/of_ref
 """
 
 from __future__ import annotations
@@ -38,9 +47,11 @@ def parse_args():
     ap.add_argument("--image", required=True)
     ap.add_argument("--task", default="panoptic",
                     choices=("panoptic", "semantic", "instance"))
-    ap.add_argument("--size", type=int, default=384,
-                    help="square input side; must be a multiple of 384 so every Swin "
-                         "stage stays divisible by the window size")
+    ap.add_argument("--size", type=int, default=640,
+                    help="square input side; must be a multiple of 32 so every Swin "
+                         "stage resolution is an integer and every resize ratio stays a "
+                         "power of two. A multiple of 384 additionally avoids Swin's "
+                         "window padding, which is cheaper but not required")
     ap.add_argument("--out", default="/tmp/of_ref")
     return ap.parse_args()
 

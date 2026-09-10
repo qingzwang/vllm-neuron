@@ -16,6 +16,8 @@ static-shape ahead-of-time compiler has a reason to struggle with:
 
   grid_sample          the core of multi-scale deformable attention: a gather at
                        *computed float* coordinates with bilinear weights
+  bilinear_sample_packed  the same sampling in one gather instead of four, which is
+                       the 83 ms question -- against the four-gather form, out of range
   ms_deform_attn       HF's own pure-PyTorch deformable attention, end to end
   ms_deform_attn_nki   the NKI library's kernel for the same thing, against ours --
                        including at non-square levels, which the real model never has
@@ -228,6 +230,28 @@ def probe_fixed_resize():
     return fn, (masks, feats)
 
 
+def probe_bilinear_sample_packed():
+    """The one-gather form, against the four-gather form it must reproduce exactly."""
+    sys.path.insert(0, str(pathlib.Path(__file__).parent / "src"))
+    from bilinear import bilinear_sample, bilinear_sample_packed
+
+    value = torch.rand(8, 32, 48, 48, dtype=DEVICE_DTYPE)
+    # Out of range on purpose, and by more than one pixel: the packed form's whole
+    # correctness argument is about the boundary (a zero halo) and about far-out samples
+    # (weights already zero), so a probe that stays inside would prove nothing.
+    grid = torch.rand(8, 3024, 4, 2, dtype=DEVICE_DTYPE) * 2.6 - 1.3
+
+    reference = bilinear_sample(value, grid)
+    on_host = ((bilinear_sample_packed(value, grid) - reference).abs().max()
+               / reference.abs().max()).item()
+    print(f"       (vs the four-gather form, on CPU: rel={on_host:.2e})")
+
+    def fn(value, grid):
+        return bilinear_sample_packed(value, grid)
+
+    return fn, (value, grid), reference
+
+
 def probe_ms_deform_attn_ours():
     """Our whole multi-scale deformable attention, at the pixel decoder's shapes."""
     sys.path.insert(0, str(pathlib.Path(__file__).parent / "src"))
@@ -302,6 +326,7 @@ def probe_ms_deform_attn_nki_hw():
 PROBES = {
     "grid_sample": probe_grid_sample,
     "bilinear_sample": probe_bilinear_sample,
+    "bilinear_sample_packed": probe_bilinear_sample_packed,
     "ms_deform_attn_ours": probe_ms_deform_attn_ours,
     "ms_deform_attn_nki": probe_ms_deform_attn_nki,
     "ms_deform_attn_nki_hw": probe_ms_deform_attn_nki_hw,

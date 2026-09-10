@@ -8,19 +8,27 @@ up on Trainium — developed on Trn2, since re-run unchanged on Trn1.
 **Status: working.** The whole model compiles to a single graph and runs on one
 NeuronCore, and its panoptic segmentation is **pixel-for-pixel identical** to
 HuggingFace on CPU on every image tried — same segments, same order, same scores to
-four decimals. A forward is **230 ms on trn1.2xlarge** (244 ms before the tuning below)
-and 333 ms on trn2.3xlarge, about 2-3x the same forward on 12 CPU cores. Nine patches
-were needed; every one is a compiler constraint, and all of them together leave the model
-numerically unchanged on CPU.
+four decimals. A forward is **143 ms on trn1.2xlarge**, about **5x faster than the same
+model on 12 CPU cores**. Nine patches were needed; every one is a compiler constraint, and
+all of them together leave the model numerically unchanged on CPU.
 
-That ratio is modest for an accelerator, and the port has now been profiled rather than
-guessed about, so the reason is specific: **54% of the forward is DMA and 34% of it is
-one op** — the gather inside deformable attention. The tensor engine is idle 83% of the
-time. "Where the 240 ms goes" says what that buys and what was taken: `--optlevel 1` and
-an exact power-of-two resize are worth 10.5 ms together (241.0 → 230.5) at unchanged
-segmentation, and the 83 ms gather is a *hardware generation* boundary, not a missing
-kernel — the NKI kernel for it is written and needs Trainium2. bfloat16 is 9% faster and
-opt-in, because it loses a whole small object.
+It did not start there. The first working version was 244 ms — 2.2x CPU, which is modest
+for an accelerator — and profiling said why: **54% of the forward was DMA, and 34% of it
+was one op**, the gather inside deformable attention, with the tensor engine idle 83% of
+the time. "Where the 240 ms goes" is that measurement and what came out of it:
+
+| | | |
+|---|---|---|
+| `--optlevel 1` | −3.1 ms | the compiler asked, once |
+| exact power-of-two resize | −7.5 ms | an `F.interpolate` was compiling to a 9216x144 matmul |
+| **one gather instead of four** | **−87.4 ms** | fold the 2x2 neighbourhood into the table |
+
+All three are on by default and all three leave the output **bit-for-bit unchanged**. The
+last one is the interesting one, and its lesson is that the 83 ms was not a missing kernel
+and not the hardware: it was asking for the same data four times. The NKI kernel for this
+op *is* written (`--msda nki`) and does need Trainium2, but it is now competing against
+30.9 ms rather than 83. bfloat16 is a further ~9% and stays opt-in, because it loses a
+whole small object.
 
 ## Why this is not a vllm-neuron model
 
@@ -108,6 +116,7 @@ python contrib/oneformer-swin-l/probe_device_ops.py bilinear_sample # a subset
 | HF's `multi_scale_deformable_attention` | uses `grid_sample` | **ABORT** (exit -11) |
 | **our `bilinear_sample`** | the replacement | **OK, rel 0.00e+00** |
 | **our `multi_scale_deformable_attention`** | the replacement, whole op | **OK, rel 2.12e-07** |
+| **our `bilinear_sample_packed`** | the same sampling in one gather instead of four, samples deliberately >1 px out of range | **OK, rel 0.00e+00** |
 | Swin `window_partition` + reverse | rank-6 view + permute | OK, bit-exact |
 | `torch.roll` | shifted windows | OK, bit-exact |
 | `F.interpolate` bilinear 96→384 | mask logits to image size | OK, rel 1.8e-07 (76 s to compile) |
@@ -705,49 +714,107 @@ already — `hardware_dynamic_dma_packet_percent` is 0 on this machine because h
 descriptor generation (`dge_mode.hwdge`) is also gen3+, so every one of those 3.7 M
 gather descriptors is generated in *software*.
 
-So the 83 ms is not a missing kernel, it is the machine. Two consequences worth being
-precise about:
+**On trn2 this is a `--msda nki` away.** The code is written, the conventions are verified
+against the kernel's source (see `src/nki_msda.py` for the row/column question, which
+square feature maps would have hidden), and the probes are in `probe_device_ops.py`,
+including a deliberately non-square one.
 
-* **On trn2 this is a `--msda nki` away.** The code is written, the conventions are
-  verified against the kernel's source (see `src/nki_msda.py` for the row/column question,
-  which square feature maps would have hidden), and the probes are in
-  `probe_device_ops.py`, including a deliberately non-square one.
-* **On trn1, a hand-written kernel is unlikely to beat the compiler at this.** The gen2-legal
-  gather primitives are `nisa.local_gather` (GpSimd, partition offsets within 16-partition
-  groups, ≤4096 indices per core) and `nisa.nc_n_gather`. Both would gather one sample's
-  32-channel row at a time: 128 bytes per descriptor. The compiler's current lowering
-  already averages **552 bytes** per gather packet, because it coalesces across
-  neighbouring queries. Writing a kernel to make the packets four times *smaller* is not
-  a plan, and DMA time here is per packet.
+> **A retraction.** This section used to end by concluding that the 83 ms "is not a
+> missing kernel, it is the machine", and that a hand-written gen2 kernel could not beat
+> the compiler because `nisa.local_gather` moves 128 bytes per descriptor against the
+> compiler's 552. That argument compares the wrong things: `local_gather` is a GpSimd
+> **SBUF-to-SBUF instruction** and issues no DMA descriptors at all — and GpSimd is busy
+> 4.6 ms out of 241. It also missed that the whole value table is 3.1 MB against 24 MB of
+> SBUF, so it could be resident. The 83 ms was never "the machine"; it was **83 ms of
+> asking for the data four times**, which the next section fixes without a kernel at all.
+> A gen2 NKI kernel remains unproven rather than ruled out.
+
+### One gather instead of four: −87 ms
+
+The four-corner sampler asked for each bilinear sample four times, at four computed
+indices. Since `bilinear_sample` lays the value out with the *spatial* dimension innermost,
+`x0` and `x1` are already adjacent floats — so the 2x2 neighbourhood can be folded into the
+table and fetched with a single index:
+
+```
+packed[p] = [ v(p), v(p+1), v(p+W), v(p+W+1) ]
+```
+
+One gather of four contiguous floats, then a 4-way weighted sum. The table is 4x wider and
+is built from four shifted slices — sequential traffic, the cheap kind, traded against
+scattered traffic, the expensive kind. `src/bilinear.py::bilinear_sample_packed`, selected
+by `--gather packed`, and **now the default**.
+
+| | `--gather corners` | **`--gather packed`** | Δ |
+|---|---|---|---|
+| **device latency** (`neuron-bench`, n=200) | 230.46 ms | **143.11 ms** | **−87.35 (−37.9%)** |
+| software dynamic DMA | 81.2 ms | **30.9 ms** | −50.3 |
+| its packets | 3.70 M × 552 B | **1.34 M × 1612 B** | −64% count, 2.9x size |
+| DMA active, all of it | 130.9 ms | 71.3 ms | −59.6 |
+| transpose FLOP | 222.5 G | 142.7 G | −80 G |
+| spill save + reload | 5.78 GB | 5.35 GB | −0.43 GB |
+| vector engine | 49.0 ms | 58.4 ms | **+9.4** |
+| tensor engine | 40.8 ms | 36.1 ms | −4.7 |
+
+The vector engine going *up* is the trade being visible: the 4-way weighted sum is real
+arithmetic that used to be four separate multiply-accumulates hidden behind DMA latency.
+It is a good trade at 9.4 ms against 50.3.
+
+The gather itself only accounts for −50 ms of the −87. The rest is second-order and was
+not predicted: four gathers meant four index tensors, four sets of clamps and four
+`expand`s per sample, and removing them took 80 GFLOP of transposes with it.
+
+**The output is bit-for-bit identical**, which is the reason this is a default and not a
+flag. Not "within tolerance" — `rel=0.00e+00` against the four-corner form on device
+(probe `bilinear_sample_packed`, at 48x48 with samples deliberately more than a pixel out
+of range), the same `3.071e-06 / 3.503e-06` logit digits as the corners build against CPU,
+and 100.000% pixel agreement on 3 images x 2 tasks.
+
+Getting there needed one correction worth keeping, because the wrong version is the
+obvious one. Clamping the base index is **not** the same as clamping each corner: at
+`x0 == -1` the `x1` corner still has a nonzero weight and must read column 0, while
+`packed[clamp(x0) == 0]` slot 1 holds column *1*. Off by one, only at the boundary, and it
+showed up as rel 0.9 — loudly, which is the good case. Padding the map with one ring of
+zeros first makes that read an honest zero, which is what `padding_mode="zeros"` means
+anyway; the index clamp then only bites two or more pixels out, where `inside()` has
+already zeroed all four weights.
 
 ### What would actually be worth doing
 
-What has been done, and what the numbers say is left. Everything above is now the
-default: `--optlevel=1` plus the fixed resize takes the fp32 forward from **241.0 ms to
-230.5 ms (−4.4%)** with segmentation still 100.000% pixel-identical to CPU.
+Everything above is now the default, and together it is **241.0 ms → 143.1 ms, −40.6%**,
+with segmentation still 100.000% pixel-identical to CPU:
 
-1. **Run it on trn2, which is where the 83 ms lives.** This is not a code change — the
-   code is written. Both halves of the gather problem are the same generation boundary:
-   the NKI kernel needs gen3, *and* hardware descriptor generation needs gen3, which is
-   why 3.7 M descriptors are built in software on this box. The ConvNeXt-XL port's whole
-   pixel decoder — six of these layers — is 70 ms on trn2. That is the single largest
-   lever available and it costs a `--msda nki`. (Note the other trn2 fact from "Two
-   machines": trn2 was *slower* here, 333 ms against 244, so this needs measuring on trn2
-   rather than assuming; the point is that only trn2 can even try it.)
-2. **More ops that are not really arithmetic.** The resize was worth 6.9 ms and 87,625
-   matmul instructions for two string substitutions, and the profile still says
-   **310,513 matmul instructions averaging 180 ns** and **222 GFLOP of transposes** —
-   46% of all tensor-engine FLOP — against 273 GFLOP of actual model arithmetic. The
-   resize was the largest single such op; whether the rest is one more findable op or a
-   long tail of layout churn is unknown, and `%dot` load-weight sizes in the profile are
-   how to find out.
-3. **Spill, still** — 5.78 GB of save+reload after the resize, down from 7.29 GB, and
-   static DMA is still ~50 ms. Anything that reduces live bytes helps: one fewer
-   pixel-decoder level is the untried structural change.
-4. **bfloat16 is available and should stay opt-in.** −21.5 ms (232.9 → 211.4 ms, −9.2%),
-   for one lost 2009-pixel object. That is a deliberate trade a caller can make with
-   `--compiler-args '--auto-cast=matmult --auto-cast-type=bf16'`; it is not a default,
-   because the fp32 default is exactly CPU and this is not.
+| | device latency | cumulative |
+|---|---|---|
+| baseline (eight patches, compiler defaults) | 241.05 ms | — |
+| `--optlevel 1` | 237.91 ms | −1.3% |
+| \+ fixed resize (patch 9) | 230.46 ms | −4.4% |
+| \+ packed gather (`--gather packed`) | **143.11 ms** | **−40.6%** |
+
+The device forward is now **5x faster than the same model on 12 CPU cores**, where it
+started at 2.2x. What is left, in descending order of what the numbers support:
+
+1. **The gather is still the largest single item, but it is no longer absurd.** 30.9 ms
+   of dynamic DMA in 1.34 M packets of 1612 B. The same folding trick does not repeat —
+   there is no third dimension to fold — so the next step here really is a kernel or a
+   different machine. Note that the `--gather packed` result changes what the NKI kernel
+   is competing against: it now has to beat 30.9 ms, not 83.
+2. **trn2, for two reasons at once.** `--msda nki` needs gen3, and so does hardware
+   descriptor generation — the 1.34 M descriptors are still generated in *software* here.
+   Both are free on trn2 and impossible on trn1. (Caveat from "Two machines": trn2 was
+   *slower* on this graph, 333 ms against 244, so this is worth measuring rather than
+   assuming.)
+3. **More ops that are not really arithmetic.** Still **317,401 matmul instructions**
+   averaging 180 ns and **143 GFLOP of transposes** against 273 GFLOP of real model
+   arithmetic. Two of the three wins so far were of this shape — a generic lowering doing
+   as a matmul what is really a data movement — and the `%dot` load-weight sizes in the
+   profile are how to find the next one.
+4. **Spill** — 5.35 GB of save+reload, ~44 ms of static DMA. One fewer pixel-decoder level
+   is the untried structural change.
+5. **bfloat16 stays opt-in.** It was −21.5 ms *on the corners build* and has not been
+   re-measured on top of the packed gather, where the tensor engine is a larger share of a
+   smaller total and it might well be worth more. It costs one lost 2009-pixel object
+   either way, which is why it is a flag.
 
 Batching is not on this list because nothing here has been measured at batch > 1; a
 DMA-bound graph may well amortise better than a compute-bound one, which makes it worth
@@ -766,14 +833,16 @@ contrib/oneformer-swin-l/
 ├── samples/                — the three comparisons shown above
 ├── run_device.py           — compile and diff on device; bisects by module, dumps dtypes
 └── src/
-    ├── bilinear.py         — grid_sample-free bilinear sampling + deformable attention
+    ├── bilinear.py         — grid_sample-free bilinear sampling (four gathers, or one)
     ├── nki_msda.py         — the same attention through the NKI library's kernel
     ├── resize.py           — exact bilinear resize at power-of-two ratios
     └── patches.py          — the nine substitutions, with version-drift assertions
 ```
 
 `run_device.py` and `segment.py` both take `--dtype {float32,bfloat16}` (casts the model),
-`--msda {torch,nki}` (which deformable attention runs on device) and `--compiler-args`
+`--gather {packed,corners}` (one gather per bilinear sample or four — identical output,
+87 ms apart), `--msda {torch,nki}` (which deformable attention runs on device) and
+`--compiler-args`
 (passed verbatim to `neuronx-cc`, e.g.
 `'--auto-cast=matmult --auto-cast-type=bf16'` to leave the weights in fp32 and only run
 the matmuls in bf16). `--compiler-args` is part of the compile-cache key, so each setting
@@ -823,10 +892,18 @@ gets its own NEFF and cannot silently reuse a previous build.
       232.9 (−9.2%) for 99.843% of pixels, and the diff is one whole 2009-px object the
       device does not find. `--auto-cast=matmult` and `--auto-cast=all` are
       indistinguishable, so the entire effect is in the matmuls. Opt-in, not default
-- [ ] Cut spill further: 5.8 GB of save+reload is still ~50 ms of static DMA. One fewer
+- [x] **One gather instead of four: 230.5 -> 143.1 ms, −37.9%, output bit-for-bit
+      identical.** The 2x2 bilinear neighbourhood folded into the value table, so a sample
+      is one gather of four contiguous floats instead of four scattered reads: 1.34 M
+      packets against 3.70 M, dynamic DMA 30.9 ms against 81.2. No kernel, no accuracy
+      cost, ~40 lines. This also **retracts** the conclusion above it — the 83 ms was
+      never the hardware, it was asking for the data four times
+- [ ] Cut spill further: 5.35 GB of save+reload is still ~44 ms of static DMA. One fewer
       pixel-decoder level is the untried structural change
-- [ ] Find the next resize-shaped op: 310 k matmul instructions at 180 ns and 222 GFLOP
-      of transposes say there is more layout churn than arithmetic left
+- [ ] Find the next resize-shaped op: 317 k matmul instructions at 180 ns and 143 GFLOP
+      of transposes say there is still more layout churn than arithmetic
+- [ ] Re-measure bf16 on top of the packed gather: its −21.5 ms was against the corners
+      build, and the tensor engine is now a larger share of a smaller total
 - [ ] Other input sizes (768x768 is the interesting one for segmentation quality) and
       the semantic / instance tasks, which share the graph but not the post-processing
 - [ ] Batching, which is unmeasured — a DMA-bound graph may amortise better than a

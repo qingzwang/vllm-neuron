@@ -86,12 +86,14 @@ rather than a silently unpatched model.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import textwrap
 import types
 
 import torch
 
+from . import bilinear
 from .bilinear import multi_scale_deformable_attention as _msda
 from .resize import fixed_bilinear_resize as _fixed_resize
 
@@ -450,7 +452,11 @@ def _check(condition: bool, message: str) -> None:
         )
 
 
-def install(level_shapes: list[tuple[int, int]], msda: str = "torch") -> None:
+def install(
+    level_shapes: list[tuple[int, int]],
+    msda: str = "torch",
+    gather: str = "packed",
+) -> None:
     """Patch ``transformers.models.oneformer.modeling_oneformer`` in place.
 
     Args:
@@ -463,6 +469,11 @@ def install(level_shapes: list[tuple[int, int]], msda: str = "torch") -> None:
             Either way the host still runs :mod:`bilinear`, because a NKI kernel does not
             exist off the device; that is what keeps ``run_device.py``'s CPU reference
             forward working, and it makes its comparison a direct kernel-vs-PyTorch diff.
+        gather: with ``msda="torch"``, how :mod:`bilinear` fetches the 2x2 neighbourhood
+            on device -- ``"corners"`` for four gathers per sample, ``"packed"`` for one
+            (see :func:`bilinear.bilinear_sample_packed`). The two are bit-for-bit equal,
+            so this is purely a DMA-descriptor question. The host stays on ``"corners"``
+            either way, which makes the device comparison a direct diff between them.
 
     The order matters and getting it wrong is silent: the reversed list sums to the
     same number of positions, so the shapes still "fit" while every level is sampled
@@ -489,7 +500,18 @@ def install(level_shapes: list[tuple[int, int]], msda: str = "torch") -> None:
     total = sum(h * w for h, w in level_shapes)
 
     _check(msda in ("torch", "nki"), f"unknown msda implementation {msda!r}")
-    device_msda = _msda
+    _check(gather in bilinear.SAMPLERS, f"unknown gather strategy {gather!r}")
+    _check(
+        msda == "torch" or gather == "corners",
+        "gather= only applies to the PyTorch deformable attention; the NKI kernel does "
+        "its own sampling",
+    )
+    # The host stays on the four-corner sampler whatever the device does. The two are
+    # bit-for-bit equal, so this costs no accuracy, and it keeps the CPU reference
+    # independent of the thing being measured -- and off the 4x-wider table, which on a
+    # host is pure cost.
+    host_msda = functools.partial(_msda, gather="corners")
+    device_msda = functools.partial(_msda, gather=gather)
     if msda == "nki":
         from . import nki_msda
 
@@ -524,7 +546,7 @@ def install(level_shapes: list[tuple[int, int]], msda: str = "torch") -> None:
             )
         # The host always takes the PyTorch path: a NKI kernel exists only on device, and
         # the CPU forward is the reference the device is compared against.
-        impl = device_msda if value.device.type == "neuron" else _msda
+        impl = device_msda if value.device.type == "neuron" else host_msda
         return impl(value, level_shapes, sampling_locations, attention_weights)
 
     m.multi_scale_deformable_attention = patched_msda

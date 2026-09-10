@@ -55,6 +55,12 @@ def parse_args():
                          "PyTorch one (src/bilinear.py) or the NKI library kernel "
                          "(src/nki_msda.py). --compare-cpu always runs the PyTorch one "
                          "on the host")
+    ap.add_argument("--gather", default="packed", choices=("corners", "packed"),
+                    help="how src/bilinear.py fetches the 2x2 bilinear neighbourhood on "
+                         "device: 'packed' is one gather into a 4x-wide table, 'corners' "
+                         "four gathers at four indices. Bit-for-bit identical outputs; "
+                         "packed is 143 ms against 230 because it issues 64%% fewer DMA "
+                         "packets. Defaults to packed")
     ap.add_argument("--compiler-args", default="--optlevel=1",
                     help="passed verbatim to neuronx-cc. Defaults to --optlevel=1, the "
                          "fastest setting measured; pass '' for the compiler's own "
@@ -75,12 +81,12 @@ class Heads(nn.Module):
         return out.class_queries_logits, out.masks_queries_logits
 
 
-def build(model_path, size, msda="torch"):
+def build(model_path, size, msda="torch", gather="corners"):
     """Load, patch, and return (model, wrapper). See src/patches.py for the nine."""
     from src import patches
 
     level_shapes = [(size // s, size // s) for s in (32, 16, 8)]
-    patches.install(level_shapes, msda=msda)
+    patches.install(level_shapes, msda=msda, gather=gather)
 
     from transformers import OneFormerForUniversalSegmentation
 
@@ -156,7 +162,7 @@ def main():
 
     # Two independent instances when comparing: one stays on the host, one moves to the
     # device. They cannot be the same object -- moving it would take the CPU side with it.
-    dev_model, device_wrapper, patches = build(args.model, args.size, msda=args.msda)
+    dev_model, device_wrapper, patches = build(args.model, args.size, msda=args.msda, gather=args.gather)
     cpu_wrapper = build(args.model, args.size)[1] if args.compare_cpu else None
 
     pixel_mask = torch.ones(1, args.size, args.size)

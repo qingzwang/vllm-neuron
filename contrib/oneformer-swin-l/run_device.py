@@ -60,6 +60,12 @@ def parse_args():
                          "PyTorch one (src/bilinear.py) or the NKI library kernel "
                          "(src/nki_msda.py). The CPU side of the comparison is always "
                          "the PyTorch one, so 'nki' makes this a kernel-vs-PyTorch diff")
+    ap.add_argument("--gather", default="packed", choices=("corners", "packed"),
+                    help="how src/bilinear.py fetches the 2x2 bilinear neighbourhood on "
+                         "device: 'packed' is one gather into a 4x-wide table, 'corners' "
+                         "four gathers at four indices. Bit-for-bit identical outputs; "
+                         "packed is 143 ms against 230 because it issues 64%% fewer DMA "
+                         "packets. Defaults to packed")
     ap.add_argument("--compiler-args", default="--optlevel=1",
                     help="passed verbatim to neuronx-cc. Defaults to --optlevel=1, which "
                          "measured fastest (237.9 ms against 241.0 at the compiler's "
@@ -239,9 +245,9 @@ def main():
 
     from src import patches
 
-    patches.install(level_shapes, msda=args.msda)
+    patches.install(level_shapes, msda=args.msda, gather=args.gather)
     print(f"patched for {size}x{size}, deformable levels {level_shapes}, {args.dtype}, "
-          f"device deformable attention: {args.msda}\n")
+          f"device deformable attention: {args.msda}/{args.gather}\n")
 
     from transformers import OneFormerForUniversalSegmentation
 

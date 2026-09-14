@@ -19,12 +19,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from src import buckets  # noqa: E402 — after sys.path
 
 
 def parse_args():
@@ -39,11 +44,12 @@ def parse_args():
 
 
 def segment(processor, model_config, cls_logits, mask_logits, task, size):
+    """``size`` is ``(H, W)``: the network's input size, which is what the .pt records."""
     outputs = SimpleNamespace(
         class_queries_logits=cls_logits, masks_queries_logits=mask_logits
     )
     post = getattr(processor, f"post_process_{task}_segmentation")
-    result = post(outputs, target_sizes=[(size, size)])[0]
+    result = post(outputs, target_sizes=[size])[0]
     if isinstance(result, dict):
         seg = result["segmentation"].cpu().numpy()
         segments = []
@@ -75,12 +81,14 @@ def main():
     args = parse_args()
     ref = torch.load(args.ref, weights_only=False)
     dev = torch.load(args.device, weights_only=False)
-    size = ref["size"]
+    # A .pt written before rectangular sizes existed stores a bare int for a square one.
+    size = buckets.parse_size(ref["size"])
+    print(f"[size] {buckets.describe(*size)}\n")
 
     from transformers import AutoConfig, OneFormerProcessor
 
     processor = OneFormerProcessor.from_pretrained(args.model)
-    processor.image_processor.size = {"height": size, "width": size}
+    processor.image_processor.size = {"height": size[0], "width": size[1]}
     config = AutoConfig.from_pretrained(args.model)
 
     cpu_seg, cpu_segments = segment(

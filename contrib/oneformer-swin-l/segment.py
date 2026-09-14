@@ -15,6 +15,13 @@ importing scipy and friends. Medians over ``--iterations``.
 Usage:
     python contrib/oneformer-swin-l/segment.py --image a.jpg b.jpg --compare-cpu \\
         --out /tmp/of_seg --iterations 10
+    ... segment.py --image a.jpg --size 480x864      # one rectangular bucket
+    ... segment.py --image *.jpg --size auto         # a bucket per aspect ratio
+
+``--size auto`` compiles one graph per bucket the run touches. That is one NEFF each
+(50-59 MB, weights not included, so they share the one device copy) and a few minutes of
+compile each; the point of :mod:`src.buckets` is that they should all take the same time to
+*run*, because they all have the same area.
 """
 
 from __future__ import annotations
@@ -43,10 +50,13 @@ def parse_args():
     ap.add_argument("--image", nargs="+", required=True)
     ap.add_argument("--task", default="panoptic",
                     choices=("panoptic", "semantic", "instance"))
-    ap.add_argument("--size", type=int, default=640,
-                    help="square input side, pinned for the compiler; a multiple of 32. "
-                         "640 is the default test size; 384 is what Swin-L was trained "
-                         "at and is where the README's optimization numbers were measured")
+    ap.add_argument("--size", default="640", metavar="H[xW]",
+                    help="input size, pinned for the compiler; each side a multiple of 32. "
+                         "'640' means 640x640, the default test size; 'HxW' gives a "
+                         "rectangle, e.g. 480x864 for 16:9 at the same area and so at "
+                         "about the same latency. 'auto' picks the equal-area bucket "
+                         "nearest each image's own aspect ratio (src/buckets.py), which "
+                         "compiles one graph per bucket the run touches")
     ap.add_argument("--iterations", type=int, default=10)
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--compare-cpu", action="store_true",
@@ -101,13 +111,17 @@ class Heads(nn.Module):
         return out.class_queries_logits, out.masks_queries_logits
 
 
-def build(model_path, size, msda="torch", gather="corners", gather_split=1,
+def build(model_path, msda="torch", gather="corners", gather_split=1,
           cross_attn="per_head"):
-    """Load, patch, and return (model, wrapper). See src/patches.py for the ten."""
+    """Load, patch, and return (model, wrapper). See src/patches.py for the ten.
+
+    No input size here: the patches are choices of implementation and are process-wide,
+    while the size is a property of the *instance* and is set by ``select`` below. That
+    split is what lets one model serve several buckets.
+    """
     from src import patches
 
-    level_shapes = [(size // s, size // s) for s in (32, 16, 8)]
-    patches.install(level_shapes, msda=msda, gather=gather, gather_split=gather_split,
+    patches.install(msda=msda, gather=gather, gather_split=gather_split,
                     cross_attn=cross_attn)
 
     from transformers import OneFormerForUniversalSegmentation
@@ -115,9 +129,8 @@ def build(model_path, size, msda="torch", gather="corners", gather_split=1,
     model = OneFormerForUniversalSegmentation.from_pretrained(model_path).eval()
     patches.replace_gelu(model)
     patches.cache_position_embeddings(model)
-    patches.cache_reference_points(model, level_shapes)
     patches.relax_shape_assert()
-    patches.patch_pixel_decoder_forward(level_shapes)
+    patches.patch_pixel_decoder_forward()
     patches.patch_prediction_heads()
     return model, Heads(model), patches
 
@@ -133,14 +146,17 @@ def timed(fn, iterations, warmup):
     return statistics.median(samples), min(samples), max(samples)
 
 
-def summarize(processor, config, cls_logits, mask_logits, task, size):
+def summarize(processor, config, cls_logits, mask_logits, task, target_size):
     from types import SimpleNamespace
 
     outputs = SimpleNamespace(
         class_queries_logits=cls_logits, masks_queries_logits=mask_logits
     )
     post = getattr(processor, f"post_process_{task}_segmentation")
-    result = post(outputs, target_sizes=[(size, size)])[0]
+    # The *image's* size, not the network's: the masks come out at a quarter of the input
+    # and are upsampled here anyway, so upsampling them straight to the original costs
+    # nothing extra and means the result can be used without a second resize.
+    result = post(outputs, target_sizes=[target_size])[0]
     if isinstance(result, dict):
         seg = result["segmentation"].cpu().numpy()
         rows = []
@@ -161,12 +177,12 @@ def summarize(processor, config, cls_logits, mask_logits, task, size):
     return seg, rows
 
 
-def save_overlay(image, seg, path, size):
+def save_overlay(image, seg, path):
     rng = np.random.default_rng(0)
     top = int(seg.max()) + 2
     palette = rng.integers(40, 235, size=(top, 3), dtype=np.uint8)
     rgb = palette[np.clip(seg + 1, 0, top - 1)]
-    base = np.asarray(image.resize((size, size), Image.LANCZOS), dtype=np.float32)
+    base = np.asarray(image, dtype=np.float32)
     Image.fromarray((0.45 * base + 0.55 * rgb).astype(np.uint8)).save(path)
 
 
@@ -176,43 +192,76 @@ def main():
     if out:
         out.mkdir(parents=True, exist_ok=True)
 
+    from src import buckets
+
     from transformers import AutoConfig, OneFormerProcessor
 
     processor = OneFormerProcessor.from_pretrained(args.model)
-    processor.image_processor.size = {"height": args.size, "width": args.size}
     config = AutoConfig.from_pretrained(args.model)
+    auto = str(args.size).lower() == "auto"
+    fixed = None if auto else buckets.parse_size(args.size)
 
+    dtype = getattr(torch, args.dtype)
     # Two independent instances when comparing: one stays on the host, one moves to the
     # device. They cannot be the same object -- moving it would take the CPU side with it.
     dev_model, device_wrapper, patches = build(
-        args.model, args.size, msda=args.msda, gather=args.gather,
+        args.model, msda=args.msda, gather=args.gather,
         gather_split=args.gather_split, cross_attn=args.cross_attn,
     )
-    cpu_wrapper = build(args.model, args.size)[1] if args.compare_cpu else None
+    cpu_model, cpu_wrapper = build(args.model)[:2] if args.compare_cpu else (None, None)
 
-    pixel_mask = torch.ones(1, args.size, args.size)
+    # Cast *before* the host warmup pass, not after. The caches this fills are keyed by
+    # the dtype they were asked for, and the device then looks them up under the dtype it
+    # runs in -- so a float32 warmup followed by a bfloat16 device run misses the cache
+    # and falls back to a host tensor inside the graph.
+    #
+    # Casting before the move is also required for a different reason: in one call it
+    # fails, because OneFormer carries a float64 parameter it never uses in inference
+    # (`criterion.logit_scale`, a scalar in the training loss) and casting f64 -> f32 as
+    # part of the device transfer trips "Expected self.dtype() == dst.dtype()".
+    device_wrapper = device_wrapper.to(dtype=dtype)
 
-    # One host forward first: it is what fills the position and reference caches, which
-    # then get copied to the device. Building them on the device is what patches 4 and 5
-    # exist to avoid.
-    warm = processor(images=Image.open(args.image[0]).convert("RGB"),
-                     task_inputs=[args.task], return_tensors="pt")
-    with torch.no_grad():
-        device_wrapper(warm["pixel_values"], warm["task_inputs"], pixel_mask)
+    # Which bucket each image lands in, decided up front: every size needs one *host*
+    # forward to fill the position tables and the reference grid (building those on device
+    # is what patches 4 and 5 exist to avoid), and doing them all before the model moves
+    # means the 839 MB of weights cross to the device once instead of once per bucket.
+    def size_for(path):
+        with Image.open(path) as image:
+            return buckets.pick(image.width, image.height) if auto else fixed
 
-    dtype = getattr(torch, args.dtype)
-    # Cast on the host, *then* move. In one call it fails: OneFormer carries a float64
-    # parameter it never uses in inference (`criterion.logit_scale`, a scalar in the
-    # training loss), and casting f64 -> f32 as part of the device transfer trips
-    # "Expected self.dtype() == dst.dtype()". Casting first makes it f32 on the host,
-    # after which the move is a plain copy.
-    device_wrapper = device_wrapper.to(dtype=dtype).to(device=DEVICE)
+    sizes = {path: size_for(path) for path in args.image}
+
+    def select(height, width):
+        """Point both models at one bucket. Called outside any compiled region.
+
+        The level shapes and the reference grid live on the instance, so switching size is
+        just a re-pin -- nothing is rebuilt and nothing is recopied.
+        """
+        for model in (dev_model, cpu_model):
+            if model is not None:
+                patches.pin_input_size(model, buckets.level_shapes(height, width))
+
+    for height, width in dict.fromkeys(sizes.values()):
+        print(f"[setup] {buckets.describe(height, width)}")
+        select(height, width)
+        processor.image_processor.size = {"height": height, "width": width}
+        warm = processor(images=Image.open(args.image[0]).convert("RGB"),
+                         task_inputs=[args.task], return_tensors="pt")
+        with torch.no_grad():
+            device_wrapper(warm["pixel_values"].to(dtype), warm["task_inputs"],
+                           torch.ones(1, height, width, dtype=dtype))
+
+    device_wrapper = device_wrapper.to(device=DEVICE)
     print(f"[setup] copied {patches.move_position_cache(dev_model, DEVICE, dtype)} "
-          f"position table(s) to the device, reference grid: "
-          f"{patches.move_reference_cache(DEVICE, dtype)}")
+          f"position table(s) to the device, reference grid(s): "
+          f"{patches.move_reference_cache(dev_model, DEVICE, dtype)}")
+
     compile_options = {"compiler_args": args.compiler_args} if args.compiler_args else {}
     if compile_options:
         print(f"[setup] neuronx-cc args: {args.compiler_args}")
+    # One compiled callable serves every bucket: Dynamo keys its cache on the input
+    # shapes, so a new size recompiles and an old one is still there. That guard is the
+    # input tensor's own shape, which is the one thing that cannot disagree with the pin.
     compiled = torch.compile(
         device_wrapper, backend="neuron_libtorch", fullgraph=True,
         options=compile_options,
@@ -221,7 +270,11 @@ def main():
     for path in args.image:
         image = Image.open(path).convert("RGB")
         name = Path(path).stem
-        print(f"\n=== {path}  ({image.width}x{image.height} -> {args.size}x{args.size})")
+        height, width = sizes[path]
+        processor.image_processor.size = {"height": height, "width": width}
+        print(f"\n=== {path}  ({image.width}x{image.height} -> {height}x{width}"
+              f"{', auto' if auto else ''})")
+        select(height, width)
 
         def preprocess():
             return processor(images=image, task_inputs=[args.task], return_tensors="pt")
@@ -229,9 +282,11 @@ def main():
         inputs = preprocess()
         pv = inputs["pixel_values"]
         ti = inputs["task_inputs"]
+        pixel_mask = torch.ones(1, height, width)
         # task_inputs stays integral: they are token ids, not activations.
         dev_inputs = [pv.to(device=DEVICE, dtype=dtype), ti.to(DEVICE),
                       pixel_mask.to(device=DEVICE, dtype=dtype)]
+        target_size = (image.height, image.width)
 
         def forward_device():
             with torch.no_grad():
@@ -242,7 +297,7 @@ def main():
         dev_cls, dev_msk = forward_device()
 
         def postprocess():
-            return summarize(processor, config, dev_cls, dev_msk, args.task, args.size)
+            return summarize(processor, config, dev_cls, dev_msk, args.task, target_size)
 
         pre_ms = timed(preprocess, args.iterations, args.warmup)
         fwd_ms = timed(forward_device, args.iterations, args.warmup)
@@ -266,7 +321,7 @@ def main():
             cpu_cls, cpu_msk = forward_cpu()
             cpu_fwd = timed(forward_cpu, args.cpu_iterations, 1)
             cpu_seg, cpu_rows = summarize(
-                processor, config, cpu_cls, cpu_msk, args.task, args.size
+                processor, config, cpu_cls, cpu_msk, args.task, target_size
             )
             print(f"  {'forward (CPU)':<14}{cpu_fwd[0]:>9.2f}ms"
                   f"{cpu_fwd[1]:>9.2f}ms{cpu_fwd[2]:>9.2f}ms"
@@ -282,9 +337,9 @@ def main():
                 print(f"  {i:<22}{fmt(left):>22}{fmt(right):>22}")
             print(f"\n  same segments: {same} | pixel agreement: {agree * 100:.3f}%")
             if out:
-                save_overlay(image, cpu_seg, out / f"{name}_{args.task}_cpu.png", args.size)
+                save_overlay(image, cpu_seg, out / f"{name}_{args.task}_cpu.png")
         if out:
-            save_overlay(image, dev_seg, out / f"{name}_{args.task}_neuron.png", args.size)
+            save_overlay(image, dev_seg, out / f"{name}_{args.task}_neuron.png")
             print(f"  wrote {out}/{name}_{args.task}_*.png")
 
 

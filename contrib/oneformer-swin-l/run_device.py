@@ -112,9 +112,9 @@ class Heads(nn.Module):
         # pixel_mask is passed rather than left to default. Upstream would create it
         # with torch.ones(...) inside the forward, and Dynamo isolates that line into a
         # subgraph of its own whose only value is unused there — which the backend
-        # rejects outright ("Cannot compile a module that has no output"). At a pinned
-        # square input the mask is all ones either way, so this changes nothing but the
-        # graph partitioning.
+        # rejects outright ("Cannot compile a module that has no output"). The input is
+        # never padded here (see src/buckets.py), so the mask is all ones either way and
+        # this changes nothing but the graph partitioning.
         out = self.model(
             pixel_values=pixel_values,
             task_inputs=task_inputs,
@@ -257,14 +257,16 @@ def main():
     args = parse_args()
     dtype = getattr(torch, args.dtype)
     ref = torch.load(args.ref, weights_only=False)
-    size = ref["size"]
-    level_shapes = [(size // s, size // s) for s in (32, 16, 8)]
 
-    from src import patches
+    from src import buckets, patches
 
-    patches.install(level_shapes, msda=args.msda, gather=args.gather,
+    # Older reference files stored a bare int for a square input; parse_size takes either.
+    height, width = buckets.parse_size(ref["size"])
+    level_shapes = buckets.level_shapes(height, width)
+
+    patches.install(msda=args.msda, gather=args.gather,
                     gather_split=args.gather_split, cross_attn=args.cross_attn)
-    print(f"patched for {size}x{size}, deformable levels {level_shapes}, {args.dtype}, "
+    print(f"patched for {buckets.describe(height, width)}, {args.dtype}, "
           f"device deformable attention: {args.msda}/{args.gather}"
           f"/split{args.gather_split}, "
           f"cross attention: {args.cross_attn}\n")
@@ -278,14 +280,16 @@ def main():
     # The sine position tables are constants at a pinned input size, and building them
     # is what the compiler rejects ([NCC_IBIR243]). Cache them on the host instead.
     print(f"cached {patches.cache_position_embeddings(model)} sine position embedding(s)")
-    # Same story for the pixel decoder's reference-point grid: constant at a pinned
-    # size, and its meshgrid+reshape is rejected on device (not contiguous).
-    patches.cache_reference_points(model, level_shapes)
+    # Pin *this instance* to this input size: the deformable attention's level shapes, and
+    # the reference-point grid, which is a constant at a pinned size and whose
+    # meshgrid+reshape is rejected on device (not contiguous).
+    print(f"pinned {patches.pin_input_size(model, level_shapes)} pixel-decoder module(s) "
+          f"to {height}x{width}")
     # Upstream's tensor-valued shape assert becomes an unbacked symbol under Dynamo;
     # keep it on the host, where it still catches level-shape mistakes.
     patches.relax_shape_assert()
     # Tensor-valued split/view sizes, plus the FPN's 2x resize as shifts and adds.
-    patches.patch_pixel_decoder_forward(level_shapes)
+    patches.patch_pixel_decoder_forward()
     # `mask_logits < 0.5` promotes 0.5 to f64 in the lowering ([NCC_ESPP004]), and the
     # mask downsample is a 9216x144 matmul unless it is written out.
     patches.patch_prediction_heads()
@@ -310,7 +314,7 @@ def main():
     if args.module == "full":
         inputs.append(ref["task_inputs"])
         # float32 ones, which is exactly what upstream's default would build.
-        inputs.append(torch.ones(1, size, size))
+        inputs.append(torch.ones(1, height, width))
     elif args.module in ("decoder", "layers"):
         # Run the pixel half on CPU once to get this half's real inputs.
         with torch.no_grad():
@@ -337,7 +341,7 @@ def main():
     # follow the model, or the backend refuses the graph for mixing devices.
     print(f"[device] moved {patches.move_position_cache(model, DEVICE, dtype)} "
           f"cached position table(s), reference grid moved: "
-          f"{patches.move_reference_cache(DEVICE, dtype)}")
+          f"{patches.move_reference_cache(model, DEVICE, dtype)}")
     compile_options = {"compiler_args": args.compiler_args} if args.compiler_args else {}
     if compile_options:
         print(f"[device] neuronx-cc args: {args.compiler_args}")

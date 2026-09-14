@@ -6,8 +6,9 @@ Both are forced by ``probe_device_ops.py``, not by taste:
 1. **Deformable attention.** ``F.grid_sample`` aborts the runtime here, so
    :mod:`bilinear` reimplements the op. The upstream call site passes
    ``spatial_shapes`` as a *tensor*; ours needs the level sizes as Python ints so the
-   per-level ``split`` is a compile-time constant. Since the input resolution is
-   pinned anyway, the sizes are known at install time and are passed in.
+   per-level ``split`` is a compile-time constant. The input resolution is pinned per
+   graph, so those ints are known -- but they are read off the *model instance*, not
+   installed as a module constant, so one process can hold several sizes at once.
 
    With ``msda="nki"`` the *device* half of that replacement becomes
    :mod:`nki_msda` -- the NKI library's hand-written kernel for the same op -- because
@@ -45,7 +46,8 @@ Both are forced by ``probe_device_ops.py``, not by taste:
    level shapes and of ``valid_ratios``, which is all ones whenever the input is a
    full, unpadded rectangle. So it too is computed on the host, once, after asserting
    that the ratios really are ones and that the constant matches what upstream
-   computes for the same input.
+   computes for the same input. Cached on the instance, like the level shapes and for
+   the same reason.
 
 6. **The deformable attention's shape assert.** Upstream calls
    ``torch_compilable_check((spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() ==
@@ -60,8 +62,9 @@ Both are forced by ``probe_device_ops.py``, not by taste:
    (``level_start_index[i + 1] - level_start_index[i]``) and then views each piece with
    tensor dimensions. Both make sizes data-dependent, and Dynamo stops at
    ``Could not guard on data-dependent expression 256*u0 < 2``. At a pinned input the
-   splits are constants, so upstream's own source is transformed -- three exact string
-   substitutions, asserted to apply -- to use Python ints.
+   splits are constants, so upstream's own source is transformed -- four exact string
+   substitutions, asserted to apply -- to use Python ints taken from the feature maps'
+   own shapes, a few lines above, before upstream turns them into a tensor.
 
 8. **A comparison against a Python float.** `forward_prediction_heads` ends with
    ``... < 0.5`` to turn mask logits into a boolean attention mask. Comparing a tensor
@@ -132,8 +135,11 @@ class ErfGELU(torch.nn.Module):
 
 _INV_SQRT2 = 0.7071067811865476
 
-# Set by install(), so the per-model helpers below do not need it passed twice.
-_installed_level_shapes: list = []
+# Nothing here holds an input size. Everything that depends on one is either recovered
+# from the tensors inside the traced function (the pixel decoder's per-level split) or
+# stored on the *model instance* that was pinned to it (:func:`pin_input_size`), so one
+# process can hold several sizes at once -- which is what serving more than one aspect
+# ratio needs. See "More than one input size in one process" in the README.
 
 # Every patch that rewrites *module-level* state has to be idempotent: a process that
 # builds two model instances (a host one and a device one, to compare them) calls the
@@ -219,24 +225,82 @@ def move_position_cache(model: torch.nn.Module, device, dtype=None) -> int:
     return moved
 
 
-# The pixel decoder's reference grid, as one constant. Filled by the CPU pass and then
-# moved once by move_reference_cache(); the traced graph only ever reads it. Doing the
-# move *inside* the graph is what produced "unimplemented _copy_from xla:0neuron:0" --
-# during tracing the device HuggingFace passes around is an XLA device, not neuron.
-_reference_cache: dict = {}
+def pin_input_size(model: torch.nn.Module, level_shapes) -> int:
+    """Pin one *model instance* to one input size. Returns the modules touched.
 
+    Two things in the model need the level shapes as Python ints rather than as the
+    ``(levels, 2)`` device tensor upstream passes around, and neither can read that
+    tensor: reading it on device would put a host sync in the middle of the graph.
 
-def cache_reference_points(model: torch.nn.Module, level_shapes) -> None:
-    """Replace the pixel decoder's reference-point grid with a host-computed constant.
+    * **The reference-point grid.** ``get_reference_points`` builds it with ``meshgrid``
+      and then ``reshape(-1)`` on the non-contiguous result, which the device rejects
+      outright (``Expected self.is_contiguous() to be true, but got false``). It is a
+      constant: a function of the level shapes and of ``valid_ratios``, which is all ones
+      whenever the input is a full unpadded rectangle -- asserted here, not assumed. So it
+      is computed on the host and cached per dtype, exactly like the position tables.
+    * **The deformable attention's per-level split**, which needs the sizes to be
+      compile-time constants.
 
-    ``get_reference_points(spatial_shapes, valid_ratios, device)`` depends only on the
-    level shapes and the ratios. The ratios are ones for a full rectangular input --
-    asserted here rather than assumed -- so the grid is fixed, and the ``meshgrid`` plus
-    non-contiguous ``reshape`` that the device refuses never runs.
+    Both go on the instance rather than on the class, which is the whole reason one process
+    can serve more than one size. Call it once after ``from_pretrained`` for a fixed size;
+    call it **again**, from outside the compiled region, to switch a model between sizes. A
+    switch is cheap and keeps everything already computed: the reference grids are cached
+    under a key that includes the shapes, so going back to a size does not rebuild it, and
+    ``torch.compile`` will have kept that size's graph too -- it recompiled on the input
+    shape when the size first appeared, which is a guard this cannot get wrong.
+
+    Nothing anywhere is keyed by the flattened length, which would be ambiguous: at equal
+    area two different shapes flatten to the same number of positions -- ``512x800`` and
+    ``640x640`` both give 8400 -- and a transposed pair always does. Equal area is the
+    normal case here, not a corner one; see :mod:`buckets`.
+
+    :func:`move_reference_cache` then copies the grids to the device.
     """
-    if _applied.get("reference_points") == list(level_shapes):
+    from transformers.models.oneformer import modeling_oneformer as m
+
+    shapes = tuple((int(h), int(w)) for h, w in level_shapes)
+    _check(len(shapes) > 0, "level_shapes is empty")
+    _patch_reference_points()
+
+    pinned = 0
+    for module in model.modules():
+        if isinstance(module, m.OneFormerPixelDecoderEncoderOnly):
+            module._neuron_level_shapes = shapes
+            # setdefault, not {}: re-pinning is how a model switches size, and throwing
+            # away the grids would mean rebuilding them -- on the host, needing another
+            # move_reference_cache -- every time it switched back.
+            if getattr(module, "_neuron_reference_cache", None) is None:
+                module._neuron_reference_cache = {}
+                module._neuron_reference_device = {}
+            pinned += 1
+        elif isinstance(
+            module, m.OneFormerPixelDecoderEncoderMultiscaleDeformableAttention
+        ):
+            _check(
+                module.n_levels == len(shapes),
+                f"the deformable attention has {module.n_levels} feature levels but "
+                f"{len(shapes)} level shapes were given",
+            )
+            module._neuron_level_shapes = shapes
+            pinned += 1
+    _check(
+        pinned > 0,
+        "no pixel-decoder encoder found in this model, so nothing was pinned to "
+        f"{shapes} -- is it a OneFormer?",
+    )
+    return pinned
+
+
+def _patch_reference_points() -> None:
+    """Make ``get_reference_points`` read the pinned grid off the instance.
+
+    Upstream's is a ``staticmethod``, called as ``self.get_reference_points(...)``, so
+    replacing it with a plain method changes nothing at the call site and gives the patch
+    access to the instance -- which is where the size-dependent state has to live.
+    """
+    if _applied.get("reference_points"):
         return
-    _applied["reference_points"] = list(level_shapes)
+    _applied["reference_points"] = True
 
     from transformers.models.oneformer import modeling_oneformer as m
 
@@ -250,20 +314,23 @@ def cache_reference_points(model: torch.nn.Module, level_shapes) -> None:
         "get_reference_points no longer builds a meshgrid; re-check this patch",
     )
 
-    _reference_cache.clear()
-
-    def cached_reference_points(spatial_shapes, valid_ratios, device):
+    def cached_reference_points(self, spatial_shapes, valid_ratios, device):
+        level_shapes = _pinned_shapes(self)
         _check(
             valid_ratios.shape[1] == len(level_shapes),
-            f"valid_ratios covers {valid_ratios.shape[1]} levels but this patch was "
-            f"installed for {len(level_shapes)}",
+            f"valid_ratios covers {valid_ratios.shape[1]} levels but this model was "
+            f"pinned to {len(level_shapes)}",
         )
+        # The shapes are part of the key, so one instance can hold the grids for every
+        # size it has been pinned to. Not the flattened length: at equal area that is not
+        # unique, and equal area is what :mod:`buckets` is built out of.
+        key = (level_shapes, str(valid_ratios.dtype), int(valid_ratios.shape[0]))
         if valid_ratios.device.type != "cpu":
-            moved = _reference_cache.get("device")
+            moved = self._neuron_reference_device.get(key)
             if moved is not None:
                 return moved
 
-        host = _reference_cache.get("host")
+        host = self._neuron_reference_cache.get(key)
         if host is None:
             ones = torch.ones(
                 valid_ratios.shape[0], len(level_shapes), 2, dtype=valid_ratios.dtype
@@ -284,10 +351,20 @@ def cache_reference_points(model: torch.nn.Module, level_shapes) -> None:
                     bool(torch.equal(host, expected)),
                     "the cached reference grid differs from upstream's",
                 )
-            _reference_cache["host"] = host
+            self._neuron_reference_cache[key] = host
         return host
 
-    cls.get_reference_points = staticmethod(cached_reference_points)
+    cls.get_reference_points = cached_reference_points
+
+
+def _pinned_shapes(module):
+    shapes = getattr(module, "_neuron_level_shapes", None)
+    _check(
+        shapes is not None,
+        f"{type(module).__name__} was never pinned to an input size; call "
+        "patches.pin_input_size(model, level_shapes) after loading the model",
+    )
+    return shapes
 
 
 def _transform_method(cls, name: str, substitutions: list[tuple[str, str]]) -> None:
@@ -298,8 +375,7 @@ def _transform_method(cls, name: str, substitutions: list[tuple[str, str]]) -> N
     asserted substitution fails loudly at install time. And the result has to be
     compiled in ``modeling_oneformer``'s *own* namespace: Dynamo resolves a function's
     globals against the module it claims to come from, so a copied dict is not enough --
-    it fails with "module ... has no attribute '_NEURON_LEVEL_SHAPES'" the moment
-    tracing starts.
+    it fails with "module ... has no attribute '_NEURON_MSDA'" the moment tracing starts.
 
     All substitutions for one method must be applied in a single call. Transforming a
     method twice does not work: after the first pass ``inspect.getsource`` is looking at
@@ -323,7 +399,7 @@ def _transform_method(cls, name: str, substitutions: list[tuple[str, str]]) -> N
         namespace[name] = previous
 
 
-def patch_pixel_decoder_forward(level_shapes) -> None:
+def patch_pixel_decoder_forward() -> None:
     """Constant-fold the pixel decoder's per-level split, and fix its FPN resize.
 
     Two unrelated problems in one method, applied together because a method can only be
@@ -333,43 +409,53 @@ def patch_pixel_decoder_forward(level_shapes) -> None:
     * the FPN's ``interpolate`` is an exact 2x upsample (48x48 to 96x96 at a pinned
       384 input) being paid for as a generic resize. :mod:`resize` does it in shifts
       and adds.
+
+    The sizes are not passed in. Upstream builds a Python list of ``(height, width)``
+    from the feature maps' own shapes and only then converts it to a tensor, so a
+    ``_neuron_shapes`` local captured just before that conversion has the level shapes as
+    ints, straight from the tensors that are actually there. That is both size-agnostic --
+    the same transform serves every input size, which is what makes several sizes in one
+    process possible -- and safer than an installed constant, which could disagree with
+    the model and did once.
     """
-    if _applied.get("pixel_decoder_forward") == list(level_shapes):
+    if _applied.get("pixel_decoder_forward"):
         return
-    _check(
-        "pixel_decoder_forward" not in _applied,
-        "the pixel decoder was already patched for different level shapes; build one "
-        "process per input size",
-    )
-    _applied["pixel_decoder_forward"] = list(level_shapes)
+    _applied["pixel_decoder_forward"] = True
 
     from transformers.models.oneformer import modeling_oneformer as m
 
-    starts = [0]
-    for height, width in level_shapes[:-1]:
-        starts.append(starts[-1] + height * width)
-    m._NEURON_LEVEL_SHAPES = [tuple(int(v) for v in s) for s in level_shapes]
-    m._NEURON_LEVEL_STARTS = starts
     m._neuron_fixed_resize = _fixed_resize
 
     _transform_method(
         m.OneFormerPixelDecoder,
         "forward",
         [
+            # The source is dedented before this runs, so the method body sits at four
+            # spaces, not eight. The match starts mid-line to stay out of that argument;
+            # only the inserted lines carry indentation, and they are inside the body.
+            (
+                "spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long,"
+                " device=source_flatten.device)",
+                "_neuron_shapes = [(int(h), int(w)) for h, w in spatial_shapes]\n"
+                "    _neuron_starts = [0]\n"
+                "    for _h, _w in _neuron_shapes[:-1]:\n"
+                "        _neuron_starts.append(_neuron_starts[-1] + _h * _w)\n"
+                "    spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long,"
+                " device=source_flatten.device)",
+            ),
             (
                 "split_size_or_sections[i] = level_start_index[i + 1] - level_start_index[i]",
-                "split_size_or_sections[i] = _NEURON_LEVEL_STARTS[i + 1] - _NEURON_LEVEL_STARTS[i]",
+                "split_size_or_sections[i] = _neuron_starts[i + 1] - _neuron_starts[i]",
             ),
             (
                 "split_size_or_sections[i] = y.shape[1] - level_start_index[i]",
-                "split_size_or_sections[i] = y.shape[1] - _NEURON_LEVEL_STARTS[i]",
+                "split_size_or_sections[i] = y.shape[1] - _neuron_starts[i]",
             ),
             (
                 "z.transpose(1, 2).view(bs, -1, spatial_shapes[i][0], spatial_shapes[i][1])",
-                "z.transpose(1, 2).view(bs, -1, _NEURON_LEVEL_SHAPES[i][0], _NEURON_LEVEL_SHAPES[i][1])",
+                "z.transpose(1, 2).view(bs, -1, _neuron_shapes[i][0], _neuron_shapes[i][1])",
             ),
             (
-                # The dedented text, so the indents below are upstream's minus four.
                 "nn.functional.interpolate(\n"
                 "            out[-1], size=cur_fpn.shape[-2:], mode=\"bilinear\","
                 " align_corners=False\n"
@@ -456,13 +542,25 @@ def relax_shape_assert() -> None:
     m._oneformer_neuron_original_check = original
 
 
-def move_reference_cache(device, dtype=None) -> bool:
-    """Put the reference grid on ``device``, before compiling. Returns whether it moved."""
-    host = _reference_cache.get("host")
-    if host is None:
-        return False
-    _reference_cache["device"] = host.to(device=device, dtype=dtype or host.dtype)
-    return True
+def move_reference_cache(model: torch.nn.Module, device, dtype=None) -> int:
+    """Copy every pinned reference grid in ``model`` to ``device``, keeping the host one.
+
+    The same shape as :func:`move_position_cache`, and for the same reason: the grids are
+    plain dict entries rather than buffers, because they are built *per dtype* on the host
+    so that a bfloat16 run gets the grid upstream would have computed in bfloat16 rather
+    than an fp32 grid rounded afterwards. Returns how many grids were copied.
+    """
+    moved = 0
+    for module in model.modules():
+        cache = getattr(module, "_neuron_reference_cache", None)
+        if not cache:
+            continue
+        for key, value in cache.items():
+            module._neuron_reference_device[key] = value.to(
+                device=device, dtype=dtype or value.dtype
+            )
+            moved += 1
+    return moved
 
 
 def _check(condition: bool, message: str) -> None:
@@ -555,7 +653,6 @@ def _cross_attention_per_head(mha, query, key, value, attn_mask, key_padding_mas
 
 
 def install(
-    level_shapes: list[tuple[int, int]],
     msda: str = "torch",
     gather: str = "packed",
     gather_split: int = 1,
@@ -563,12 +660,12 @@ def install(
 ) -> None:
     """Patch ``transformers.models.oneformer.modeling_oneformer`` in place.
 
+    Class-level, and therefore process-wide: these are choices of *implementation*, not of
+    input size. No size is passed in and none is stored -- every size-dependent constant
+    lives on the model instance, put there by :func:`pin_input_size`, so one process can
+    install once and serve several input sizes.
+
     Args:
-        level_shapes: ``[(H_l, W_l), ...]`` for the pixel decoder's feature levels,
-            **in the order the model itself uses**, which is smallest map first:
-            stride 32, then 16, then 8. For a pinned 640x640 input -- the default test
-            size -- that is ``[(20, 20), (40, 40), (80, 80)]``; at 384 it is
-            ``[(12, 12), (24, 24), (48, 48)]``.
         msda: which deformable attention to use *on device* -- ``"torch"`` for
             :mod:`bilinear`, ``"nki"`` for the NKI library kernel (see :mod:`nki_msda`).
             Either way the host still runs :mod:`bilinear`, because a NKI kernel does not
@@ -595,11 +692,11 @@ def install(
             batched either way, so the device comparison is again a direct diff between
             the two.
 
-    The order matters and getting it wrong is silent: the reversed list sums to the
-    same number of positions, so the shapes still "fit" while every level is sampled
-    from the wrong feature map. That mistake cost a debugging round here, so the patch
-    now cross-checks the caller's own ``value_spatial_shapes`` whenever it can do so
-    without a device sync.
+    The level order matters and getting it wrong is silent: reversed, the list sums to the
+    same number of positions, so the shapes still "fit" while every level is sampled from
+    the wrong feature map. That mistake cost a debugging round here, so the patch
+    cross-checks the pinned shapes against the caller's own ``value_spatial_shapes``
+    whenever it can do so without a device sync.
     """
     if _applied.get("install"):
         return
@@ -616,8 +713,6 @@ def install(
         "upstream deformable attention no longer uses grid_sample, so replacing it "
         "may no longer be necessary",
     )
-
-    total = sum(h * w for h, w in level_shapes)
 
     _check(msda in ("torch", "nki"), f"unknown msda implementation {msda!r}")
     _check(gather in bilinear.SAMPLERS, f"unknown gather strategy {gather!r}")
@@ -651,15 +746,20 @@ def install(
         )
         device_msda = nki_msda.multi_scale_deformable_attention_nki
 
-    def patched_msda(value, value_spatial_shapes, sampling_locations, attention_weights):
-        # value: (B, sum(H*W), heads, dim). The shapes argument cannot be *used* — it
-        # arrives as a device tensor and reading it would put a host sync in the middle
-        # of the graph — but it can be checked when it is already on the host, which is
+    def patched_msda(self, value, value_spatial_shapes, sampling_locations,
+                     attention_weights):
+        # `self` is the attention module, and it is the only place the level shapes can
+        # come from: upstream's own `value_spatial_shapes` cannot be *used* -- it arrives
+        # as a device tensor and reading it would put a host sync in the middle of the
+        # graph -- and a module-level constant would pin the whole process to one input
+        # size. It can still be *checked* whenever it is already on the host, which is
         # exactly the case during the CPU parity check.
+        level_shapes = _pinned_shapes(self)
+        total = sum(h * w for h, w in level_shapes)
         _check(
             value.shape[1] == total,
-            f"value has {value.shape[1]} positions but level_shapes sums to {total}; "
-            "the pinned input size and the installed level shapes disagree",
+            f"value has {value.shape[1]} positions but the pinned level shapes sum to "
+            f"{total}; the input size and the size this model was pinned to disagree",
         )
         if not torch.is_tensor(value_spatial_shapes) or value_spatial_shapes.device.type == "cpu":
             passed = (
@@ -669,8 +769,8 @@ def install(
             )
             _check(
                 [list(s) for s in level_shapes] == [list(s) for s in passed],
-                f"the model passes level shapes {passed} but this patch was installed "
-                f"with {[list(s) for s in level_shapes]}. Same total, different order "
+                f"the model passes level shapes {passed} but it was pinned to "
+                f"{[list(s) for s in level_shapes]}. Same total, different order "
                 "or sizes: every level would be sampled from the wrong feature map",
             )
         # The host always takes the PyTorch path: a NKI kernel exists only on device, and
@@ -678,7 +778,22 @@ def install(
         impl = device_msda if value.device.type == "neuron" else host_msda
         return impl(value, level_shapes, sampling_locations, attention_weights)
 
-    m.multi_scale_deformable_attention = patched_msda
+    # Upstream calls the free function; the patched one needs the instance, so the call
+    # site gains a `self`. The function itself is left in place rather than replaced --
+    # anything else in the file that still calls it gets upstream's behaviour, unpatched.
+    m._NEURON_MSDA = patched_msda
+    _transform_method(
+        m.OneFormerPixelDecoderEncoderMultiscaleDeformableAttention,
+        "forward",
+        [
+            (
+                "output = multi_scale_deformable_attention("
+                "value, spatial_shapes, sampling_locations, attention_weights)",
+                "output = _NEURON_MSDA("
+                "self, value, spatial_shapes, sampling_locations, attention_weights)",
+            ),
+        ],
+    )
 
     # ------------------------------------------------------------------- 2. the guard
     layer_cls = m.OneFormerTransformerDecoderLayer
@@ -772,9 +887,6 @@ def install(
                 name,
                 [("self.multihead_attn(", "_NEURON_CROSS_ATTENTION(self.multihead_attn, ")],
             )
-
-    global _installed_level_shapes
-    _installed_level_shapes = list(level_shapes)
 
 
 def is_installed() -> bool:

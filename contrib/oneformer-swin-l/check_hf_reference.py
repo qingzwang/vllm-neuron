@@ -12,9 +12,11 @@ the model card's usage. OneFormer's processor defaults to shortest_edge 800 /
 longest_edge 1333, i.e. a different shape per image, and an ahead-of-time compiler
 needs one shape.
 
-**640x640 is the default.** What the port actually requires of the size is divisibility
-by 32: that makes all four Swin stage resolutions integers (160, 80, 40, 20) and keeps
-every resize ratio in the model a power of two, which is what ``src/resize.py`` needs.
+**640x640 is the default**, and ``--size HxW`` gives a rectangle -- see
+``src/buckets.py`` for the equal-area table that makes a non-square size worth having.
+What the port actually requires of the size is divisibility by 32 on *both* sides: that
+makes all four Swin stage resolutions integers (160, 80, 40, 20 at 640) and keeps every
+resize ratio in the model a power of two, which is what ``src/resize.py`` needs.
 384 has a second property 640 does not -- it is what Swin-L was trained at, and every
 stage divides by the window size 12, so no window padding happens anywhere. At 640 each
 stage is padded up (160 -> 168, 80 -> 84, 40 -> 48, 20 -> 24) by Swin's own
@@ -27,18 +29,24 @@ Usage:
     python contrib/oneformer-swin-l/check_hf_reference.py \\
         --model /mnt/nvme/models/oneformer_coco_swin_large \\
         --image /path/to/image.jpg --task panoptic --size 640 --out /tmp/of_ref
+    ... check_hf_reference.py --image ... --size 480x864     # writes hf_panoptic_480x864.pt
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from src import buckets  # noqa: E402 — after sys.path
 
 
 def parse_args():
@@ -47,11 +55,13 @@ def parse_args():
     ap.add_argument("--image", required=True)
     ap.add_argument("--task", default="panoptic",
                     choices=("panoptic", "semantic", "instance"))
-    ap.add_argument("--size", type=int, default=640,
-                    help="square input side; must be a multiple of 32 so every Swin "
-                         "stage resolution is an integer and every resize ratio stays a "
-                         "power of two. A multiple of 384 additionally avoids Swin's "
-                         "window padding, which is cheaper but not required")
+    ap.add_argument("--size", default="640", metavar="H[xW]",
+                    help="input size; '640' means 640x640, 'HxW' a rectangle. Each side "
+                         "must be a multiple of 32 so every Swin stage resolution is an "
+                         "integer and every resize ratio stays a power of two. A multiple "
+                         "of 384 additionally avoids Swin's window padding, which is "
+                         "cheaper but not required. src/buckets.py has the equal-area "
+                         "rectangles worth using")
     ap.add_argument("--out", default="/tmp/of_ref")
     return ap.parse_args()
 
@@ -60,13 +70,16 @@ def main():
     args = parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    height, width = buckets.parse_size(args.size)
+    tag = buckets.tag(height, width)
+    print(f"[size] {buckets.describe(height, width)}")
 
     from transformers import OneFormerForUniversalSegmentation, OneFormerProcessor
 
     processor = OneFormerProcessor.from_pretrained(args.model)
-    # Pin the shape. do_resize with a square size plus no size_divisor padding gives
-    # exactly args.size x args.size, independent of the source aspect ratio.
-    processor.image_processor.size = {"height": args.size, "width": args.size}
+    # Pin the shape. do_resize with an explicit height and width, and no size_divisor
+    # padding, gives exactly height x width whatever the source aspect ratio is.
+    processor.image_processor.size = {"height": height, "width": width}
     processor.image_processor.do_resize = True
 
     start = time.perf_counter()
@@ -94,13 +107,13 @@ def main():
     torch.save(
         {
             "task": args.task,
-            "size": args.size,
+            "size": (height, width),
             "pixel_values": inputs["pixel_values"],
             "task_inputs": inputs["task_inputs"],
             "class_queries_logits": cls_logits,
             "masks_queries_logits": mask_logits,
         },
-        out / f"hf_{args.task}_{args.size}.pt",
+        out / f"hf_{args.task}_{tag}.pt",
     )
 
     # Something to look at, and something to compare semantically rather than numerically.
@@ -129,7 +142,7 @@ def main():
         score = f" score {s['score']}" if "score" in s else ""
         print(f"    {s['label']:24} {s['pixels']:>9} px{score}")
 
-    (out / f"hf_{args.task}_{args.size}_summary.json").write_text(
+    (out / f"hf_{args.task}_{tag}_summary.json").write_text(
         json.dumps(summary, indent=1)
     )
 
@@ -139,9 +152,9 @@ def main():
     rgb = palette[np.clip(seg + 1, 0, len(palette) - 1)]
     blended = (0.45 * np.asarray(image, dtype=np.float32)
                + 0.55 * rgb.astype(np.float32)).astype(np.uint8)
-    Image.fromarray(rgb).save(out / f"hf_{args.task}_{args.size}_mask.png")
-    Image.fromarray(blended).save(out / f"hf_{args.task}_{args.size}_overlay.png")
-    print(f"\nwrote {out}/hf_{args.task}_{args.size}_{{mask,overlay}}.png and .pt")
+    Image.fromarray(rgb).save(out / f"hf_{args.task}_{tag}_mask.png")
+    Image.fromarray(blended).save(out / f"hf_{args.task}_{tag}_overlay.png")
+    print(f"\nwrote {out}/hf_{args.task}_{tag}_{{mask,overlay}}.png and .pt")
 
 
 if __name__ == "__main__":

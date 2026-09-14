@@ -20,6 +20,12 @@ before the table's last two rows, neither of which was re-run at 384); both size
 still run, and "640x640: the default test size" near the end is the re-measurement,
 including what changes about the bottleneck.
 
+The fixed square is a compiler constraint, not a modelling one, and "Dynamic resolution"
+replaces it with a **table of six aspect ratios of equal area** — one graph each, no padding,
+`--size auto` picks per image. Equal area turns out to be the right cost model to about 10%:
+the 16:9 bucket is **394.33 ms, 7.8% faster than the square's best**, on 1.2% more pixels,
+and the 4:3 bucket is 6.5% slower. Both segment **100.000% pixel-for-pixel** like CPU.
+
 It did not start there. The first working version was 244 ms at 384 — 2.2x CPU, which is
 modest for an accelerator — and profiling said why: **54% of the forward was DMA, and 34%
 of it was one op**, the gather inside deformable attention, with the tensor engine idle 83%
@@ -1068,6 +1074,10 @@ argmax identical. The default in `run_device.py` and `segment.py` is still `--op
 because it is what the 384 numbers throughout this file were measured at; **at 640, pass
 `--compiler-args=--optlevel=2`**.
 
+(That recommendation is specific to 640x640, and "Dynamic resolution" is where that turns out
+to matter: at 480x864 the same flag *costs* 4.0% and at 544x736 it exhausts the compile host.
+The right optlevel is a property of the shape.)
+
 How `--optlevel 2` wins is not how it looks like it should:
 
 | | `--optlevel 1` | `--optlevel 2` |
@@ -1245,6 +1255,247 @@ The flag stays, defaulting to `1`, for the same reason `--gather corners` and
 is worth re-testing at a smaller size, or on a part with more than 24 MiB of SBUF, where the
 arithmetic that motivated it would be different.
 
+## Dynamic resolution: equal area, one graph per aspect ratio
+
+A pinned 640x640 is a compiler requirement wearing the clothes of a modelling decision. It
+distorts everything that is not square — a 16:9 photo is squeezed 33% horizontally — and it
+is not what OneFormer's own processor does; its default is aspect-preserving
+(`shortest_edge=800`, `longest_edge=1333`, a different shape per image). The compiler still
+needs a fixed shape, so the shape cannot follow the image. But it can follow the image's
+*aspect ratio*, out of a small table, if every entry in the table costs the same.
+
+**Area is what costs.** The flattened length the pixel decoder attends over is
+
+```
+L = sum(H*W/s^2 for s in (32, 16, 8)) = 21*H*W/1024
+```
+
+— a function of the area and of nothing else. The same is true of every feature map, of the
+mask at H/4 x W/4, and of the packed gather table. So a table of shapes with equal area ought
+to have equal latency — it turns out to hold to about 10% and not exactly, which is what
+"Measured" below is about — and `src/buckets.py` is that table: six landscape entries, all
+within 4% of 640x640's 409600 pixels, each within 1.5% of a named aspect ratio.
+
+| bucket | ratio | pixels | vs 640x640 | levels | L | mask |
+|---|---|---|---|---|---|---|
+| **640x640** | 1:1 | 409600 | 1.000x | 20x20, 40x40, 80x80 | 8400 | 160x160 |
+| 544x736 | 4:3 | 400384 | 0.978x | 17x23, 34x46, 68x92 | 8211 | 136x184 |
+| 512x768 | 3:2 | 393216 | 0.960x | 16x24, 32x48, 64x96 | 8064 | 128x192 |
+| 480x864 | 16:9 | 414720 | 1.012x | 15x27, 30x54, 60x108 | 8505 | 120x216 |
+| 448x896 | 2:1 | 401408 | 0.980x | 14x28, 28x56, 56x112 | 8232 | 112x224 |
+| 416x960 | 21:9 | 399360 | 0.975x | 13x30, 26x60, 52x120 | 8190 | 104x240 |
+
+Portrait is the transpose of the landscape entry, so the table is six rows and not twelve.
+640x640 is in it unchanged, which keeps every number in this README comparable.
+
+**Nothing about the model needed changing**, which is the same pleasant surprise 640 was.
+Non-square input already works: `check_patches_vs_hf.py --all-buckets` runs all eleven
+distinct shapes (the six above plus five transposes; 640x640 is its own) through **one
+process** and every one of them lands within **2.4e-06** of unpatched HuggingFace, argmax
+unchanged. The only thing that varies per size is `level_shapes = [(H//s, W//s) for s in
+(32, 16, 8)]`.
+
+**Two constraints, both sharp.** Each side must be a multiple of 32 — Swin downsamples by 32
+and the coarsest pixel-decoder level is stride 32 — and getting it wrong is *silent*:
+`resize.fixed_bilinear_resize` falls back to `F.interpolate` when the ratio is not an even
+integer, and that fallback is the 9216x144 dense-resample matmul patch 9 exists to remove.
+And there is **no padding**, which rules out letterboxing: `valid_ratios` is computed from
+`pixel_mask`, so a padded input makes the reference grid a function of the padding instead of
+a constant, and patch 5 asserts on exactly that. The resize has to fill the frame, which is
+why the table approximates aspect ratios rather than preserving them. At 1.5% the stretch is
+not visible.
+
+### What had to change: four globals became instance state
+
+The port kept its size-dependent constants in module globals — `_installed_level_shapes`, a
+`level_shapes` closure inside `install()`, `_NEURON_LEVEL_SHAPES` / `_NEURON_LEVEL_STARTS`
+installed into `modeling_oneformer`, and a reference grid keyed only by dtype — and asserted
+that a second size in one process was an error. All four now live on the **model instance**,
+put there by `patches.pin_input_size(model, level_shapes)`, and `install()` no longer takes a
+size at all: it installs choices of *implementation*, which are process-wide, while the size
+belongs to the model.
+
+Three details decided the shape of that change:
+
+- **`get_reference_points` is a `staticmethod` called as `self.get_reference_points(...)`.**
+  Replacing it with a plain method changes nothing at the call site and gives the patch the
+  instance it needs.
+- **The pixel decoder's split needs no installed constant at all.** Upstream builds a Python
+  list of `(height, width)` from the feature maps' own shapes and only *then* converts it to
+  a tensor, so one more substitution captures those ints a few lines above where they are
+  used. The transform is now size-agnostic, and it cannot disagree with the model — which an
+  installed constant could, and once did.
+- **The flattened length is not a key.** It was the obvious one and it is wrong: at equal
+  area two shapes flatten to the same L — 640x640 and 512x800 both give 8400 — and a
+  transposed pair *always* does. Equal area is the normal case here, so anything keyed by L
+  would be wrong for exactly the table this section is about. The keys are the level shapes.
+
+`check_patches_vs_hf.py` takes several `--size` arguments for this reason: running eleven
+sizes through one process, and then re-running the first one *after* all the others, is what
+distinguishes "the state is per instance" from "the state is per process and the first size
+happens to work".
+
+### Measured: equal area is the right model, and it is only good to about 10%
+
+Equal area, equal cost is a *prediction* from `L = 21*H*W/1024`, so two buckets were compiled
+and benchmarked against the square. 16:9 and 4:3 are the interesting pair: 480x864 is the
+largest of the six (1.2% *more* pixels than 640x640) and the most distorted by a square
+graph, and 544x736 is the nearest to the square in shape.
+
+`neuron-bench exec -n 200 -w 20 --fixed-nc-count=1`, trn1.2xlarge, fp32, `cat.png`, medians
+over 200 executions (the spread is 0.5 ms, so none of these differences is noise):
+
+| bucket | pixels | vs 640x640 | `--optlevel=1` | `--optlevel=2` |
+|---|---|---|---|---|
+| 640x640 | 409600 | 1.000x | 453.23 ms | **427.72 ms** |
+| 544x736 | 400384 | 0.978x | 482.66 ms (**+6.5%**) | compile-host OOM |
+| 480x864 | 414720 | 1.012x | **394.33 ms** (**−13.0%**) | 409.87 ms |
+
+(The 640x640 row was re-measured after the refactor rather than quoted: **453.23 ms**, the
+same number to the hundredth of a millisecond as the build before any of this, and
+3.005e-06 / 2.267e-06 against CPU where it was 3.068e-06 / 2.267e-06. Moving four globals onto
+the instance changed neither the graph's speed nor its arithmetic, which is what makes the
+other two rows comparable to everything above.)
+
+Three things came out of that, and only the first one was predicted.
+
+**1. Area is the first-order model and it is off by up to 10%.** 480x864 is 13% *faster* than
+the square on 1.2% more pixels; 544x736 is 6.5% *slower* on 2.2% fewer. Both are within about
+10% of the equal-cost prediction, which is enough for the table to be a table — no bucket is
+in a different class from the others, and nothing in the graph turned out to depend on the
+shape in the way a padded or letterboxed input would. But it is not the clean confirmation
+the arithmetic suggested, and the spread is large enough that **a bucket's latency has to be
+measured, not derived**. The best bucket beats the square outright: 394.33 against 427.72, a
+7.8% saving that is available *for free* on any image that is closer to 16:9 than to 1:1,
+alongside not squeezing it 33% horizontally.
+
+**2. Which `--optlevel` wins is a property of the shape.** "640 wants `--optlevel 2`" is one
+of this README's findings — 453.23 → 427.72, −5.6%. At 480x864 the same flag *costs* 4.0%
+(394.33 → 409.87), and at 544x736 it does not build at all. So the flag is not a property of
+the model or of the size, and `run_device.py`'s default of `--optlevel=1` is right for two of
+these three shapes. A bucket table needs a per-bucket flag column.
+
+**3. Two shapes, two different mechanisms, and neither one is arithmetic.** All three profiles
+were pulled at `--optlevel=1` (`neuron-explorer view --output-format summary-text`), because a
+22% spread between two shapes 3.5% apart in area needs an explanation:
+
+| | 640x640 | 544x736 | 480x864 |
+|---|---|---|---|
+| `total_exec_time` | 453.7 ms | 483.1 ms | **394.7 ms** |
+| `total_active_time` | 423.5 ms | 391.0 ms | 375.1 ms |
+| **stalled (exec − active)** | 30.2 ms (6.6%) | **92.1 ms (19.1%)** | 19.5 ms (4.9%) |
+| spill save + reload | 31.19 GB | 28.55 GB | **24.23 GB** |
+| ├ reload alone | 21.70 | 20.32 | **14.64** |
+| `hbm_read_bytes` | 23.93 GB | 22.58 GB | **17.01 GB** |
+| DMA active | 301.3 ms | 287.7 ms | 267.4 ms |
+| ├ static | 237.8 | 213.4 | 199.5 |
+| │  its packets | 6.45 M x 5271 B | **7.83 M x 3951 B** | 6.60 M x 4076 B |
+| └ software dynamic | 75.7 | **87.2** | 81.3 |
+| │  its packets | 2.79 M x 1815 B | **3.81 M x 1239 B** | 3.25 M x 1598 B |
+| Vector engine | 161.8 ms | 142.0 ms | 150.4 ms |
+| Tensor engine | 114.3 ms | 103.3 ms | 114.3 ms |
+| Scalar engine | 101.1 ms | 82.6 ms | 98.9 ms |
+| matmul instructions | 903 k | 794 k | 935 k |
+
+Read down the `total_active_time` row and the two rectangles are both *cheaper* than the
+square; read `total_exec_time` and one of them is 30 ms more expensive. The split explains it:
+
+- **480x864 beats the square by doing less of everything.** 7.0 GB less spill, 6.9 GB less HBM
+  read, 34 ms less DMA, 11 ms less vector engine, at identical tensor-engine time and 3.5%
+  *more* matmul instructions. −48 ms of active time and −11 ms of stall for +1.2% pixels. This
+  is the same finding as "Why 640 spills" from the other side: 640's working set is the one
+  that does not tile, and a shape that tiles better is cheaper at equal area.
+- **544x736 does less work than either and is still slowest, because it stalls for 92 ms.**
+  Every engine is idle 19.1% of the forward against 4.9% for 480x864 — 72 ms of pure
+  dependency stall, which is more than the entire difference in DMA time between the two. Its
+  DMA is also the most fragmented of the three: **3.81 M dynamic packets of 1239 B**, 17% more
+  packets carrying 9% *fewer* bytes than 480x864, and 19% more static packets at 25% smaller.
+  That is the per-packet-cost thesis this port keeps running into — the whole point of the
+  packed gather — reappearing as a function of the *shape*. Why 17x23 / 34x46 / 68x92
+  descriptorizes worse than 15x27 / 30x54 / 60x108 is not established here; that it does is
+  measured.
+
+Swin's window padding pushes the same way and is worth noting because it is *exactly*
+computable rather than inferred. The window is 12, and 12 does not divide 160:
+
+| stage | 640x640 | padded | 544x736 | padded | 480x864 | padded |
+|---|---|---|---|---|---|---|
+| 0 | 160x160 | 168x168 = 28224 | 136x184 | 144x192 = 27648 | 120x216 | 120x216 = 25920 (none) |
+| 1 | 80x80 | 84x84 = 7056 | 68x92 | 72x96 = 6912 | 60x108 | 60x108 = 6480 (none) |
+| 2 | 40x40 | 48x48 = 2304 | 34x46 | 36x48 = 1728 | 30x54 | 36x60 = 2160 |
+| 3 | 20x20 | 24x24 = 576 | 17x23 | 24x24 = 576 | 15x27 | 24x36 = 864 |
+| | | **38160** | | **36864** | | **35424** |
+
+640x640 pads at every stage and wastes 4160 positions; 480x864's first two stages are exact
+multiples of 12 and it wastes 999, 7.2% fewer padded positions overall and 8.2% fewer in
+stage 0. That is a real advantage and it ranks 480x864 first, but it does **not** explain the
+table: it puts 544x736 between the two, and 544x736 is last by 22%. Window padding is a
+contributor to the first bullet above and irrelevant to the second. The actionable half is
+still worth having: **sides
+divisible by 12 as well as 32 avoid padding in the stages where the work is**, and 480x864 —
+both sides divisible by 24 — is the only row that manages it at two stages.
+
+**The output is unaffected, which is the part that had to be checked.** At both rectangular
+sizes the panoptic result is **100.000% pixel-for-pixel identical** to HuggingFace on CPU,
+same five segments in the same order on `cat.png`, largest score difference 0.0000. That
+matters because the logits are noisier here than anywhere else in this README:
+
+| device vs CPU, same dtype | class logits | mask logits |
+|---|---|---|
+| 640x640 `--optlevel=1` | 3.005e-06 | 2.267e-06 |
+| 544x736 `--optlevel=1` | 7.064e-04 | 1.839e-03 |
+| 480x864 `--optlevel=1` | 9.064e-04 | 1.121e-03 |
+| 480x864 `--optlevel=2` | 9.065e-04 | 1.121e-03 |
+
+1.839e-03 against a 2e-3 tolerance is a pass with almost nothing to spare, and it is ~500x
+the square's error. Three things bound it. It is **not the patches**: the CPU parity check at
+the same shapes is 1.725e-06 and 6.498e-06, in family with every other size. It is **not the
+optimizer**: 480x864 gives the same figure to four digits at both optlevels. And it is a
+**max-element** effect, not a systematic one — the mean is 6.231e-06 where the max is
+1.121e-03. Combined with 100.000% pixel agreement, the reading is a handful of outlier
+elements from a different reduction order at these shapes rather than anything structural.
+It is still the one number in this port that would need a wider tolerance to be comfortable,
+and the honest statement is that it is unexplained.
+
+**544x736 does not compile at `--optlevel=2` on this host.** `[F137] neuronx-cc was forcibly
+killed` after ten minutes — the compiler ran the 32 GB machine out of memory, the same
+failure as `--optlevel=3` at 640 and `--gather-split 8`. Its CPU parity check had already
+passed, so the shape is fine and the *build* is what failed; at `--optlevel=1` it compiles in
+327 s. Filling out the remaining four buckets means finding out how many of them need that
+fallback.
+
+### The buckets are cheap, and one process can hold several
+
+A NEFF is 50–59 MB and does **not** embed the 839 MB of weights, so a process serving six
+buckets holds one copy of the model and six graphs. `segment.py --size auto` does that: it
+picks each image's bucket, runs one host pass per new size to fill the caches, moves the
+model to the device once, and hands a single `torch.compile`d callable every shape.
+`torch.compile` keys its own cache on the input shapes, so a new size recompiles and an old
+one is still there — and that guard, the input tensor's own shape, is the one thing that
+cannot disagree with the pin.
+
+Measured, on the three sample images, one process, `--size auto --compare-cpu`:
+
+```
+[setup] 544x736 ... deformable levels [(17, 23), (34, 46), (68, 92)], L=8211, mask 136x184
+[setup] 640x640 ... deformable levels [(20, 20), (40, 40), (80, 80)], L=8400, mask 160x160
+[setup] copied 14 position table(s) to the device, reference grid(s): 2
+
+=== car.jpg (640x480 -> 544x736, auto)   device 486.33 ms   CPU 2708.60 ms   100.000%
+=== cat.png (640x480 -> 544x736, auto)   device 486.44 ms   CPU 2704.38 ms   100.000%
+=== dog.jpg (586x640 -> 640x640, auto)   device 457.25 ms   CPU 2824.17 ms   100.000%
+```
+
+Fourteen position tables and two reference grids alive at once — seven pixel-decoder modules
+times two sizes — is the per-instance state doing what it was refactored for. Two graphs, one
+copy of the weights, one `.to(DEVICE)`, and the size switches per image with nothing but a
+`pin_input_size` call between them. Both graphs were **compile-cache hits on the keys
+`run_device.py` had already built**, which is worth more than the time it saved: it means the
+two scripts emit the identical graph, so the NEFF latencies above are the latencies of this
+path. The end-to-end figures sit 3.7 and 4.0 ms over their NEFFs (486.33 against 482.66,
+457.25 against 453.23) — the same ~4 ms of Dynamo, dispatch and copies measured at 384, now at
+two sizes in one process.
+
 ## Layout
 
 ```
@@ -1280,9 +1531,12 @@ the matmuls in bf16). `--compiler-args` is part of the compile-cache key, so eac
 gets its own NEFF and cannot silently reuse a previous build.
 
 `check_hf_reference.py`, `check_patches_vs_hf.py` and `segment.py` take `--size`, which
-**defaults to 640**; it must be a multiple of 32. `run_device.py` has no `--size` on
-purpose — it reads the size out of the reference `.pt`, so the device build and the
-reference it is diffed against cannot disagree about it.
+**defaults to 640**. It is `H` for a square or `HxW` for a rectangle, and each side must be
+a multiple of 32; `segment.py --size auto` picks each image's equal-area bucket and
+`check_patches_vs_hf.py` takes a list of sizes, or `--all-buckets`. See "Dynamic
+resolution". `run_device.py` has no `--size` on purpose — it reads the size out of the
+reference `.pt`, so the device build and the reference it is diffed against cannot disagree
+about it.
 
 ## Plan
 
@@ -1360,10 +1614,31 @@ reference it is diffed against cannot disagree about it.
 - [x] **The same head-splitting tried on the gather, and rejected on measurement.**
       `--gather-split` is bit-exact at every N and slower at the *only* N besides 1 that
       compiles: 451.77 ms at 2 against 427.72 at 1, while 4 and 8 both OOM `neuronx-cc`
-      (27 and 71 minutes in). It also cost 16 ms just by being placed around the sampler (18 calls,
-      18 concatenations of a 32.8 MiB tensor) instead of around the whole attention. The
+      (27 and 71 minutes in). It also cost ~8 ms just by being placed around the sampler (18
+      calls, 18 concatenations of a 32.8 MiB tensor) instead of around the whole attention:
+      +32.3 ms over its own baseline against +24.1 for the right placement. The
       table being over SBUF was real; that it was what made the gather slow was not.
       Flag kept at default 1 so the result is re-runnable at another size or on more SBUF
+- [x] **Dynamic resolution, by equal area rather than by one square.** `src/buckets.py` is
+      six shapes within 4% of 640x640's area and within 1.5% of a named aspect ratio, on the
+      argument that `L = 21*H*W/1024` depends on area alone. Getting there meant moving four
+      module globals onto the model instance (`patches.pin_input_size`), which is what lets
+      one process hold several sizes and one device copy of the weights serve all of them;
+      `--all-buckets` runs all eleven distinct shapes through one process, worst case
+      **2.4e-06** against unpatched HuggingFace. The flattened length looked like the natural
+      key and is provably the wrong one: equal area means equal L. **Two buckets measured on
+      device**, and the area model is good to about 10% rather than exactly: 480x864 is
+      **394.33 ms**, 7.8% under the square's best, and 544x736 is 482.66 ms, 6.5% over the
+      square at 2.2% fewer pixels — 92 ms of it pure stall on 17% more DMA packets carrying
+      9% fewer bytes. Both segment 100.000% pixel-identical to CPU, and `--size auto` runs
+      both graphs plus the square out of one process and one copy of the weights. Also: the
+      right `--optlevel` turns out to be a property of the *shape*, and 544x736 needs
+      `--optlevel=1` because 2 exhausts the compile host
+- [ ] The four remaining buckets on device (3:2, 2:1, 21:9, and the portrait transposes),
+      which is where "measure, do not derive" gets its real test — and the open question
+      from the two that are done: **why does one shape stall for 19% of the forward?** The
+      candidates are the mask height crossing 128 partitions (136 against 120) and the odd
+      stride multiples in 17x23 / 34x46 / 68x92
 - [ ] Cut spill further — still the **largest** item: 35.4 GB / 213 ms at 640, 50% of the
       forward, against 5.35 GB / ~44 ms at 384. Two of the three plausible attacks are now
       spent (per-head cross attention won 9 ms, head-split gather lost 24), so what is left

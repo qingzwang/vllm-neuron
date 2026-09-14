@@ -8,8 +8,10 @@ OneFormer's pixel decoder is six layers of multi-scale deformable attention, and
 deformable attention *is* bilinear sampling at learned offsets, there is no way
 around implementing it.
 
-What is implemented here matches ``F.grid_sample(..., mode="bilinear",
-padding_mode="zeros", align_corners=False)`` exactly, by construction:
+What is implemented here is ``F.grid_sample(..., mode="bilinear",
+padding_mode="zeros", align_corners=False)``, by construction -- the same algorithm, to
+2.1e-05 on unit-scale values, which is where the two disagree about the order to multiply
+four weights in and nothing more:
 
 * the same coordinate convention -- ``align_corners=False`` puts pixel centres at
   ``(i + 0.5) / size`` in [0, 1], so a normalized ``g`` maps to
@@ -24,6 +26,8 @@ dynamic shapes, so it compiles as part of the surrounding graph.
 """
 
 from __future__ import annotations
+
+import functools
 
 import torch
 
@@ -157,17 +161,22 @@ def bilinear_sample_packed(value: torch.Tensor, grid: torch.Tensor) -> torch.Ten
         dim=-1,
     )  # (n, c, hp*wp, 4)
 
-    def inside(x, y):
-        return ((x >= 0) & (x <= w - 1) & (y >= 0) & (y <= h - 1)).to(coord_dtype)
+    # inside(x, y) is (x in range) & (y in range), and the four corners use only two
+    # distinct x and two distinct y, so folding each axis's test into that axis's weight
+    # computes 8 comparisons and 4 ands where the corner-at-a-time form needs 16 and 12.
+    # Bit-for-bit equal, signed zeros included: every mask is exactly 0.0 or 1.0, so the
+    # regrouping cannot round -- x * 1.0 is exact and any product containing 0.0 is a zero
+    # of the same sign whichever order it is taken in.
+    def in_range(v, hi):
+        return ((v >= 0) & (v <= hi)).to(coord_dtype)
+
+    wx0 = wx0 * in_range(x0, w - 1)
+    wx1 = wx1 * in_range(x0 + 1, w - 1)
+    wy0 = wy0 * in_range(y0, h - 1)
+    wy1 = wy1 * in_range(y0 + 1, h - 1)
 
     weights = torch.stack(
-        (
-            wx0 * wy0 * inside(x0, y0),
-            wx1 * wy0 * inside(x0 + 1, y0),
-            wx0 * wy1 * inside(x0, y0 + 1),
-            wx1 * wy1 * inside(x0 + 1, y0 + 1),
-        ),
-        dim=-1,
+        (wx0 * wy0, wx1 * wy0, wx0 * wy1, wx1 * wy1), dim=-1
     ).reshape(n, 1, q * p, 4).to(value.dtype)
 
     base = (y0 + 1).clamp(0, hp - 1) * wp + (x0 + 1).clamp(0, wp - 1)
@@ -179,12 +188,58 @@ def bilinear_sample_packed(value: torch.Tensor, grid: torch.Tensor) -> torch.Ten
 SAMPLERS = {"corners": bilinear_sample, "packed": bilinear_sample_packed}
 
 
+def _split_heads(fn, value, sampling_locations, attention_weights, heads, split):
+    """Run ``fn`` on ``split`` groups of heads and concatenate, instead of all at once.
+
+    Bit-for-bit identical -- not "numerically equivalent", identical. Every tensor here
+    has a head axis, nothing in deformable attention reduces across it (the weighted sum
+    is over levels and points, both inside a head), and the returned
+    ``(B, Q, heads * head_dim)`` lays its heads out contiguously along the last axis, so
+    ``cat`` puts the pieces back element for element. There is no reduction to
+    reassociate, which is what separates this from
+    ``patches._cross_attention_per_head``.
+
+    What changes is how much is live. At 640x640 the 80x80 level's packed table is
+    ``(8, 32, 82^2, 4)`` float32 -- **26.3 MiB** -- and the gather's result before the
+    weighted sum is ``(8, 32, 8400 * 4, 4)``, **32.8 MiB**, both against a 24 MiB SBUF and
+    both live together. Two groups halve them, eight groups leave 3.3 and 4.1 MiB.
+
+    Splitting *here* rather than around the sampler is the whole design. The sampler runs
+    18 times (six layers x three levels), so concatenating its output would add 18 copies
+    of a 32.8 MiB tensor; splitting the whole attention concatenates once, on the
+    ``(1, 8400, 256)`` result -- 8.6 MiB. Measured at ``split=2``, that placement is worth
+    about 8 ms: +24.1 ms over its own baseline here against +32.3 for the per-sampler
+    version.
+
+    And it is still a loss. ``split=2`` is 451.77 ms against 427.72 at ``split=1``, and
+    ``split=4`` and ``split=8`` do not compile at all -- ``neuronx-cc`` runs the 32 GB
+    compile host out of memory on 72 and 144 gather sites. Kept, at a default of 1, so the
+    negative result can be re-run at another size or on a part with more SBUF; see the
+    README's "The same trick on the gather, measured and rejected".
+    """
+    if split <= 1 or heads <= 1:
+        return None
+    step = -(-heads // split)  # ceil, so any head count works; the last group is short
+    return torch.cat(
+        [
+            fn(
+                value=value[:, :, i:i + step],
+                sampling_locations=sampling_locations[:, :, i:i + step],
+                attention_weights=attention_weights[:, :, i:i + step],
+            )
+            for i in range(0, heads, step)
+        ],
+        dim=-1,
+    )
+
+
 def multi_scale_deformable_attention(
     value: torch.Tensor,
     spatial_shapes: list[tuple[int, int]],
     sampling_locations: torch.Tensor,
     attention_weights: torch.Tensor,
     gather: str = "packed",
+    split: int = 1,
 ) -> torch.Tensor:
     """The pixel decoder's attention, one level at a time.
 
@@ -201,6 +256,11 @@ def multi_scale_deformable_attention(
             ``"corners"`` for the original four. Identical results, bit for bit; the
             difference is 75.4 ms of dynamic DMA against 216.1 at 640x640, and 30.9
             against 81.2 at 384. Defaults to packed.
+        split: how many groups of heads to run at a time rather than all eight at once.
+            Bit-for-bit identical at any value, and it does shrink the live set -- at 640
+            the packed table and its gathered result are 26.3 and 32.8 MiB against a 24 MiB
+            SBUF -- but measured it is slower, and above 2 it does not compile. Defaults to
+            1, all heads in one pass. See :func:`_split_heads` for the numbers.
 
     Returns:
         ``(B, Q, heads * head_dim)``.
@@ -209,6 +269,16 @@ def multi_scale_deformable_attention(
     batch, _, heads, head_dim = value.shape
     _, queries, _, levels, points, _ = sampling_locations.shape
     assert levels == len(spatial_shapes)
+
+    grouped = _split_heads(
+        functools.partial(
+            multi_scale_deformable_attention, spatial_shapes=spatial_shapes,
+            gather=gather, split=1,
+        ),
+        value, sampling_locations, attention_weights, heads, split,
+    )
+    if grouped is not None:
+        return grouped
 
     splits = [h * w for h, w in spatial_shapes]
     value_levels = value.split(splits, dim=1)

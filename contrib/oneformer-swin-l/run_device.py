@@ -67,6 +67,15 @@ def parse_args():
                          "packed is 466.7 ms against 614.8 at 640x640, and 143 against "
                          "230 at 384, because it issues 60%% fewer DMA packets for the "
                          "same bytes. Defaults to packed")
+    ap.add_argument("--gather-split", type=int, default=1, metavar="N",
+                    help="sample the deformable attention N groups of heads at a time "
+                         "instead of all eight at once. Bit-for-bit identical at every N "
+                         "-- nothing reduces across heads -- and it changes no packet's "
+                         "size or count, only how much is live: at 640 the packed table "
+                         "is 26.3 MiB and its gathered result 32.8 MiB against a 24 MiB "
+                         "SBUF, and N=8 makes them 3.3 and 4.1. Measured and rejected: "
+                         "451.77 ms at N=2 against 427.72 at N=1, and N=4 and N=8 run "
+                         "neuronx-cc out of memory. Defaults to 1")
     ap.add_argument("--cross-attn", default="per_head", choices=("batched", "per_head"),
                     help="how the decoder's masked cross attention runs on device: "
                          "'per_head' loops over the eight heads, 'batched' is upstream's "
@@ -254,9 +263,10 @@ def main():
     from src import patches
 
     patches.install(level_shapes, msda=args.msda, gather=args.gather,
-                    cross_attn=args.cross_attn)
+                    gather_split=args.gather_split, cross_attn=args.cross_attn)
     print(f"patched for {size}x{size}, deformable levels {level_shapes}, {args.dtype}, "
-          f"device deformable attention: {args.msda}/{args.gather}, "
+          f"device deformable attention: {args.msda}/{args.gather}"
+          f"/split{args.gather_split}, "
           f"cross attention: {args.cross_attn}\n")
 
     from transformers import OneFormerForUniversalSegmentation

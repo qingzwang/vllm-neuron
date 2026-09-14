@@ -12,11 +12,11 @@ four decimals. Ten patches were needed; the first eight are compiler constraints
 last two are the profile's, and all of them together leave the model numerically
 unchanged on CPU.
 
-**The default test size is 640x640**, where a forward is **458.9 ms on trn1.2xlarge** —
-**435.5 ms** with `--compiler-args=--optlevel=2` — against 2871 ms for the same model on
-12 CPU cores: **6.3x and 6.6x**. The optimization work
+**The default test size is 640x640**, where a forward is **453.2 ms on trn1.2xlarge** —
+**427.7 ms** with `--compiler-args=--optlevel=2` — against 2871 ms for the same model on
+12 CPU cores: **6.3x and 6.7x**. The optimization work
 below was done at **384x384**, where the same build is **143 ms and 5x CPU** (measured
-before the table's last row, which was not re-run at 384); both sizes
+before the table's last two rows, neither of which was re-run at 384); both sizes
 still run, and "640x640: the default test size" near the end is the re-measurement,
 including what changes about the bottleneck.
 
@@ -31,18 +31,20 @@ of the time. "Where the 240 ms goes" is that measurement and what came out of it
 | exact power-of-two resize | −7.5 ms | not re-measured | an `F.interpolate` was compiling to a 9216x144 matmul |
 | **one gather instead of four** | **−87.4 ms** | **−148.1 ms** | fold the 2x2 neighbourhood into the table |
 | cross attention one head at a time | not measured | −9.4 ms | stop holding a 29.3 MiB score matrix |
+| factor the bilinear corner masks | not measured | −7.7 ms | 16 comparisons per sample where 8 do |
 
-All four are on by default. The first three leave the output **bit-for-bit unchanged**; the
-fourth reassociates one reduction and is the only patch here that does not (3.4e-08, and
-"Cutting the widest tensor" is explicit about it). The
+All five are on by default. Four leave the output **bit-for-bit unchanged**; the
+cross-attention one reassociates a reduction and is the only patch here that does not
+(3.4e-08, and "Cutting the widest tensor" is explicit about it). The
 first row is the one that did not survive the size change, and "Compiler flags, swept
 again at 640" says why. The
-last one is the interesting one, and its lesson is that the 83 ms was not a missing kernel
+gather row is the interesting one, and its lesson is that the 83 ms was not a missing kernel
 and not the hardware: it was asking for the same data four times. The NKI kernel for this
 op *is* written (`--msda nki`) and does need Trainium2, but it is now competing against
 30.9 ms rather than 83 (75.4 against 216.1 at 640). bfloat16 stays opt-in because it loses
 a whole small object, but the price of that principle has gone up with the size: it is
-−15.0% at 384 and **−21.0% at 640** (368.6 ms).
+−15.0% at 384 and **−21.0% at 640** (368.6 ms, measured against the 466.66 ms build — the
+last two rows of the table above landed after it and it has not been re-run since).
 
 ## Why this is not a vllm-neuron model
 
@@ -936,8 +938,9 @@ the packed gather is bit-exact rather than merely close.
 ### The numbers
 
 `neuron-bench exec -n 200 -w 20 --fixed-nc-count=1`, trn1.2xlarge, `--optlevel 1`,
-`--cross-attn batched` throughout so the two sizes are the same program — the two
-subsections after this one are what moves the 640 column from 466.66 to 435.45:
+`--cross-attn batched` and unfolded corner masks throughout so the two sizes are the same
+program — the three subsections after this one are what move the 640 column from 466.66 to
+427.72:
 
 | | 384 packed | 640 corners | **640 packed** | 640 packed + bf16 |
 |---|---|---|---|---|
@@ -1145,6 +1148,103 @@ On device: `class_queries_logits rel=3.005e-06` against 3.068e-06 for batched, p
 argmax unchanged, and both gather strategies remain bit-exact — the three flags are not
 interchangeable and `patches.py` says so at each one.
 
+### Eight comparisons the bilinear weights never needed: −7.7 ms, free
+
+Zeros padding is implemented as a weight of zero, so each of the four corners asks whether
+it is inside the image:
+
+```python
+def inside(x, y):
+    return ((x >= 0) & (x <= w - 1) & (y >= 0) & (y <= h - 1)).to(coord_dtype)
+```
+
+Four corners is four calls: **16 comparisons and 12 `and`s** per sample. But the test
+factors — `inside(x, y)` is `(x in range) & (y in range)` — and the four corners use only
+*two* distinct x and two distinct y. Fold each axis's test into that axis's weight and the
+same four numbers come out of **8 comparisons and 4 `and`s**:
+
+```python
+wx0 = wx0 * in_range(x0, w - 1);  wx1 = wx1 * in_range(x0 + 1, w - 1)
+wy0 = wy0 * in_range(y0, h - 1);  wy1 = wy1 * in_range(y0 + 1, h - 1)
+weights = torch.stack((wx0 * wy0, wx1 * wy0, wx0 * wy1, wx1 * wy1), dim=-1)
+```
+
+**427.72 ms against 435.45, −7.73 ms, and bit-for-bit identical** — signed zeros included.
+The regrouping cannot round, because every mask is exactly `0.0` or `1.0`: multiplying by
+`1.0` is exact, and a product containing `0.0` is a zero of the same sign whichever order
+it is taken in. `class_queries_logits rel=3.099e-06` is unchanged to all four digits.
+At `--optlevel=1` it is **453.23 ms against 458.88, −5.65 ms** — smaller, in the same
+direction, which is what a change that removes work rather than rearranging it should look
+like at both settings.
+
+The profile says exactly what was bought, and it is the first change here that is not about
+DMA at all:
+
+| | before | after |
+|---|---|---|
+| vector engine | 169.18 ms | **162.44 ms** |
+| scalar engine | 101.27 ms | **98.47 ms** |
+| scalar instructions | 356522 | 347395 |
+| spill save + reload | 35.410 GB | 35.395 GB |
+| static DMA | 213.08 ms | 213.32 ms |
+| dynamic DMA bytes | 4734622224 | 4734606288 |
+
+Not one byte of DMA moved — the two dynamic-DMA figures differ by 16 KB in 4.7 GB. All of
+it is 9.5 ms of arithmetic that was never needed, on the two engines that are 60% of the
+forward's active time and that nothing so far had touched. Worth remembering next to the
+spill numbers: at 640 the vector and scalar engines are 264 ms of active time against the
+tensor engine's 114.
+
+### The same trick on the gather, measured and rejected
+
+The gather's own tensors are the other pair over 24 MiB — the packed table at the 80x80
+level is 26.3 MiB and the gathered result before the weighted sum is
+`(8, 32, 8400 * 4, 4)`, 32.8 MiB — and heads are independent there too, so the obvious move
+was the one that had just worked twice. `--gather-split N` runs the deformable attention on
+N groups of heads; it is bit-for-bit identical at every N, including uneven ones, because
+nothing reduces across heads. It is also, measured, a **loss at every value that compiles**:
+
+| `--optlevel=2`, `--cross-attn per_head` | median | vs its own `split=1` |
+|---|---|---|
+| `--gather-split 1`, masks folded | **427.72 ms** | — |
+| `--gather-split 2`, split around the whole attention | 451.77 ms | +24.1 ms |
+| `--gather-split 1`, before the mask folding | 435.45 ms | — |
+| `--gather-split 2`, split around the sampler | 467.71 ms | +32.3 ms |
+| `--gather-split 4` | — | compile OOM, after 27 minutes |
+| `--gather-split 8` | — | compile OOM, at *both* optlevels |
+
+The two placements were measured either side of the mask folding, which is why the table
+pairs each with its own `split=1`: the honest comparison is +24.1 ms against +32.3, not the
+raw 451.77 against 467.71. Two separate things went wrong, and they are worth keeping apart.
+
+**Where you split matters, though less than whether you split.** The first version split
+around the sampler, which runs 18 times — six pixel-decoder layers x three levels — so it
+concatenated a 32.8 MiB tensor 18 times. Moving the split up to the whole attention
+concatenates once, on the `(1, 8400, 256)` result, 8.6 MiB, and that is worth about 8 ms of
+the penalty. It is the cost of putting a `cat` inside a loop, and it is the entire difference
+between the two implementations.
+
+**And splitting still loses.** Even placed correctly it is 24 ms worse than not splitting.
+So the premise — shrink the table under SBUF and the gather gets faster — is simply false
+here. The gather was never bandwidth-starved for lack of a resident table: the runtime
+already coalesces it into 1815-byte packets, and the compiler already tiles it, exactly as
+it already tiled the cross-attention `bmm`. What splitting adds is real: eight or two copies
+of every coordinate computation, a longer graph, and less for the scheduler to overlap.
+
+**And past 2 it will not compile on a trn1.2xlarge at all.** 72 gather sites at `split=4` and
+144 at `split=8` instead of 18, and `neuronx-cc`'s `WalrusDriver` is killed with `-9` —
+`[F137] ... forcibly killed`, the same 32 GB compile-host OOM as `--optlevel=3`. `split=8`
+dies after 71 minutes at `--optlevel=2` and 10 at `--optlevel=1`, with its scheduler
+reporting 666362 messages on one SBUF range; `split=4` dies after 27. So the flag has exactly
+one setting other than the default that can even be measured, and that one is 24 ms slower.
+Copying a loop body N times to shrink its working set costs the compiler more than it costs
+the device.
+
+The flag stays, defaulting to `1`, for the same reason `--gather corners` and
+`--cross-attn batched` stay: a negative result is only useful if someone can re-run it. It
+is worth re-testing at a smaller size, or on a part with more than 24 MiB of SBUF, where the
+arithmetic that motivated it would be different.
+
 ## Layout
 
 ```
@@ -1167,10 +1267,12 @@ contrib/oneformer-swin-l/
 `run_device.py` and `segment.py` both take `--dtype {float32,bfloat16}` (casts the model),
 `--gather {packed,corners}` (one gather per bilinear sample or four — identical output,
 148 ms apart at 640 and 87 at 384), `--msda {torch,nki}` (which deformable attention runs
-on device), `--cross-attn {per_head,batched}` (whether the decoder's masked cross attention
-loops over the eight heads or goes through `nn.MultiheadAttention` as upstream does — the
-only knob of the four whose two settings are *not* bit-identical to each other, see above)
-and
+on device), `--gather-split N` (sample N groups of heads at a time instead of all eight —
+bit-identical at every N, and *slower* at every N that compiles, kept only so the negative
+result above is re-runnable), `--cross-attn {per_head,batched}` (whether the decoder's
+masked cross attention loops over the eight heads or goes through `nn.MultiheadAttention`
+as upstream does — the only knob of the five whose two settings are *not* bit-identical to
+each other, see above) and
 `--compiler-args`
 (passed verbatim to `neuronx-cc`, e.g.
 `'--auto-cast=matmult --auto-cast-type=bf16'` to leave the weights in fp32 and only run
@@ -1249,10 +1351,23 @@ reference it is diffed against cannot disagree about it.
       score matrix is gone and `matmul_instruction_count` is unchanged to the digit, which
       is the finding: the compiler had already tiled it, so the win is 1.56 GB less spill
       and nothing more. The only non-bit-exact patch in the port (3.4e-08)
-- [ ] Cut spill further — still the **largest** item: 31.1 GB / 238 ms at 640, 52% of the
-      forward, against 5.35 GB / ~44 ms at 384. The remaining tensor over 24 MiB is the
-      packed gather's own table (26.3 MiB), so a 2-slot table is now the targeted change
-      and one fewer pixel-decoder level the structural one
+- [x] **The bilinear corner masks factored: 435.45 -> 427.72 ms, −7.7 ms, bit-for-bit
+      identical.** 16 comparisons and 12 `and`s per sample become 8 and 4, because
+      `inside(x, y)` factors and the four corners use only two x and two y. Not one byte of
+      DMA moves; it is 6.7 ms off the vector engine and 2.8 off the scalar. The first win
+      here that is arithmetic rather than data movement, and the reminder behind it is that
+      those two engines are 264 ms of active time at 640 against the tensor engine's 114
+- [x] **The same head-splitting tried on the gather, and rejected on measurement.**
+      `--gather-split` is bit-exact at every N and slower at the *only* N besides 1 that
+      compiles: 451.77 ms at 2 against 427.72 at 1, while 4 and 8 both OOM `neuronx-cc`
+      (27 and 71 minutes in). It also cost 16 ms just by being placed around the sampler (18 calls,
+      18 concatenations of a 32.8 MiB tensor) instead of around the whole attention. The
+      table being over SBUF was real; that it was what made the gather slow was not.
+      Flag kept at default 1 so the result is re-runnable at another size or on more SBUF
+- [ ] Cut spill further — still the **largest** item: 35.4 GB / 213 ms at 640, 50% of the
+      forward, against 5.35 GB / ~44 ms at 384. Two of the three plausible attacks are now
+      spent (per-head cross attention won 9 ms, head-split gather lost 24), so what is left
+      is structural: one fewer pixel-decoder level, or bf16 where it halves every tensor
 - [ ] Find the next resize-shaped op: 317 k matmul instructions at 180 ns and 143 GFLOP
       of transposes say there is still more layout churn than arithmetic (903 k and
       283 GFLOP at 640)

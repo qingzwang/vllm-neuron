@@ -65,6 +65,15 @@ def parse_args():
                          "packed is 466.7 ms against 614.8 at 640x640, and 143 against "
                          "230 at 384, because it issues 60%% fewer DMA packets for the "
                          "same bytes. Defaults to packed")
+    ap.add_argument("--gather-split", type=int, default=1, metavar="N",
+                    help="sample the deformable attention N groups of heads at a time "
+                         "instead of all eight at once. Bit-for-bit identical at every N "
+                         "-- nothing reduces across heads -- and it changes no packet's "
+                         "size or count, only how much is live: at 640 the packed table "
+                         "is 26.3 MiB and its gathered result 32.8 MiB against a 24 MiB "
+                         "SBUF, and N=8 makes them 3.3 and 4.1. Measured and rejected: "
+                         "451.77 ms at N=2 against 427.72 at N=1, and N=4 and N=8 run "
+                         "neuronx-cc out of memory. Defaults to 1")
     ap.add_argument("--cross-attn", default="per_head", choices=("batched", "per_head"),
                     help="how the decoder's masked cross attention runs on device: "
                          "'per_head' loops over the eight heads, 'batched' is upstream's "
@@ -92,12 +101,14 @@ class Heads(nn.Module):
         return out.class_queries_logits, out.masks_queries_logits
 
 
-def build(model_path, size, msda="torch", gather="corners", cross_attn="per_head"):
+def build(model_path, size, msda="torch", gather="corners", gather_split=1,
+          cross_attn="per_head"):
     """Load, patch, and return (model, wrapper). See src/patches.py for the ten."""
     from src import patches
 
     level_shapes = [(size // s, size // s) for s in (32, 16, 8)]
-    patches.install(level_shapes, msda=msda, gather=gather, cross_attn=cross_attn)
+    patches.install(level_shapes, msda=msda, gather=gather, gather_split=gather_split,
+                    cross_attn=cross_attn)
 
     from transformers import OneFormerForUniversalSegmentation
 
@@ -173,8 +184,10 @@ def main():
 
     # Two independent instances when comparing: one stays on the host, one moves to the
     # device. They cannot be the same object -- moving it would take the CPU side with it.
-    dev_model, device_wrapper, patches = build(args.model, args.size, msda=args.msda, gather=args.gather,
-                                              cross_attn=args.cross_attn)
+    dev_model, device_wrapper, patches = build(
+        args.model, args.size, msda=args.msda, gather=args.gather,
+        gather_split=args.gather_split, cross_attn=args.cross_attn,
+    )
     cpu_wrapper = build(args.model, args.size)[1] if args.compare_cpu else None
 
     pixel_mask = torch.ones(1, args.size, args.size)

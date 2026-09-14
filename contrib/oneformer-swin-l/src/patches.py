@@ -558,6 +558,7 @@ def install(
     level_shapes: list[tuple[int, int]],
     msda: str = "torch",
     gather: str = "packed",
+    gather_split: int = 1,
     cross_attn: str = "per_head",
 ) -> None:
     """Patch ``transformers.models.oneformer.modeling_oneformer`` in place.
@@ -578,6 +579,13 @@ def install(
             (see :func:`bilinear.bilinear_sample_packed`). The two are bit-for-bit equal,
             so this is purely a DMA-descriptor question. The host stays on ``"corners"``
             either way, which makes the device comparison a direct diff between them.
+        gather_split: how many groups of heads the device samples at a time. Also
+            bit-for-bit -- there is no reduction across heads to reassociate -- and it does
+            shrink the live set: at 640 the packed table is 26.3 MiB and its gathered
+            result 32.8 MiB against a 24 MiB SBUF, and ``8`` would make them 3.3 and 4.1.
+            It is nevertheless *slower* at the only value above 1 that compiles (451.77 ms
+            against 427.72), which is why it defaults to 1. Kept so the negative result is
+            re-runnable. See :func:`bilinear._split_heads`.
         cross_attn: how the decoder's masked cross attention runs *on device* --
             ``"per_head"`` for :func:`_cross_attention_per_head`, ``"batched"`` for
             upstream's ``nn.MultiheadAttention`` call. The same arithmetic, but *not*
@@ -618,12 +626,21 @@ def install(
         "gather= only applies to the PyTorch deformable attention; the NKI kernel does "
         "its own sampling",
     )
+    _check(
+        isinstance(gather_split, int) and gather_split >= 1,
+        f"gather_split must be a positive int, got {gather_split!r}",
+    )
+    _check(
+        msda == "torch" or gather_split == 1,
+        "gather_split= only applies to the PyTorch deformable attention; the NKI kernel "
+        "does its own sampling",
+    )
     # The host stays on the four-corner sampler whatever the device does. The two are
     # bit-for-bit equal, so this costs no accuracy, and it keeps the CPU reference
     # independent of the thing being measured -- and off the 4x-wider table, which on a
     # host is pure cost.
     host_msda = functools.partial(_msda, gather="corners")
-    device_msda = functools.partial(_msda, gather=gather)
+    device_msda = functools.partial(_msda, gather=gather, split=gather_split)
     if msda == "nki":
         from . import nki_msda
 

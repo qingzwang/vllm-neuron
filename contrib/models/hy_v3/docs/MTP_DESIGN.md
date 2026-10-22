@@ -121,12 +121,34 @@ kwargs) fits MTP unchanged.
 
 ### Performance (full model, latency config, concurrency 1)
 
-| | plain decode | MTP k=1 |
-| --- | --- | --- |
-| acceptance (20 MATH-500 problems) | - | 87% (3057 / 3512) |
-| streamed step gap, median | 26.4 ms (p10 25.8, p90 26.9) | 55-59 ms (p10 ~47, p90 ~65) |
-| TPOT, real prompts (median) | 26.3 ms | 30.9 ms |
-| TPOT, random prompts 1k / 16k | 26.3 / 27.7 ms | 39.2 / 43.3 ms |
+`scripts/serve_latency.sh` (`MTP_K=k` for MTP), 20 MATH-500 problems as chat
+prompts (no_think, greedy, up to 512 tokens, `scripts/bench_real_prompts.py`),
+acceptance from the server's spec-decode counters. "Step" is the median gap
+between streamed chunks (one engine step each) for two 256-token completions.
+
+| | plain | MTP k=1 | k=2 | k=3 | k=4 |
+| --- | --- | --- | --- | --- | --- |
+| **TPOT, real prompts (median)** | 26.3 ms | 30.9 ms | 23.4 ms | 21.0 ms | **20.6 ms (-22%)** |
+| tokens per step (1 + accepted / drafts) | 1 | 1.87 | 2.48 | 2.78 | 2.93 |
+| acceptance, draft position 1 | - | 87.0% | 86.5% | 85.4% | 85.4% |
+| acceptance, position 2 | - | - | 61.1% | 59.4% | 58.9% |
+| acceptance, position 3 | - | - | - | 33.4% | 32.3% |
+| acceptance, position 4 | - | - | - | - | 16.0% |
+| step time (streamed chunk gap, median) | 26.4 ms | 55-59 ms | 60 ms | 60-61 ms | 61-62 ms |
+| 256-token completion, total (2 requests) | 6717 / 6719 ms | - | 6221 / 7407 ms | 5389 / 6068 ms | 5579 / 5790 ms |
+| TPOT, random prompts 1k / 16k | 26.3 / 27.7 ms | 39.2 / 43.3 ms | 35.3 / 36.4 ms | 32.6 / 39.1 ms | 33.9 / 32.3 ms |
+| TTFT, real prompts (median) | 0.16 s | 0.20 s | 0.20 s | 0.20 s | 0.20 s |
+
+Acceptance per position counts the steps whose draft at that position was
+accepted (so it is cumulative: position 2 can only be accepted after position 1).
+
+- Each step costs ~55-62 ms for every k (vs 26.4 ms plain), so the gain comes
+  only from tokens per step. An extra draft position costs ~1-2 ms per step, so
+  k=3 / k=4 still pay off with the single MTP layer reused recurrently
+  (positions 3-4 accept 32% / 16%).
+- On real chat prompts k=4 lowers TPOT by 22% and k=3 by 20%; k=1 is slower than
+  plain. Random-token prompts are hardly ever accepted, so every k is slower
+  than plain there. TTFT grows by ~40 ms (the draft's prefill pass).
 
 Device profile of a spec step (core 0): the draft NEFF takes 0.6-1.0 ms and
 the target verify NEFF 28-30 ms of compute, i.e. the device work per step is
@@ -146,6 +168,5 @@ vllm-neuron as an issue).
 
 - With the per-step overhead removed (step ~= 29 ms device time), k=1 at 87%
   acceptance would give a TPOT of ~16-18 ms (~35-40% lower than plain).
-- Raising k only amortizes the overhead: a second / third draft costs ~1 ms of
-  device time each but reuses the single MTP layer recurrently, so its
-  acceptance is expected to drop. Not measured on the full model yet.
+- Until then, raising k amortizes the overhead: k=4 is the best measured
+  setting (TPOT 20.6 ms on real prompts, -22%).

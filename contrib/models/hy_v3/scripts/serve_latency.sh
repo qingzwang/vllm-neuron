@@ -3,11 +3,16 @@
 # prefill), fine-grained prefill buckets (no 1k -> 2048 padding) and a 16k prompt
 # runs in one prefill step.
 # Env: MODEL (default tencent/Hy3-FP8), EP=<n> sets neuron_config.ep_degree
-#      (default: full EP=64), KV_CAP, PORT.
+#      (default: full EP=64), KV_CAP, PORT, MTP_K (MTP speculative tokens per
+#      step; default off; needs a vllm-neuron with MTP support).
 set -euo pipefail
 export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.45}
-exec vllm serve "${MODEL:-tencent/Hy3-FP8}" \
+SPEC_ARGS=()
+if [ -n "${MTP_K:-}" ]; then
+    SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP_K}")
+fi
+exec vllm serve "${MODEL:-tencent/Hy3-FP8}" "${SPEC_ARGS[@]}" \
     --served-model-name hy3 \
     --tensor-parallel-size 64 \
     --enable-expert-parallel \

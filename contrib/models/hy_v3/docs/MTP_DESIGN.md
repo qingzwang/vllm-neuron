@@ -1,6 +1,6 @@
 # MTP speculative decoding for Hy3 on Neuron: design
 
-Status: proposal (branch `hy3-fp8-opt`). Goal: lower single-request TPOT,
+Status: implemented on branch `hy3-fp8-opt` (framework part on `mtp-spec-decode`); see Results. Goal: lower single-request TPOT,
 which the 0.29 profile puts at 27.8 ms per step (`PROFILE_0.29.md`), by using
 the MTP (next-n prediction) layer that tencent/Hy3-FP8 ships.
 
@@ -14,7 +14,9 @@ the MTP (next-n prediction) layer that tencent/Hy3-FP8 ships.
   `h = eh_proj(cat(enorm(embed(t_{i+1})), hnorm(h_i)))`, then the decoder
   layer (with its residual), then `final_layernorm`, then the target lm_head.
   `h_i` is the target's final (post-norm) hidden state at position i; for
-  further draft steps the MTP output itself is fed back.
+  further draft steps the MTP output itself is fed back. (The target hands
+  over the pre-norm state and the draft applies the target's final norm; see
+  Results.)
 - vLLM 0.29: `--speculative-config '{"method": "mtp", "num_speculative_tokens": k}'`
   turns the target `hy_v3` config into a draft config with
   `model_type=hy_v3_mtp`, `architectures=["HYV3MTPModel"]`, same checkpoint.
@@ -95,3 +97,55 @@ kwargs) fits MTP unchanged.
   spreads the decode MoE load and may raise the verify-step cost more than
   for a dense model.
 - Compile time: the draft adds one fused NEFF per decode bucket.
+
+## Results (2026-10-22)
+
+### Correctness
+
+- 4-layer checkpoint with the MTP layer (`make_mini.py --keep-mtp`,
+  `scripts/check_mtp.py`): greedy MTP output equals plain decoding token for
+  token, k=1 and k=2, batch 4, 16 tokens.
+- Bug found on the way: returning the target's post-norm hidden states as the
+  auxiliary output, while the same tensor also feeds the lm_head, made the
+  verify step's lm_head rows wrong for every request but the first at batch > 1
+  (the norm output itself was correct in a tensor capture; computing the
+  lm_head from it on the host gave the right tokens). Handing over the pre-norm
+  last-layer output, as the Neuron capture convention does for EAGLE3, fixed it.
+- Full model, 20 MATH-500 problems, greedy, 512 tokens: the MTP and plain
+  outputs agree on 2/20 and split early on the others at equally plausible
+  wording ("coordinates" vs "point", `\[` vs `$$`). Graded with math-verify:
+  plain 11/20 correct (7 truncated), MTP 13/20 (5 truncated). Most likely the
+  verify step (1 + k tokens per request) is numerically slightly different from
+  a single-token decode step and flips near-ties; not yet confirmed with
+  per-token logprobs, and a full MATH-500 run with MTP is still to do.
+
+### Performance (full model, latency config, concurrency 1)
+
+| | plain decode | MTP k=1 |
+| --- | --- | --- |
+| acceptance (20 MATH-500 problems) | - | 87% (3057 / 3512) |
+| streamed step gap, median | 26.4 ms (p10 25.8, p90 26.9) | 55-59 ms (p10 ~47, p90 ~65) |
+| TPOT, real prompts (median) | 26.3 ms | 30.9 ms |
+| TPOT, random prompts 1k / 16k | 26.3 / 27.7 ms | 39.2 / 43.3 ms |
+
+Device profile of a spec step (core 0): the draft NEFF takes 0.6-1.0 ms and
+the target verify NEFF 28-30 ms of compute, i.e. the device work per step is
+about one plain decode step. The rest of the ~55 ms is waiting: an idle gap
+before the verify NEFF or a `BARRIER` at its start of up to 32 ms (this core is
+ready early and waits for other ranks). The step is bounded by host-side work
+on the slowest rank, which the async pipeline hides in plain decode but not in
+speculative decoding.
+
+The same holds for the officially supported Llama-3.1-8B + EAGLE3 (TP=8, k=1,
+tutorial config): ~25 ms per spec step against ~7-15 ms per plain step, 68%
+acceptance, total time -8% / +35% on two requests. So the overhead is in the
+framework's speculative-decoding step, not in the Hy3 draft (reported to
+vllm-neuron as an issue).
+
+### Outlook
+
+- With the per-step overhead removed (step ~= 29 ms device time), k=1 at 87%
+  acceptance would give a TPOT of ~16-18 ms (~35-40% lower than plain).
+- Raising k only amortizes the overhead: a second / third draft costs ~1 ms of
+  device time each but reuses the single MTP layer recurrently, so its
+  acceptance is expected to drop. Not measured on the full model yet.

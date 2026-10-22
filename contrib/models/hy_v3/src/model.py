@@ -54,6 +54,7 @@ from nkilib.core.utils.common_types import (
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_tp_group
+from vllm.model_executor.models.interfaces import SupportsEagle3
 
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
@@ -74,6 +75,7 @@ from vllm_neuron.utils.weight_loader import (
     set_weight_loader,
     sharding_weight_loader,
 )
+from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 
 from . import kv_scales
 from .fp8_kv_layout import packed_decode_viable, swizzle_packed_k, unswizzle_packed_k
@@ -1596,6 +1598,12 @@ class HYV3Model(nn.Module):
         )
         self.rotary_emb = HYV3RotaryEmbedding(config)
 
+        # Hidden states handed to a speculative-decoding draft, set by the
+        # runner via set_aux_hidden_state_layers(). Index i is the input of
+        # layer i; index num_hidden_layers is the last layer's output before
+        # the final norm (the MTP draft applies that norm itself).
+        self.aux_hidden_state_layers: list[int] = []
+
     def forward(
         self,
         input_ids,
@@ -1605,7 +1613,7 @@ class HYV3Model(nn.Module):
         rank=None,
         inputs_embeds=None,
         is_token_ids=None,
-    ):
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         hidden_states = self.embed_tokens(
             input_ids, scatter_tokens=is_prefill, rank=rank
         )
@@ -1625,7 +1633,18 @@ class HYV3Model(nn.Module):
         position_embeddings = self.rotary_emb(
             positions, device=hidden_states.device, dtype=hidden_states.dtype
         )
-        for layer in self.layers:
+
+        # >>> PARALLELISM: SP — prefill states are token shards; gather them
+        # so the draft sees every token. <<<
+        def full_rows(t):
+            if is_prefill and self.world_size > 1:
+                return self.tp_group.all_gather(t, dim=0)
+            return t
+
+        aux_hidden_states = []
+        for idx, layer in enumerate(self.layers):
+            if idx in self.aux_hidden_state_layers:
+                aux_hidden_states.append(full_rows(hidden_states))
             hidden_states = layer(
                 hidden_states,
                 positions,
@@ -1634,12 +1653,74 @@ class HYV3Model(nn.Module):
                 is_decode=not is_prefill,
                 rank=rank,
             )
-        hidden_states = self.norm(hidden_states)
+        # Returning the post-norm states as an extra graph output corrupts the
+        # lm_head rows of the same graph on Neuron for batch > 1 (seen in MTP
+        # verify steps), so hand over the pre-norm states.
+        if len(self.layers) in self.aux_hidden_state_layers:
+            aux_hidden_states.append(full_rows(hidden_states))
+        hidden_states = full_rows(self.norm(hidden_states))
+        return hidden_states, aux_hidden_states
 
-        # >>> PARALLELISM: SP — all-gather the full sequence <<<
-        if is_prefill and self.world_size > 1:
-            hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
-        return hidden_states
+
+def decoder_layer_weight_mappings(
+    layer: "HYV3DecoderLayer", dst: str, src: str, num_experts: int
+) -> dict[str, str | list[str]]:
+    """<-- MODEL-SPECIFIC: parameter -> checkpoint key(s) for one decoder layer.
+
+    ``dst`` is the layer's parameter prefix in the module tree and ``src`` its
+    checkpoint prefix (they differ for the MTP layer: ``layers.0`` <- ``model.layers.80``).
+    """
+    m: dict[str, str | list[str]] = {}
+    a, sa = f"{dst}.self_attn", f"{src}.self_attn"
+    m[f"{a}.qkv_proj_weight"] = [f"{sa}.{n}_proj.weight" for n in "qkv"]
+    m[f"{a}.qkv_weight_scale"] = [f"{sa}.{n}_proj.weight_scale" for n in "qkv"]
+    m[f"{a}.qkv_input_scale"] = [f"{sa}.{n}_proj.input_scale" for n in "qkv"]
+    m[f"{a}.o_proj_weight"] = f"{sa}.o_proj.weight"
+    m[f"{a}.o_weight_scale"] = f"{sa}.o_proj.weight_scale"
+    m[f"{a}.o_input_scale"] = f"{sa}.o_proj.input_scale"
+    m[f"{a}.q_norm.weight"] = f"{sa}.q_norm.weight"
+    m[f"{a}.k_norm.weight"] = f"{sa}.k_norm.weight"
+    m[f"{dst}.input_layernorm.weight"] = f"{src}.input_layernorm.weight"
+    m[f"{dst}.post_attention_layernorm.weight"] = (
+        f"{src}.post_attention_layernorm.weight"
+    )
+
+    def gated_mlp(d: str, s: str):
+        for n in ("gate", "up", "down"):
+            m[f"{d}.{n}_proj_weight"] = f"{s}.{n}_proj.weight"
+            m[f"{d}.{n}_weight_scale"] = f"{s}.{n}_proj.weight_scale"
+        m[f"{d}.gate_up_input_scale"] = [
+            f"{s}.gate_proj.input_scale",
+            f"{s}.up_proj.input_scale",
+        ]
+        m[f"{d}.down_input_scale"] = f"{s}.down_proj.input_scale"
+
+    if isinstance(layer.mlp, HYV3DenseMLP):
+        gated_mlp(f"{dst}.mlp.mlp", f"{src}.mlp")
+        return m
+
+    mp, smp = f"{dst}.mlp", f"{src}.mlp"
+    m[f"{mp}.router_weight"] = f"{smp}.router.gate.weight"
+    m[f"{mp}.expert_bias"] = f"{smp}.expert_bias"
+
+    def experts(proj: str, suffix: str) -> list[str]:
+        return [f"{smp}.experts.{e}.{proj}.{suffix}" for e in range(num_experts)]
+
+    gate_up_s = experts("gate_proj", "weight_scale") + experts(
+        "up_proj", "weight_scale"
+    )
+    m[f"{mp}.gate_up_proj_weight"] = experts("gate_proj", "weight") + experts(
+        "up_proj", "weight"
+    )
+    m[f"{mp}.down_proj_weight"] = experts("down_proj", "weight")
+    m[f"{mp}.gate_up_proj_scale"] = gate_up_s
+    m[f"{mp}.gate_up_proj_scale_tkg"] = gate_up_s
+    m[f"{mp}.down_proj_scale"] = experts("down_proj", "weight_scale")
+    m[f"{mp}.down_proj_scale_tkg"] = experts("down_proj", "weight_scale")
+    gated_mlp(f"{mp}.shared_mlp", f"{smp}.shared_mlp")
+    if layer.mlp.shared_mlp_decode is not None:
+        gated_mlp(f"{mp}.shared_mlp_decode", f"{smp}.shared_mlp")
+    return m
 
 
 # =============================================================================
@@ -1647,8 +1728,14 @@ class HYV3Model(nn.Module):
 # =============================================================================
 
 
-class HYV3ForCausalLM(nn.Module):
-    """Hy3 model with column-parallel LM head."""
+@async_speculative_decoding
+class HYV3ForCausalLM(nn.Module, SupportsEagle3):
+    """Hy3 model with column-parallel LM head.
+
+    As a speculative-decoding target (MTP) it returns the requested auxiliary
+    hidden states with its outputs and verifies drafts with the rejection
+    sampler (same contract as ``llama3/model.py``).
+    """
 
     def __init__(self, config: HYV3Config):
         super().__init__()
@@ -1712,7 +1799,7 @@ class HYV3ForCausalLM(nn.Module):
                 f"Prompt Length ({T}) must be > world_size ({self.world_size}) for SP."
             )
 
-        hidden_states = self.model(
+        hidden_states, aux_hidden_states = self.model(
             input_ids,
             positions,
             attn_metadata,
@@ -1721,13 +1808,15 @@ class HYV3ForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             is_token_ids=is_token_ids,
         )
+        # One device tensor for the draft NEFF (the cat stays in this graph).
+        aux = torch.cat(aux_hidden_states, dim=-1) if aux_hidden_states else None
         hidden_states = torch.index_select(
             hidden_states, dim=0, index=sampling_positions
         )
         logits = self.lm_head(hidden_states)
 
         if self.on_device_sampling_config is None:
-            return logits
+            return logits if aux is None else (logits, aux)
 
         sampled_tokens = self.sampler(
             logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
@@ -1735,7 +1824,30 @@ class HYV3ForCausalLM(nn.Module):
         gathered_logits = (
             self.tp_group.all_gather(logits, dim=1) if self._gather_logits else None
         )
+
+        # >>> SPEC DECODE: verify the drafts on device <<<
+        if spec_decode_metadata is not None:
+            from vllm_neuron.nn.rejection_sampler import rejection_sampler
+
+            accepted = rejection_sampler(spec_decode_metadata, sampled_tokens)
+            return accepted if aux is None else (accepted, aux, gathered_logits)
+
+        if aux is not None:
+            return sampled_tokens, aux, gathered_logits
         return sampled_tokens, gathered_logits
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Select the hidden states returned for a speculative-decoding draft.
+
+        Index i is the input of layer i; ``num_hidden_layers`` is the last
+        layer's (pre-final-norm) output, which the MTP draft consumes.
+        """
+        if layers is not None:
+            self.model.aux_hidden_state_layers = list(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        # MTP (the only draft Hy3 ships) consumes the final hidden state.
+        return (len(self.model.layers),)
 
     @classmethod
     def from_configs(cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig):
@@ -1800,7 +1912,6 @@ class HYV3ForCausalLM(nn.Module):
     def _weight_mappings(self) -> dict[str, str | list[str]]:
         """<-- MODEL-SPECIFIC: model parameter name -> checkpoint key(s)."""
         cfg = self.config
-        E = cfg.num_experts
         m: dict[str, str | list[str]] = {
             "model.embed_tokens.weight": "model.embed_tokens.weight",
             "lm_head.weight": (
@@ -1810,60 +1921,12 @@ class HYV3ForCausalLM(nn.Module):
             ),
             "model.norm.weight": "model.norm.weight",
         }
-
-        def fp8_linear(dst: str, src: str):
-            m[f"{dst}_weight"] = f"{src}.weight"
-
         for i, layer in enumerate(self.model.layers):
-            p = f"model.layers.{i}"
-            a = f"{p}.self_attn"
-            m[f"{a}.qkv_proj_weight"] = [f"{a}.{n}_proj.weight" for n in "qkv"]
-            m[f"{a}.qkv_weight_scale"] = [f"{a}.{n}_proj.weight_scale" for n in "qkv"]
-            m[f"{a}.qkv_input_scale"] = [f"{a}.{n}_proj.input_scale" for n in "qkv"]
-            m[f"{a}.o_proj_weight"] = f"{a}.o_proj.weight"
-            m[f"{a}.o_weight_scale"] = f"{a}.o_proj.weight_scale"
-            m[f"{a}.o_input_scale"] = f"{a}.o_proj.input_scale"
-            m[f"{a}.q_norm.weight"] = f"{a}.q_norm.weight"
-            m[f"{a}.k_norm.weight"] = f"{a}.k_norm.weight"
-            m[f"{p}.input_layernorm.weight"] = f"{p}.input_layernorm.weight"
-            m[f"{p}.post_attention_layernorm.weight"] = (
-                f"{p}.post_attention_layernorm.weight"
+            m.update(
+                decoder_layer_weight_mappings(
+                    layer, f"model.layers.{i}", f"model.layers.{i}", cfg.num_experts
+                )
             )
-
-            def gated_mlp(dst: str, src: str):
-                for n in ("gate", "up", "down"):
-                    m[f"{dst}.{n}_proj_weight"] = f"{src}.{n}_proj.weight"
-                    m[f"{dst}.{n}_weight_scale"] = f"{src}.{n}_proj.weight_scale"
-                m[f"{dst}.gate_up_input_scale"] = [
-                    f"{src}.gate_proj.input_scale",
-                    f"{src}.up_proj.input_scale",
-                ]
-                m[f"{dst}.down_input_scale"] = f"{src}.down_proj.input_scale"
-
-            if isinstance(layer.mlp, HYV3DenseMLP):
-                gated_mlp(f"{p}.mlp.mlp", f"{p}.mlp")
-                continue
-
-            mp = f"{p}.mlp"
-            m[f"{mp}.router_weight"] = f"{mp}.router.gate.weight"
-            m[f"{mp}.expert_bias"] = f"{mp}.expert_bias"
-
-            def experts(proj: str, suffix: str, mp: str = mp) -> list[str]:
-                return [f"{mp}.experts.{e}.{proj}.{suffix}" for e in range(E)]
-
-            gate_up_w = experts("gate_proj", "weight") + experts("up_proj", "weight")
-            gate_up_s = experts("gate_proj", "weight_scale") + experts(
-                "up_proj", "weight_scale"
-            )
-            m[f"{mp}.gate_up_proj_weight"] = gate_up_w
-            m[f"{mp}.down_proj_weight"] = experts("down_proj", "weight")
-            m[f"{mp}.gate_up_proj_scale"] = gate_up_s
-            m[f"{mp}.gate_up_proj_scale_tkg"] = gate_up_s
-            m[f"{mp}.down_proj_scale"] = experts("down_proj", "weight_scale")
-            m[f"{mp}.down_proj_scale_tkg"] = experts("down_proj", "weight_scale")
-            gated_mlp(f"{mp}.shared_mlp", f"{mp}.shared_mlp")
-            if layer.mlp.shared_mlp_decode is not None:
-                gated_mlp(f"{mp}.shared_mlp_decode", f"{mp}.shared_mlp")
         return m
 
     def load_weights(

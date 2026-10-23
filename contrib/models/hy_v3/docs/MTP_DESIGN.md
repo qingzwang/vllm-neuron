@@ -150,6 +150,27 @@ accepted (so it is cumulative: position 2 can only be accepted after position 1)
   plain. Random-token prompts are hardly ever accepted, so every k is slower
   than plain there. TTFT grows by ~40 ms (the draft's prefill pass).
 
+#### Concurrency 4
+
+Same server and prompts, 40 MATH-500 problems sent 4 at a time
+(`scripts/bench_real_prompts.py --concurrency 4`):
+
+| | plain | MTP k=4 | change |
+| --- | --- | --- | --- |
+| TPOT per request (median) | 53.2 ms | **16.9 ms** | -68% |
+| output throughput | 72.1 tok/s | **219.8 tok/s** | 3.05x |
+| end-to-end per request (mean) | 16.7 s | 5.5 s | -67% |
+| TTFT (median) | 0.27 s | 0.26 s | |
+| acceptance, positions 1-4 | - | 85.4 / 59.4 / 33.4 / 16.3% | |
+| tokens per step | 1 | 2.94 | |
+
+At batch 4 a plain decode step costs ~53 ms (twice the batch-1 step), while a
+k=4 speculative step costs ~50 ms (16.9 ms x 2.94), so verifying 20 tokens
+costs about as much as decoding 4 and the ~1.9 extra tokens per step are
+almost free. The fixed per-step overhead that dominates at concurrency 1 no
+longer shows; MTP pays off much more at moderate concurrency than for a
+single request.
+
 Device profile of a spec step (core 0): the draft NEFF takes 0.6-1.0 ms and
 the target verify NEFF 28-30 ms of compute, i.e. the device work per step is
 about one plain decode step. The rest of the ~55 ms is waiting: an idle gap
@@ -169,4 +190,5 @@ vllm-neuron as an issue).
 - With the per-step overhead removed (step ~= 29 ms device time), k=1 at 87%
   acceptance would give a TPOT of ~16-18 ms (~35-40% lower than plain).
 - Until then, raising k amortizes the overhead: k=4 is the best measured
-  setting (TPOT 20.6 ms on real prompts, -22%).
+  setting (TPOT 20.6 ms on real prompts, -22%, at concurrency 1; 16.9 ms and
+  3.05x throughput at concurrency 4).

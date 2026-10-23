@@ -1,4 +1,4 @@
-"""Single-request latency on real prompts (MATH-500 problems), plus MTP acceptance.
+"""Latency on real prompts (MATH-500 problems), plus MTP acceptance.
 
 Random-token benchmarks say nothing about speculative-decoding acceptance, so
 this sends real chat prompts one at a time (greedy, streaming) and reports the
@@ -6,7 +6,7 @@ median TTFT / TPOT. When the server runs MTP it also reports the acceptance
 from the server's spec-decode counters (/metrics).
 
 Usage: python bench_real_prompts.py <out.json> [--num 20] [--max-tokens 512]
-           [--data math500.jsonl] [--base-url http://127.0.0.1:8000]
+           [--concurrency 1] [--data math500.jsonl] [--base-url http://127.0.0.1:8000]
 Requires: openai (and datasets when --data is not given).
 """
 
@@ -15,6 +15,7 @@ import json
 import statistics
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from openai import OpenAI
@@ -47,9 +48,8 @@ def main(args):
         rows = list(load_dataset("HuggingFaceH4/MATH-500", split="test"))
     rows = rows[: args.num]
     client = OpenAI(base_url=f"{args.base_url}/v1", api_key="EMPTY")
-    before = counters(args.base_url)
-    results = []
-    for r in rows:
+
+    def one(r):
         t0 = time.perf_counter()
         first, n_chunks, text = None, 0, ""
         stream = client.chat.completions.create(
@@ -74,13 +74,17 @@ def main(args):
         n_out = usage.completion_tokens if usage else n_chunks
         ttft = (first or end) - t0
         tpot = (end - (first or end)) / max(n_out - 1, 1)
-        results.append(
-            {"ttft": ttft, "tpot": tpot, "output_tokens": n_out, "text": text}
-        )
         print(
             f"ttft {ttft * 1e3:.0f} ms, tpot {tpot * 1e3:.1f} ms, {n_out} tokens",
             flush=True,
         )
+        return {"ttft": ttft, "tpot": tpot, "output_tokens": n_out, "text": text}
+
+    before = counters(args.base_url)
+    wall0 = time.perf_counter()
+    with ThreadPoolExecutor(args.concurrency) as pool:
+        results = list(pool.map(one, rows))
+    wall = time.perf_counter() - wall0
     after = counters(args.base_url)
     delta = {k: after[k] - before.get(k, 0.0) for k in after}
     drafts = delta.get("vllm:spec_decode_num_draft_tokens", 0.0)
@@ -90,6 +94,9 @@ def main(args):
         "median_ttft_ms": statistics.median(x["ttft"] for x in results) * 1e3,
         "median_tpot_ms": statistics.median(x["tpot"] for x in results) * 1e3,
         "mean_output_tokens": statistics.mean(x["output_tokens"] for x in results),
+        "concurrency": args.concurrency,
+        "wall_s": wall,
+        "output_tok_per_s": sum(x["output_tokens"] for x in results) / wall,
         "spec_decode": delta,
         "acceptance_rate": accepted / drafts if drafts else None,
     }
@@ -106,6 +113,7 @@ if __name__ == "__main__":
     p.add_argument("out")
     p.add_argument("--num", type=int, default=20)
     p.add_argument("--max-tokens", type=int, default=512)
+    p.add_argument("--concurrency", type=int, default=1)
     p.add_argument("--data", default=None)
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
     main(p.parse_args())

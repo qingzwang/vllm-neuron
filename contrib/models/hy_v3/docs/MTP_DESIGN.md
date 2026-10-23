@@ -185,10 +185,53 @@ acceptance, total time -8% / +35% on two requests. So the overhead is in the
 framework's speculative-decoding step, not in the Hy3 draft (reported to
 vllm-neuron as an issue).
 
+#### With routed-expert decode (`moe_tkg_hits`, 2026-10-23)
+
+`moe_tkg_hits` / `moe_tkg_hits_batch` (README, "Decode: only the routed
+experts") compute only the experts routed to each rank in decode steps of up
+to `HY3_DECODE_HITS_MAX_T` tokens (default 4 per 3 local experts: 4 at EP=64).
+A verify step has (k + 1) tokens per request, so at concurrency 1 with k=3 it
+takes the hits path by default, and at concurrency 4 (16 / 20 tokens) only
+with a raised limit. `scripts/serve_latency.sh` sets the limit to
+4 x (k + 1) when `MTP_K` is given (16 for k=3 is equivalent to the measured
+20: no step of that config has more than 16 tokens). Same prompts and client
+as above:
+
+| config | TPOT c=1 | out tok/s c=1 | TTFT c=1 | TPOT c=4 | out tok/s c=4 | TTFT c=4 |
+| --- | --- | --- | --- | --- | --- | --- |
+| plain, `moe_tkg` | 26.3 ms | 38 | 0.16 s | 53.2 ms | 72 | 0.27 s |
+| plain, hits | 21.7 ms | 45 | 0.16 s | 34.0 ms | 111 | 0.22 s |
+| MTP k=4, `moe_tkg` | 20.6 ms | 49 | 0.20 s | 16.9 ms | 220 | 0.26 s |
+| MTP k=3, hits, limit 4 | 13.6 ms | 70 | 0.18 s | 19.1 ms | 198 | 0.26 s |
+| MTP k=3, hits, limit 4, `VLLM_NEURON_PRECOMPILE_GUARD_FILTER=portable` | 13.4 ms | 71 | 0.18 s | 18.8 ms | 201 | 0.26 s |
+| **MTP k=3, hits, limit 20** | **13.8 ms** | **70** | 0.19 s | **17.1 ms** | **216** | 0.24 s |
+| MTP k=4, hits, limit 20 | 13.8 ms | 70 | 0.19 s | 17.0 ms | 218 | 0.25 s |
+
+c=1 tok/s for the `moe_tkg` rows is 1000 / TPOT. Acceptance per draft
+position with hits: 85 / 60 / 35% at k=3 (2.80 tokens per step), 85 / 59 /
+33 / 16% at k=4 (2.92), the same as with `moe_tkg`.
+
+- Concurrency 1: hits and MTP compound. The plain step gets 4.6 ms shorter
+  with hits, but the spec step gets ~20 ms shorter (TPOT x tokens per step:
+  ~59 -> ~38 ms). Much of the per-step wait for other ranks is MoE rank
+  skew: with all-expert `moe_tkg` the verify step's ranks finish at different
+  times, and hits shortens the slowest one. TPOT is 48% below plain.
+- Concurrency 4: MTP gives the 3x on its own. With the default limit the
+  16-token verify step falls back to `moe_tkg` (198 tok/s, below k=4 without
+  hits); with the limit raised it takes the hits path (216-218 tok/s), on par
+  with k=4 + `moe_tkg`. So the hits kernel stays faster than `moe_tkg` up to
+  16-20 tokens here, past the 4-token default, which was set for plain decode.
+- k=4 gives nothing over k=3 with hits; k=3 is the recommended setting.
+- The precompile guard filter changes nothing measurable.
+
 ### Outlook
 
 - With the per-step overhead removed (step ~= 29 ms device time), k=1 at 87%
   acceptance would give a TPOT of ~16-18 ms (~35-40% lower than plain).
-- Until then, raising k amortizes the overhead: k=4 is the best measured
-  setting (TPOT 20.6 ms on real prompts, -22%, at concurrency 1; 16.9 ms and
-  3.05x throughput at concurrency 4).
+- Until then, raising k amortizes the overhead. Without hits k=4 is best
+  (TPOT 20.6 ms, -22%, at concurrency 1; 16.9 ms and 3.05x throughput at
+  concurrency 4). With hits, k=3 is best: 13.8 ms (-48%) at concurrency 1 and
+  216 tok/s (3x) at concurrency 4.
+- The hits batch limit is tuned for plain decode. A per-request limit for
+  verify steps, or a limit measured at larger batches with MTP, is left open;
+  `scripts/serve.sh` (config B, up to 32 requests) keeps the default.

@@ -114,9 +114,15 @@ print(outputs[0].outputs[0].text)
   whatever the request's real length (vllm-neuron 0.21+ makes this opt-in;
   the NxDI-based 0.2.x bucketed decode by sequence length by default). The
   configs below all set it.
-- Not supported: data parallel / attention DP, MTP speculative decoding.
-  They are rejected at startup. FP8 KV cache needs a calibrated KV scale
-  profile (the checkpoint ships none); see "FP8 KV cache" below.
+- Not supported: data parallel / attention DP, MTP together with DCP. They
+  are rejected at startup. FP8 KV cache needs a calibrated KV scale profile
+  (the checkpoint ships none); see "FP8 KV cache" below.
+- MTP speculative decoding (`--speculative-config '{"method": "mtp",
+  "num_speculative_tokens": 3}'`, `MTP_K=3` for the serve scripts) uses the
+  checkpoint's MTP layer as the draft. It needs a vllm-neuron with the MTP
+  proposer (`vllm_neuron/vllm/spec_decode/mtp.py`). With `moe_tkg_hits` it
+  cuts TPOT at concurrency 1 from 26.3 to 13.8 ms and triples throughput at
+  concurrency 4; see "MTP speculative decoding" under Results.
 - `--decode-context-parallel-size 8 --cp-kv-cache-interleave-size 32` shards
   the replicated KV heads 8 ways (8x KV capacity) for many concurrent
   long-context requests. On 0.29 it is validated on the 4-layer model
@@ -129,7 +135,9 @@ print(outputs[0].outputs[0].text)
   (`src/kernels/moe_tkg_hits.py` for one token, `moe_tkg_hits_batch.py` for
   more; on by default). Larger steps keep the all-expert `moe_tkg`.
   `HY3_DECODE_HITS_MAX_T` changes the limit and `HY3_DECODE_HITS=0` turns
-  both paths off. See "Decode: only the routed experts" under Results.
+  both paths off. See "Decode: only the routed experts" under Results. With
+  MTP, raise the limit to the verify step's size (max-num-seqs x (k + 1));
+  `scripts/serve_latency.sh` does this when `MTP_K` is set.
 - `"ep_degree": 32` (`EP=32` for `scripts/serve.sh` and
   `scripts/serve_latency.sh`) trades TTFT for TPOT. In config B it gives
   0.4-1.8 ms lower TPOT at concurrency 1 and 4, but 3-6% higher TPOT at
@@ -623,6 +631,30 @@ step itself. (A disaggregated decode node counts that re-compute into the
 decode batch instead, see `_should_skip_prefilling_padding_in_di` in
 `vllm_neuron/vllm/core/scheduler.py`.)
 
+### MTP speculative decoding
+
+Latency config (`scripts/serve_latency.sh`, EP=64, `MTP_K=k`), MATH-500 chat
+prompts (no_think, greedy, up to 512 tokens, `scripts/bench_real_prompts.py`):
+20 problems one at a time (c=1) and 40 four at a time (c=4). Random-token
+prompts are almost never accepted, so they do not show MTP's gain.
+
+| config | TPOT c=1 | out tok/s c=1 | TPOT c=4 | out tok/s c=4 |
+| --- | --- | --- | --- | --- |
+| plain, `moe_tkg` | 26.3 ms | 38 | 53.2 ms | 72 |
+| plain, `moe_tkg_hits` | 21.7 ms | 45 | 34.0 ms | 111 |
+| MTP k=4, `moe_tkg` | 20.6 ms | 49 | 16.9 ms | 220 |
+| MTP k=3, `moe_tkg_hits`, limit 4 (default) | 13.6 ms | 70 | 19.1 ms | 198 |
+| **MTP k=3, `moe_tkg_hits`, limit 16 (`serve_latency.sh`)** | **13.8 ms** | **70** | **17.1 ms** | **216** |
+| MTP k=4, `moe_tkg_hits`, limit 20 (`serve_latency.sh`) | 13.8 ms | 70 | 17.0 ms | 218 |
+
+c=1 tok/s for the `moe_tkg` rows is 1000 / TPOT. Acceptance per draft
+position is 85 / 60 / 34 / 16% (2.8 tokens per step at k=3, 2.9 at k=4), the
+same with either MoE kernel. TTFT is 0.18-0.19 s at c=1 and 0.24-0.25 s at
+c=4 (plain: 0.16 / 0.22-0.27 s). MTP k=3 with `moe_tkg_hits` is the
+recommended latency setting: k=4 does not help (its fourth draft is accepted
+16% of the time). Design, correctness checks and the per-step overhead:
+[docs/MTP_DESIGN.md](docs/MTP_DESIGN.md).
+
 ### Comparison with the previous implementation (vllm-neuron 0.24, neuronx-cc 2.27)
 
 The same model code previously ran on vllm-neuron 0.24. Same benchmark, same
@@ -735,7 +767,9 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | Script | Purpose |
 | --- | --- |
 | `scripts/serve.sh` | `vllm serve` with prefix caching (configs B / C / DCP below); `EP=<n>` sets the EP degree |
-| `scripts/serve_latency.sh` | single-request latency config (no prefix caching, prefill buckets 512..16384) |
+| `scripts/serve_latency.sh` | single-request latency config (no prefix caching, prefill buckets 512..16384); `MTP_K=<k>` enables MTP |
+| `scripts/bench_real_prompts.py` | TTFT / TPOT / throughput on MATH-500 chat prompts, plus MTP acceptance from `/metrics` |
+| `scripts/check_mtp.py` | MTP vs plain greedy output (lossless check) and acceptance |
 | `scripts/bench_matrix.sh` | `vllm bench serve` matrix, random dataset, a distinct seed per cell so cells never share prefix-cache entries |
 | `scripts/serve_256k.sh` | long-context config: max_model_len 256000, DCP=8, prefill buckets up to 4096 (with DCP the 8192 bucket fails to compile, `NCC_IGCA037`) |
 | `scripts/bench_fixed.sh` | `vllm bench serve` matrix over the fixed real-text prompts in `bench_data/prompts` (same requests every run) |

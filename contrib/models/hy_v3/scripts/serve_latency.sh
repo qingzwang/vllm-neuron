@@ -4,13 +4,18 @@
 # runs in one prefill step.
 # Env: MODEL (default tencent/Hy3-FP8), EP=<n> sets neuron_config.ep_degree
 #      (default: full EP=64), KV_CAP, PORT, MTP_K (MTP speculative tokens per
-#      step; default off; needs a vllm-neuron with MTP support).
+#      step; default off; needs a vllm-neuron with MTP support),
+#      HY3_DECODE_HITS_MAX_T (with MTP_K default 4 x (MTP_K + 1)).
 set -euo pipefail
 export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.45}
 SPEC_ARGS=()
 if [ -n "${MTP_K:-}" ]; then
     SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP_K}")
+    # A verify step has up to max-num-seqs x (MTP_K + 1) tokens; their routed
+    # experts stay few enough for moe_tkg_hits_batch, which beats moe_tkg there
+    # (concurrency 4, k=3: 17.1 vs 19.1 ms TPOT).
+    export HY3_DECODE_HITS_MAX_T=${HY3_DECODE_HITS_MAX_T:-$((4 * (MTP_K + 1)))}
 fi
 exec vllm serve "${MODEL:-tencent/Hy3-FP8}" "${SPEC_ARGS[@]}" \
     --served-model-name hy3 \

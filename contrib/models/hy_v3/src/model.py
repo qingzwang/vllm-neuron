@@ -475,9 +475,9 @@ class HYV3Attention(nn.Module):
                 scale=self.scaling,
                 tp_q=True,
                 tp_out=True,
+                # The packed FP8 cache is read as is: with unit scales there is
+                # nothing to dequantize (llama3 fuses its K scale into ``scale``).
                 fp8_packed=self.fp8_packed,
-                k_scale=self.kv_unit_scale if self.kv_fp8 else None,
-                v_scale=self.kv_unit_scale if self.kv_fp8 else None,
             )
         else:
             k = k.repeat_interleave(self.num_key_value_groups, dim=0)

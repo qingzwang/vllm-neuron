@@ -252,8 +252,7 @@ class HYV3MTPForCausalLM(nn.Module):
     def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
         if self.layer_name not in kv_caches:
             raise KeyError(f"KV cache for layer {self.layer_name} not initialized")
-        self.layers[0].self_attn.k_cache = kv_caches[self.layer_name][0]
-        self.layers[0].self_attn.v_cache = kv_caches[self.layer_name][1]
+        self.layers[0].self_attn.bind_cache(*kv_caches[self.layer_name][:2])
 
     # ── forward ───────────────────────────────────────────────────────────
 

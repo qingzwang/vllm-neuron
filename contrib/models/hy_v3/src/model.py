@@ -58,12 +58,17 @@ from vllm.model_executor.models.interfaces import SupportsEagle3
 
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
+from vllm_neuron.functional.attention.attention_decode import (
+    _swizzle_packed_k,
+    _unswizzle_packed_k,
+)
 from vllm_neuron.functional.moe.moe_tkg_wrapper import moe_tkg_wrapper
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.parallel.neuron_parallel_state import shard_select
+from vllm_neuron.utils.dtype_utils import FP8_CLAMP_MAX
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import (
     expert_parallel_grouped_loader,
@@ -259,9 +264,15 @@ class HYV3Attention(nn.Module):
         self.q_norm = HYV3RMSNorm(self.head_dim, config.rms_norm_eps, self.dtype)
         self.k_norm = HYV3RMSNorm(self.head_dim, config.rms_norm_eps, self.dtype)
 
-        # KV caches bound externally via bind_kv_cache() (BF16 only).
+        # KV caches bound externally via bind_kv_cache() (``bind_cache``):
+        # BF16, or FP8 with unit scales (``--kv-cache-dtype fp8`` plus
+        # ``neuron_config.fp8_packed_kv``, which the segmented prefill kernel
+        # needs to read an FP8 K cache).
         self.k_cache = None
         self.v_cache = None
+        self.kv_fp8 = False
+        self.fp8_packed = False
+        self.kv_unit_scale = None
 
         self._setup_weight_loaders()
 
@@ -328,6 +339,23 @@ class HYV3Attention(nn.Module):
             hidden_states, position_embeddings, attn_metadata, dcp_rank
         )
 
+    def bind_cache(self, k_cache: torch.Tensor, v_cache: torch.Tensor) -> None:
+        """Bind this layer's KV cache; an FP8 cache needs the packed K layout."""
+        self.k_cache, self.v_cache = k_cache, v_cache
+        self.kv_fp8 = k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        self.fp8_packed = k_cache.dim() == 5
+        if self.kv_fp8 and not self.fp8_packed:
+            raise ValueError(
+                f"{self.layer_name}: an FP8 KV cache needs the packed K layout "
+                "(neuron_config fp8_packed_kv=true): the segmented prefill "
+                "kernel cannot read a plain FP8 K cache."
+            )
+        if self.kv_fp8 and self.dcp_size > 1:
+            raise ValueError(f"{self.layer_name}: FP8 KV cache with DCP is not supported.")
+        self.kv_unit_scale = (
+            torch.ones(1, 1, dtype=torch.bfloat16, device=k_cache.device) if self.kv_fp8 else None
+        )
+
     def _qk_norm(self, t: torch.Tensor, norm: HYV3RMSNorm) -> torch.Tensor:
         tf = t.to(torch.float32)
         tf = tf * torch.rsqrt(tf.pow(2).mean(-1, keepdim=True) + norm.variance_epsilon)
@@ -391,12 +419,23 @@ class HYV3Attention(nn.Module):
             ),
             pos_idx.repeat(nkh),
         )
-        self.k_cache.index_put_(
-            index, k.reshape(-1, self.head_dim).to(self.k_cache.dtype)
-        )
-        self.v_cache.index_put_(
-            index, v.reshape(-1, self.head_dim).to(self.v_cache.dtype)
-        )
+        k_rows = k.reshape(-1, self.head_dim)
+        v_rows = v.reshape(-1, self.head_dim)
+        if self.kv_fp8:
+            # FP8 KV with unit scales (the checkpoint ships no KV scales): K is
+            # QK-normed, and both stay far inside the 240 clamp.
+            k_rows = k_rows.float().clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX)
+            v_rows = v_rows.float().clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX)
+        self.v_cache.index_put_(index, v_rows.to(self.v_cache.dtype))
+        if self.fp8_packed:
+            # The packed K layout [blocks, kv_heads, block // 2, d, 2]
+            # interleaves adjacent positions, so scatter through the unpacked
+            # view and pack back in place (as llama3's segmented path does).
+            k_unpacked = _unswizzle_packed_k(self.k_cache)
+            k_unpacked.index_put_(index, k_rows.to(self.k_cache.dtype))
+            self.k_cache.copy_(_swizzle_packed_k(k_unpacked))
+        else:
+            self.k_cache.index_put_(index, k_rows.to(self.k_cache.dtype))
 
         # Step 4: Attention
         kv_segment_size = meta.get("kv_segment_size")
@@ -436,6 +475,9 @@ class HYV3Attention(nn.Module):
                 scale=self.scaling,
                 tp_q=True,
                 tp_out=True,
+                fp8_packed=self.fp8_packed,
+                k_scale=self.kv_unit_scale if self.kv_fp8 else None,
+                v_scale=self.kv_unit_scale if self.kv_fp8 else None,
             )
         else:
             k = k.repeat_interleave(self.num_key_value_groups, dim=0)
@@ -572,8 +614,9 @@ class HYV3Attention(nn.Module):
             input_dequant_scale_out=self.o_input_scale,
             transposed_out=False,
             out_in_sb=False,
-            k_scale=None,
-            v_scale=None,
+            fp8_packed=self.fp8_packed,
+            k_scale=self.kv_unit_scale if self.kv_fp8 else None,
+            v_scale=self.kv_unit_scale if self.kv_fp8 else None,
             dcp_size=self.dcp_size,
             dcp_group=self.dcp_group,
             dcp_active_owner=dcp_active_mask,
@@ -1669,8 +1712,7 @@ class HYV3ForCausalLM(nn.Module, SupportsEagle3):
             name = f"layers.{i}.self_attn"
             if name not in kv_caches:
                 raise KeyError(f"KV cache for layer {name} not initialized")
-            layer.self_attn.k_cache = kv_caches[name][0]
-            layer.self_attn.v_cache = kv_caches[name][1]
+            layer.self_attn.bind_cache(kv_caches[name][0], kv_caches[name][1])
 
     # ── Weight loading ────────────────────────────────────────────────────
 

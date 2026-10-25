@@ -631,6 +631,45 @@ step itself. (A disaggregated decode node counts that re-compute into the
 decode batch instead, see `_should_skip_prefilling_padding_in_di` in
 `vllm_neuron/vllm/core/scheduler.py`.)
 
+**The same split with MTP (no DCP).** MTP does not run with DCP, so
+`scripts/serve_85k.sh` serves the same prompts without DCP: max_model_len
+86016, max_num_seqs 4, the same prefill buckets. The KV holds 376k tokens
+(349k with MTP, `KV_CAP` 0.65 / 0.61), so 4 requests run at once (concurrency
+8 queues 4) and the 80 suffixes no longer fit next to the prefix: the replay
+pass 2 hits 92.3%, not 100%, and repeats pass 1. Same `bench_pd_split.sh "1 4 8"`
+runs (`results/bench/pd_split_85k_nodcp/`, `results/bench/pd_split_85k_nodcp_mtp3/`,
+`MTP_K=3`); DCP=8 rows are pass 1 above (same 91% hit rate):
+
+| | DCP=8 | no DCP | no DCP + MTP k=3 |
+|---|---|---|---|
+| P: TTFT P50, c=1 / 4 / 8 (s) | 2.55 / 9.39 / 18.74 | 2.11 / 7.57 / 15.11 | 2.14 / 7.68 / 15.31 |
+| P: requests/s | 0.43 | 0.53 | 0.53 |
+| D c=1: TTFT P50 / TPOT P50 / ITL P50 | 2.60 s / 32.0 / 32.1 ms | 2.16 s / 35.2 / 35.4 ms | 2.18 s / **23.9** / 48.2 ms |
+| D c=1: output tok/s | 23.9 | 23.0 | **30.7** |
+| D c=4: TTFT P50 / TPOT P50 / ITL P50 | 5.25 s / 59.1 / 45.3 ms | 4.35 s / 72.5 / 61.4 ms | 2.38 s / **58.9** / 73.3 ms |
+| D c=4: output tok/s | 48.5 | 43.7 | **57.9** |
+| D c=8: TTFT P50 / TPOT P50 / ITL P50 | 9.91 s / 85.7 / 53.6 ms | 27.27 s / 72.5 / 61.5 ms | 19.40 s / 60.4 / 73.4 ms |
+| D c=8: output tok/s | **63.1** | 44.0 | 58.7 |
+
+MTP acceptance at temperature 0.9 on these ShareGPT texts is 60 / 29 / 14%
+per draft position (33% of drafts, 2.0 tokens per step; MATH-500 greedy:
+2.8). With MTP a streamed chunk is one step of 1-4 tokens, so ITL is the
+step time and TPOT the per-token time.
+
+- Prefill without DCP is 20% faster (0.53 vs 0.43 requests/s); MTP adds
+  nothing measurable to it.
+- Decode without DCP reads the full 85k KV on every rank, so its step is
+  slower than with DCP at this length (35.4 vs 32.1 ms at c=1, 61 vs 45 ms at
+  c=4), the reverse of short contexts.
+- MTP k=3 makes up for it: TPOT -32% at c=1 (-25% against DCP=8) and -19% at
+  c=4 (equal to DCP=8). Requests finish sooner, so queued prefills start
+  sooner and TTFT drops too (c=4: 4.35 -> 2.38 s).
+- At c=8 DCP=8 still wins on throughput: it runs 8 requests at once against
+  4 here.
+- `KV_CAP` 0.65 with MTP runs out of HBM at 4 concurrent requests
+  (`nrt_tensor_allocate status=4`); 0.60 fits only 3.99 requests (3 at once).
+  `serve_85k.sh` defaults to 0.61 with `MTP_K`.
+
 ### MTP speculative decoding
 
 Latency config (`scripts/serve_latency.sh`, EP=64, `MTP_K=k`), MATH-500 chat
@@ -775,7 +814,8 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/bench_fixed.sh` | `vllm bench serve` matrix over the fixed real-text prompts in `bench_data/prompts` (same requests every run) |
 | `scripts/gen_bench_prompts.py` | generates `bench_data/prompts`: sglang-style ShareGPT text cut / repeated to an exact token count |
 | `scripts/bench_prefix_fixed.sh` | prefix-cache benchmark over `bench_data/prefix` (85k input, 92% shared prefix): warm-up request, one `cache_salt` per run, hit rate from `/metrics` |
-| `scripts/bench_pd_split.sh` | prefill-only (output 1) and decode-only (replay twice) split over `bench_data/prefix`, with per-cell `cache_salt` and hit rates |
+| `scripts/bench_pd_split.sh` | prefill-only (output 1) and decode-only (replay twice) split over `bench_data/prefix`, with per-cell `cache_salt`, hit rates and MTP acceptance |
+| `scripts/serve_85k.sh` | 85k-context config without DCP (max_model_len 86016, 4 requests at once), for MTP on `bench_data/prefix` |
 | `scripts/gen_prefix_prompts.py` | generates `bench_data/prefix`: real-text shared prefix + distinct suffixes, exact token counts |
 | `scripts/needle.py` | passkey retrieval at 16k-85k (`gen` writes `bench_data/needle.jsonl.gz`, `run` checks a server) |
 | `scripts/bench_sharegpt.sh` | `vllm bench serve` on ShareGPT (vLLM keeps prompts <= 1024 tokens only) |

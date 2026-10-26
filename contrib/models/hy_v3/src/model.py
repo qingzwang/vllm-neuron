@@ -58,10 +58,6 @@ from vllm.model_executor.models.interfaces import SupportsEagle3
 
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
-from vllm_neuron.functional.attention.attention_decode import (
-    _swizzle_packed_k,
-    _unswizzle_packed_k,
-)
 from vllm_neuron.functional.moe.moe_tkg_wrapper import moe_tkg_wrapper
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
 from vllm_neuron.model.neuron_config import NeuronConfig
@@ -428,12 +424,13 @@ class HYV3Attention(nn.Module):
             v_rows = v_rows.float().clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX)
         self.v_cache.index_put_(index, v_rows.to(self.v_cache.dtype))
         if self.fp8_packed:
-            # The packed K layout [blocks, kv_heads, block // 2, d, 2]
-            # interleaves adjacent positions, so scatter through the unpacked
-            # view and pack back in place (as llama3's segmented path does).
-            k_unpacked = _unswizzle_packed_k(self.k_cache)
-            k_unpacked.index_put_(index, k_rows.to(self.k_cache.dtype))
-            self.k_cache.copy_(_swizzle_packed_k(k_unpacked))
+            # The packed K layout [blocks, kv_heads, block // 2, d, 2] keeps
+            # position p of a block at [p // 2, :, p % 2]: scatter the rows
+            # straight there. (Unswizzling the whole cache, writing and
+            # swizzling it back, as llama3's fallback does, moves every layer's
+            # full K cache on each prefill step.)
+            blk, head, pos = index
+            self.k_cache[blk, head, pos // 2, :, pos % 2] = k_rows.to(self.k_cache.dtype)
         else:
             self.k_cache.index_put_(index, k_rows.to(self.k_cache.dtype))
 

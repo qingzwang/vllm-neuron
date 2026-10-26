@@ -61,7 +61,9 @@ tencent/Hy3-FP8: ~295B-parameter MoE decoder with a static per-tensor FP8 checkp
   On vllm-neuron 0.24 the CTE MLP kernel gave wrong results otherwise; on
   0.29 the unpadded shape is correct too, the padding is kept as the
   validated path.
-- KV cache is BF16 only (the checkpoint has no KV scales).
+- KV cache: BF16, or FP8 e4m3 with unit scales (the checkpoint has no KV
+  scales) in the packed K layout (`--kv-cache-dtype fp8` +
+  `neuron_config.fp8_packed_kv`; `KV_DTYPE=fp8` for `scripts/serve.sh`).
 
 ## Feature Status
 
@@ -73,7 +75,7 @@ tencent/Hy3-FP8: ~295B-parameter MoE decoder with a static per-tensor FP8 checkp
 | DCP (decode context parallel) | ✅ | `--decode-context-parallel-size 8 --cp-kv-cache-interleave-size <block_size>`; 8x KV capacity at TP=64. On 0.29 validated on the 4-layer model (cos >= 0.9988 incl. prefix-cache hits); full-model performance only measured on 0.24 |
 | DP / attention DP / MLP DP | ❌ | rejected at startup |
 | MTP spec decode    | ✅ | `model_mtp.py` (draft `HYV3MTPModel`); needs the vllm-neuron MTP proposer; not with DCP. Eagle3 is not supported |
-| FP8 KV cache       | ❌ | |
+| FP8 KV cache       | ✅ | e4m3, unit scales, packed K; not with DCP. See README "8K in / 1K out at high concurrency" |
 | On-device sampling | ✅ | |
 | Prefix caching (segmented prefill) | ✅ | several prefill buckets can share one `kv_segment_size` |
 

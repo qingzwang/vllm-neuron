@@ -13,6 +13,9 @@
 #                    vllm-neuron with MTP support)
 #   PORT             API port (default: 8000)
 #   EP               neuron_config.ep_degree (default: full EP=64)
+#   KV_DTYPE         bf16 (default) or fp8: an e4m3 KV cache with unit scales in
+#                    the packed K layout (--kv-cache-dtype fp8 plus
+#                    neuron_config fp8_packed_kv), twice the tokens per byte
 #
 # Configs used in the README:
 #   (max_model_len is always an implicit decode context bucket)
@@ -29,10 +32,14 @@ export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.45}
 # Needed on instances without EFA devices.
 export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
 SPEC_ARGS=()
+KV_ARGS=(); KV_CFG=""
+if [ "${KV_DTYPE:-bf16}" = fp8 ]; then
+    KV_ARGS=(--kv-cache-dtype fp8); KV_CFG='"fp8_packed_kv": true,'
+fi
 if [ -n "${MTP_K:-}" ]; then
     SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP_K}")
 fi
-exec vllm serve "${MODEL:-tencent/Hy3-FP8}" "${SPEC_ARGS[@]}" \
+exec vllm serve "${MODEL:-tencent/Hy3-FP8}" ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} ${KV_ARGS[@]+"${KV_ARGS[@]}"} \
     --served-model-name hy3 \
     --tensor-parallel-size 64 \
     --enable-expert-parallel \
@@ -44,7 +51,7 @@ exec vllm serve "${MODEL:-tencent/Hy3-FP8}" "${SPEC_ARGS[@]}" \
     --decode-context-parallel-size "${DCP:-1}" \
     --cp-kv-cache-interleave-size 32 \
     --port "${PORT:-8000}" \
-    --additional-config "{\"neuron_config\": {${EP:+\"ep_degree\": $EP,}
+    --additional-config "{\"neuron_config\": {${EP:+\"ep_degree\": $EP,} $KV_CFG
         \"num_batched_tokens_buckets\": $PREFILL_BUCKETS,
         \"kv_segment_size_buckets\": ${KV_SEGMENTS:-[2048]},
         \"num_seqs_buckets\": $3,

@@ -75,10 +75,10 @@ class HYV3ForCausalLM(nn.Module):
         tp = parallel.tensor_parallel_size
 
         cache_dtype = vllm_config.cache_config.cache_dtype
-        if cache_dtype not in ("auto", "bfloat16"):
+        if cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
             raise ValueError(
-                f"Hy3 supports only a BF16 KV cache (the checkpoint has no KV "
-                f"scales); got kv_cache_dtype={cache_dtype!r}."
+                f"Hy3 supports a BF16 or an FP8 (e4m3, unit scales) KV cache; "
+                f"got kv_cache_dtype={cache_dtype!r}."
             )
         if parallel.data_parallel_size != 1:
             raise ValueError("Hy3 does not support data parallelism yet.")

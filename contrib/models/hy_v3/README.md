@@ -99,8 +99,14 @@ print(outputs[0].outputs[0].text)
   whatever the request's real length (vllm-neuron 0.21+ makes this opt-in;
   the NxDI-based 0.2.x bucketed decode by sequence length by default). The
   configs below all set it.
-- Not supported: data parallel / attention DP, FP8 KV cache (the checkpoint
-  has no KV scales), MTP together with DCP. They are rejected at startup.
+- Keep every decode context bucket (and `max_model_len`, the implicit last
+  one) a multiple of 256 whose quotient by 256 shares a large factor with 32,
+  e.g. 8192, 10240, 12288, 16384. The decode kernel resizes the cache block to
+  `gcd(32, bucket / 256)`; 8448 or 9472 give block length 1, one DMA per KV
+  row, which cost up to 33% TPOT at 8K context (see "8K in / 1K out at high
+  concurrency"). The kernel prints "reducing block length by ...x" per bucket.
+- Not supported: data parallel / attention DP, MTP together with DCP, an FP8
+  KV cache together with DCP. They are rejected at startup.
 - MTP speculative decoding (`--speculative-config '{"method": "mtp",
   "num_speculative_tokens": 3}'`, `MTP_K=3` for the serve scripts) uses the
   checkpoint's MTP layer as the draft. It needs a vllm-neuron with the MTP
@@ -372,6 +378,44 @@ c=4 (plain: 0.16 / 0.22-0.27 s). MTP k=3 with `moe_tkg_hits` is the
 recommended latency setting: k=4 does not help (its fourth draft is accepted
 16% of the time). Design, correctness checks and the per-step overhead:
 [docs/MTP_DESIGN.md](docs/MTP_DESIGN.md).
+
+### 8K in / 1K out at high concurrency: aligned decode buckets and an FP8 KV cache
+
+`contrib/benchmark/bench_matrix.sh` (vllm-project/vllm-neuron#75): 8192 input tokens of ShareGPT text (+/-3%), exactly 1024 output tokens, 10 x concurrency requests, MTP k=3, `moe_tkg_hits` up to 128 tokens, 2048-token prefill chunks, BF16 unless noted (`results/bench/sharegpt8k_*`).
+
+**Align the decode context buckets.** The decode kernel resizes the cache block length to `gcd(block_size, bucket / (128 * lnc))` so that the blocks per request divide evenly across partitions (`resize_cache_block_len_for_attention_tkg_kernel`). With `block_size` 32 at lnc 2, the 8448 / 9472 buckets resize it to 1 ("Token-gen bucket length of 9472: reducing block length by 32x"), and every KV row is then its own DMA. 8192 keeps 32 and 10240 gives 8. `serve.sh 10240 32 ... '[8192]'` instead of `9472 ... '[8448]'`:
+
+| concurrency | TPOT 8448 / 9472 | TPOT 8192 / 10240 | total tok/s before -> after |
+|---|---|---|---|
+| 1 | 17.0 ms | 17.7 ms | 477 -> 468 |
+| 4 | 29.9 ms | 25.1 ms | 1087 -> 1328 |
+| 8 | 44.3 ms | 32.4 ms | 1499 -> 2040 |
+| 16 | 76.0 ms | 50.7 ms | 1769 -> 2668 |
+| KV limit (27 -> 25) | 102.8 ms | 72.9 ms | 2235 -> 2901 |
+
+Much of the near-linear growth of TPOT with concurrency was this: the KV read per step grows with the batch, and at block length 1 it is DMA-descriptor bound. Pick buckets whose `bucket / 256` shares a large factor with 32 (8192, 12288, 16384 keep 32 or 16).
+
+**FP8 KV cache** (`KV_DTYPE=fp8`): e4m3 with unit scales (the checkpoint has none; K is QK-normed), the packed K layout the decode and segmented kernels read, written in prefill with `scatter_packed_k`. On the 4-layer checkpoint, against the BF16 cache with the same prompts (5000 and 1100 tokens of text, 32 greedy tokens), every step's logits have cosine >= 0.9988 and KL ~0.001; the one greedy split is at a 0.06 near-tie. A 5.8k-token needle is answered on the full model. Same aligned buckets, `max_num_seqs` 48:
+
+| concurrency | TTFT | TPOT (BF16) | ITL (BF16) | total tok/s (BF16) |
+|---|---|---|---|---|
+| 1 | 1.11 s | 22.0 ms (17.7) | 47.2 ms (40.2) | 394 (468) |
+| 4 | 1.50 s | 23.7 ms (25.1) | 46.1 ms (48.2) | 1350 (1328) |
+| 8 | 1.51 s | 30.9 ms (32.4) | 52.6 ms (55.9) | 2122 (2040) |
+| 16 | 1.54 s | 47.5 ms (50.7) | 65.8 ms (73.5) | 2837 (2668) |
+| 32 | 1.60 s | 78.6 ms | 94.9 ms | 3442 |
+| 48 | 1.66 s | 106.9 ms | 112.3 ms | **3818** (2901 at the BF16 limit, 25) |
+
+- The KV cache holds twice the requests (48+ against 25 at 10240), so the best throughput is 32% higher.
+- From concurrency 4 up the decode step is shorter (half the KV bytes).
+- At concurrency 1 the step is ~7 ms longer, presumably the in-kernel FP8 handling across 80 layers. For single-request latency keep BF16.
+- The first FP8 prefill write unswizzled, wrote and reswizzled each layer's whole K cache; a per-lane `k[.., p // 2, :, p % 2]` write was worse (stride-2 byte scatter). Both doubled TTFT. `scatter_packed_k` writes whole token pairs and brings TTFT back to BF16's.
+
+**Other findings at this shape**
+- **MTP k=2 vs k=3** (same aligned BF16 config): equal at concurrency 16 (49.9 / 50.7 ms) and worse at 25 (76.8 / 72.9 ms). k=3 stays the setting.
+- **TTFT** median stays at 1.1-1.7 s at every concurrency (prefill is chunked and scheduled first). P99 TTFT grows with concurrency because the benchmark starts all C requests at once and the scheduler runs one prefill per step: the last of the first wave waits for C prefills (~1.1 s each).
+- **TPOT minus ITL** is the decode time lost to other requests' prefill steps (prefill and decode never share a step on Neuron); here it is a few ms per output token.
+- **Short context, same buckets:** ISL 128 measures the same ITL as ISL 8192 (40.5 / 41.4 ms at concurrency 1, 58.2 / 60.5 ms at 4). The decode step's attention cost follows the context bucket, not the actual context.
 
 ### Comparison with the previous implementation (vllm-neuron 0.24, neuronx-cc 2.27)
 

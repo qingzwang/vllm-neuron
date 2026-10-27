@@ -670,6 +670,43 @@ step time and TPOT the per-token time.
   (`nrt_tensor_allocate status=4`); 0.60 fits only 3.99 requests (3 at once).
   `serve_85k.sh` defaults to 0.61 with `MTP_K`.
 
+**The same split with an FP8 KV cache (no DCP).** `KV_DTYPE=fp8
+HY3_KV_SCALE_PROFILE=kv_profiles/Hy3-FP8_mtp_neuron.safetensors scripts/serve_85k.sh`
+(with and without `MTP_K=3`): FP8 halves the KV bytes, so the same `KV_CAP`
+(0.60 / 0.61 with MTP) holds 695k / 697k tokens, 8 requests at once
+(max_num_seqs 8), and all 80 suffixes stay cached: the replay pass 2 hits
+99.9-100%, as with DCP=8. Decode context buckets are only 32768 (+ 86016):
+with 8192 / 32768 / 65536 the batch-8 decode NEFFs did not fit next to the KV
+(`Allocation Failure` at batch 8, context 65536; the NEFF code is ~2.2 GiB per
+core with one bucket). Decode only (pass 2, ~100% hit), same 80 requests
+(`results/bench/pd_split_85k_nodcp_fp8kv{,_mtp3}/`):
+
+| | DCP=8 (BF16 KV) | no DCP, FP8 KV | no DCP, FP8 KV + MTP k=3 |
+|---|---|---|---|
+| c=1: TPOT / ITL P50 | 31.9 / 32.1 ms | 33.8 / 34.0 ms | **23.4** / 47.4 ms |
+| c=1: output tok/s | 28.9 | 27.3 | **37.9** |
+| c=4: TPOT / ITL P50 | 48.2 / 45.3 ms | 59.6 / 56.8 ms | **39.2** / 66.6 ms |
+| c=4: output tok/s | 75.0 | 61.5 | **92.0** |
+| c=8: TPOT / ITL P50 | 60.0 / 53.6 ms | 75.4 / 68.8 ms | **51.0** / 76.7 ms |
+| c=8: output tok/s | 116.4 | 94.9 | **138.3** |
+| c=8: TTFT P50 | 2.31 s | 2.40 s | 0.95 s |
+| prefill-only, requests/s | 0.43 | 0.53 | 0.52 |
+
+- FP8 KV + MTP k=3 without DCP beats DCP=8 at every concurrency: TPOT -27% /
+  -19% / -15% and output throughput +31% / +23% / +19% at c=1 / 4 / 8, with 20%
+  more prefill throughput. (DCP=8 with FP8 KV is within 3% of BF16 KV, see
+  "FP8 KV cache" above, so the DCP=8 column stands for both.)
+- FP8 KV alone makes the no-DCP step 4-8% cheaper (ITL 35.4 -> 34.0 ms at c=1,
+  61.4 -> 56.8 ms at c=4) and doubles the requests that run at once; MTP then
+  gives 2.0 tokens per step (temperature 0.9) for a step 40% / 17% / 11% longer
+  at c=1 / 4 / 8, i.e. TPOT -31% / -34% / -32% over FP8 KV alone.
+- The step itself is still cheapest with DCP=8 (each rank reads 1/8 of the
+  history): MTP together with DCP would combine both, see the MTP limitations.
+- MTP with FP8 KV needs scales for the MTP layer (`model.layers.80`):
+  `kv_profiles/Hy3-FP8_mtp_neuron.safetensors` is the shipped profile plus that
+  layer (`calibrate_kv_scales_neuron.py calibrate --mtp`); the MTP acceptance
+  is the same as with BF16 KV (60% of drafts on MATH-500, 33% here).
+
 ### MTP speculative decoding
 
 Latency config (`scripts/serve_latency.sh`, EP=64, `MTP_K=k`), MATH-500 chat
@@ -685,13 +722,17 @@ prompts are almost never accepted, so they do not show MTP's gain.
 | MTP k=3, `moe_tkg_hits`, limit 4 (default) | 13.6 ms | 70 | 19.1 ms | 198 |
 | **MTP k=3, `moe_tkg_hits`, limit 16 (`serve_latency.sh`)** | **13.8 ms** | **70** | **17.1 ms** | **216** |
 | MTP k=4, `moe_tkg_hits`, limit 20 (`serve_latency.sh`) | 13.8 ms | 70 | 17.0 ms | 218 |
+| MTP k=3, `moe_tkg_hits`, limit 16, FP8 KV (`KV_DTYPE=fp8`) | 13.8 ms | 69 | 17.2 ms | 217 |
 
 c=1 tok/s for the `moe_tkg` rows is 1000 / TPOT. Acceptance per draft
 position is 85 / 60 / 34 / 16% (2.8 tokens per step at k=3, 2.9 at k=4), the
 same with either MoE kernel. TTFT is 0.18-0.19 s at c=1 and 0.24-0.25 s at
 c=4 (plain: 0.16 / 0.22-0.27 s). MTP k=3 with `moe_tkg_hits` is the
 recommended latency setting: k=4 does not help (its fourth draft is accepted
-16% of the time). Design, correctness checks and the per-step overhead:
+16% of the time). An FP8 KV cache (with the MTP-layer profile,
+`kv_profiles/Hy3-FP8_mtp_neuron.safetensors`) changes nothing at these short
+contexts (acceptance 60% of drafts either way); it pays at long context (see
+"The same split with an FP8 KV cache" above). Design, correctness checks and the per-step overhead:
 [docs/MTP_DESIGN.md](docs/MTP_DESIGN.md).
 
 ### Comparison with the previous implementation (vllm-neuron 0.24, neuronx-cc 2.27)
@@ -808,7 +849,8 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/serve.sh` | `vllm serve` with prefix caching (configs B / C / DCP below); `EP=<n>` sets the EP degree |
 | `scripts/serve_latency.sh` | single-request latency config (no prefix caching, prefill buckets 512..16384); `MTP_K=<k>` enables MTP |
 | `scripts/bench_real_prompts.py` | TTFT / TPOT / throughput on MATH-500 chat prompts, plus MTP acceptance from `/metrics` |
-| `scripts/check_mtp.py` | MTP vs plain greedy output (lossless check) and acceptance |
+| `scripts/check_mtp.py` | MTP vs plain greedy output (lossless check) and acceptance; `KV_DTYPE=fp8`, `PREFIX_CACHING=1`, `DUMP_IDS` |
+| `scripts/check_mtp_gaps.py` | HF FP32 log-probs at the first token where the plain and MTP runs differ (near-tie or defect) |
 | `scripts/bench_matrix.sh` | `vllm bench serve` matrix, random dataset, a distinct seed per cell so cells never share prefix-cache entries |
 | `scripts/serve_256k.sh` | long-context config: max_model_len 256000, DCP=8, prefill buckets up to 4096 (with DCP the 8192 bucket fails to compile, `NCC_IGCA037`) |
 | `scripts/bench_fixed.sh` | `vllm bench serve` matrix over the fixed real-text prompts in `bench_data/prompts` (same requests every run) |

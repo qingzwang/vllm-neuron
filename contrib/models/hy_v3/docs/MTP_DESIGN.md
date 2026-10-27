@@ -224,6 +224,27 @@ position with hits: 85 / 60 / 35% at k=3 (2.80 tokens per step), 85 / 59 /
 - k=4 gives nothing over k=3 with hits; k=3 is the recommended setting.
 - The precompile guard filter changes nothing measurable.
 
+#### Long context and FP8 KV (2026-10-27)
+
+85k-token prompts with a 92% shared prefix (`bench_data/prefix`,
+`scripts/bench_pd_split.sh`, temperature 0.9): MTP does not run with DCP
+(platform gate; upstream vLLM has the same gap, vllm#50391), so MTP runs
+without DCP (`scripts/serve_85k.sh`). With BF16 KV that config holds only 4
+requests at once; with an FP8 KV cache 8, and decode-only TPOT at c=1 / 4 / 8
+is 23.4 / 39.2 / 51.0 ms against 31.9 / 48.2 / 60.0 ms for DCP=8 without MTP
+(full table in the README, "The same split with an FP8 KV cache"). MTP gets
+2.0 tokens per step there (60 / 29 / 14% per position), against 2.8 on
+MATH-500 greedy.
+
+FP8 KV for the draft: the MTP layer is `model.layers.80`, which the 80-layer
+calibrated profile lacks. `model_mtp.py` reads entry 80 of the same profile
+(and refuses one without it); `calibrate_kv_scales_neuron.py calibrate --mtp`
+measures it with MTP on and copies layers 0-79 from the base profile, so the
+target's scales (decode compile-time constants) do not change. On the 4-layer
+MTP model, FP8 KV + MTP differs from plain decoding only at near-ties, as BF16
+KV + MTP does (first differing token, HF FP32 log-probs of the two choices
+0.10-0.21 nats apart; identical with prefix caching on).
+
 ### Outlook
 
 - With the per-step overhead removed (step ~= 29 ms device time), k=1 at 87%
@@ -235,3 +256,7 @@ position with hits: 85 / 60 / 35% at k=3 (2.80 tokens per step), 85 / 59 /
 - The hits batch limit is tuned for plain decode. A per-request limit for
   verify steps, or a limit measured at larger batches with MTP, is left open;
   `scripts/serve.sh` (config B, up to 32 requests) keeps the default.
+- Long context: MTP together with DCP (per-token ownership and a causal
+  per-token mask in the DCP decode path; the NKI CP decode kernel already takes
+  up to 8 tokens per request) would combine DCP's cheaper step with MTP's
+  tokens per step.

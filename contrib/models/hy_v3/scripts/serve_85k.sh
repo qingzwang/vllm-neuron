@@ -10,15 +10,24 @@
 # out at 4 concurrent requests (nrt_tensor_allocate), 0.60 holds only 3.99
 # requests, so the MTP default is 0.61 (349k tokens, 4.05x). KV_CAP 0.85
 # leaves too little HBM for the decode NEFFs to load.
-# Env: MODEL, PORT, MTP_K, KV_CAP (default 0.65, with MTP_K 0.61) as for serve.sh; with MTP_K,
+# KV_DTYPE=fp8 (FP8 KV, needs HY3_KV_SCALE_PROFILE; with MTP a profile with
+# the MTP layer, kv_profiles/Hy3-FP8_mtp_neuron.safetensors) halves the KV
+# bytes per token, so 8 requests run at once: max_num_seqs 8, buckets
+# [1, 4, 8], KV_CAP 0.60 (0.61 with MTP), about 8.1x, and only the 32768
+# decode context bucket below 86016: with all three, the batch-8 decode NEFFs
+# do not fit next to the KV (Allocation Failure at batch 8, 65536).
+# Env: MODEL, PORT, MTP_K, KV_DTYPE, KV_CAP as for serve.sh; with MTP_K,
 #      HY3_DECODE_HITS_MAX_T defaults to 4 x (MTP_K + 1) (4-request verify steps).
 # Benchmark: bench_pd_split.sh "1 4 8".
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-DEFAULT_KV_CAP=0.65
+DEFAULT_KV_CAP=0.65 SEQS=4 SEQ_BUCKETS='[1, 4]' CTX_BUCKETS='[8192, 32768, 65536]'
+if [ "${KV_DTYPE:-auto}" = fp8 ]; then
+    DEFAULT_KV_CAP=0.60 SEQS=8 SEQ_BUCKETS='[1, 4, 8]' CTX_BUCKETS='[32768]'
+fi
 if [ -n "${MTP_K:-}" ]; then
     export HY3_DECODE_HITS_MAX_T=${HY3_DECODE_HITS_MAX_T:-$((4 * (MTP_K + 1)))}
     DEFAULT_KV_CAP=0.61
 fi
 KV_CAP=${KV_CAP:-$DEFAULT_KV_CAP} PREFILL_BUCKETS='[512, 1024, 2048, 4096]' \
-    exec "$HERE/serve.sh" 86016 4 '[1, 4]' '[8192, 32768, 65536]'
+    exec "$HERE/serve.sh" 86016 $SEQS "$SEQ_BUCKETS" "$CTX_BUCKETS"

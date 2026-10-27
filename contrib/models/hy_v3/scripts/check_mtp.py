@@ -7,10 +7,15 @@ layer was trained on the full model's hidden states; the token comparison is
 the check there.
 
 Usage: python check_mtp.py <ckpt> <num_speculative_tokens> [max_tokens=64] [mode=both|mtp|plain]
+Env: KV_DTYPE=fp8 for an FP8 KV cache (packed K; needs HY3_KV_SCALE_PROFILE
+with the MTP layer), PREFIX_CACHING=1 for prefix caching (segmented prefill),
+DUMP_IDS=<file.json> to save both runs' token ids for check_mtp_gaps.py, which
+tells near-tie flips from real divergence with an HF reference.
 Needs a vllm-neuron with MTP support (vllm_neuron/vllm/spec_decode/mtp.py) and
 the contrib package (pip install -e contrib/models/hy_v3).
 """
 
+import os
 import sys
 import time
 
@@ -19,6 +24,8 @@ from vllm import LLM, SamplingParams
 ckpt, k = sys.argv[1], int(sys.argv[2])
 max_tokens = int(sys.argv[3]) if len(sys.argv) > 3 else 64
 mode = sys.argv[4] if len(sys.argv) > 4 else "both"
+fp8_kv = os.environ.get("KV_DTYPE") == "fp8"
+prefix = os.environ.get("PREFIX_CACHING") == "1"
 
 PROMPTS = [
     "The capital of France is",
@@ -37,7 +44,8 @@ def run(spec: bool):
         max_num_seqs=len(PROMPTS),
         max_num_batched_tokens=2048,
         block_size=32,
-        enable_prefix_caching=False,
+        enable_prefix_caching=prefix,
+        kv_cache_dtype="fp8" if fp8_kv else "auto",
         disable_log_stats=False,
         speculative_config=(
             {"method": "mtp", "num_speculative_tokens": k} if spec else None
@@ -46,6 +54,8 @@ def run(spec: bool):
             "neuron_config": {
                 "num_batched_tokens_buckets": [2048],
                 "num_seqs_buckets": [1, len(PROMPTS)],
+                **({"kv_segment_size_buckets": [2048]} if prefix else {}),
+                **({"fp8_packed_kv": True} if fp8_kv else {}),
             }
         },
     )
@@ -78,6 +88,11 @@ for name, (_, dt, stats) in results.items():
         rate = accepted / drafts if drafts else 0.0
         line += f"; draft tokens {drafts}, accepted {accepted} ({rate:.1%}), per position {per_pos}"
     print(line)
+if os.environ.get("DUMP_IDS"):  # token ids of each run, for an offline reference check
+    import json
+
+    with open(os.environ["DUMP_IDS"], "w") as f:
+        json.dump({"prompts": PROMPTS, **{k: v[0] for k, v in results.items()}}, f)
 if len(results) == 2:
     for i, (x, y) in enumerate(zip(results["plain"][0], results["mtp"][0])):
         same = next((j for j, (u, v) in enumerate(zip(x, y)) if u != v), len(x))

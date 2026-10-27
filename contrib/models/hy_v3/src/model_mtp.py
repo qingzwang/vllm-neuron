@@ -27,6 +27,7 @@ drafts [bs, k], logits)``.
 
 import dataclasses
 import logging
+import os
 
 import torch
 from torch import nn
@@ -40,13 +41,16 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.parallel.neuron_parallel_state import shard_select
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+from vllm_neuron.utils.dtype_utils import FP8_CLAMP_MAX, QUANTIZED_KV_CACHE_DTYPES
 from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
 
+from . import kv_scales
 from .config import HYV3Config
 from .model import (
     HYV3DecoderLayer,
     HYV3RMSNorm,
     HYV3RotaryEmbedding,
+    bind_attention_kv,
     decoder_layer_weight_mappings,
 )
 
@@ -226,11 +230,47 @@ class HYV3MTPForCausalLM(nn.Module):
         for name, param in self.named_parameters():
             if param.is_meta:
                 raise RuntimeError(f"MTP parameter {name} was not loaded")
+        self._load_kv_cache_scales(checkpoint_path, device)
 
     def load_weights_lite(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None = None
     ) -> None:
-        """CPU compile: no scale-derived compile-time constants to load."""
+        """CPU compile: only the KV scales (decode uses them as graph constants)."""
+        self._load_kv_cache_scales(checkpoint_path, device)
+
+    def _load_kv_cache_scales(self, checkpoint_path: str, device) -> None:
+        """<-- FP8 KV: the MTP layer's K/V scales, entry ``start_layer_idx`` (80)
+        of the same profile / checkpoint scales as the target's 80 layers.
+
+        A profile calibrated without the MTP layer has 80 entries and is
+        rejected here: calibrate one with ``calibrate_kv_scales_neuron.py
+        calibrate --mtp``. (The draft's scales only affect acceptance; the
+        output is verified by the target.)
+        """
+        from vllm.config import get_current_vllm_config
+
+        cache_dtype = get_current_vllm_config().cache_config.cache_dtype
+        if cache_dtype not in QUANTIZED_KV_CACHE_DTYPES:
+            return
+        if not os.path.isdir(checkpoint_path):
+            raise ValueError(
+                "Hy3 FP8 KV reads its KV scales from a local checkpoint directory; "
+                f"got {checkpoint_path!r}"
+            )
+        i = self.start_layer_idx
+        try:
+            s = kv_scales.resolve_kv_scales(checkpoint_path, i + 1, FP8_CLAMP_MAX)
+        except (KeyError, ValueError) as e:
+            raise ValueError(
+                f"Hy3 MTP with an FP8 KV cache needs KV scales for the MTP layer "
+                f"(model.layers.{i}): {e}. Calibrate a profile that includes it with "
+                "scripts/calibrate_kv_scales_neuron.py calibrate --mtp."
+            ) from e
+        self.layers[0].self_attn.set_kv_scales(s.q_k[i], s.q_v[i], device)
+        (logger.warning if s.source == "default" else logger.info)(
+            "Hy3 MTP FP8 KV scales: source=%s layer=%d %s q_k=%.4g q_v=%.4g",
+            s.source, i, s.detail, s.q_k[i], s.q_v[i],
+        )
 
     # ── KV cache ──────────────────────────────────────────────────────────
 
@@ -252,8 +292,8 @@ class HYV3MTPForCausalLM(nn.Module):
     def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
         if self.layer_name not in kv_caches:
             raise KeyError(f"KV cache for layer {self.layer_name} not initialized")
-        self.layers[0].self_attn.k_cache = kv_caches[self.layer_name][0]
-        self.layers[0].self_attn.v_cache = kv_caches[self.layer_name][1]
+        k_cache, v_cache = kv_caches[self.layer_name]
+        bind_attention_kv(self.layers[0].self_attn, self.layer_name, k_cache, v_cache)
 
     # ── forward ───────────────────────────────────────────────────────────
 

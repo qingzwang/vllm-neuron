@@ -146,6 +146,29 @@ def _is_fp8_kv(cache: torch.Tensor | None) -> bool:
     return cache is not None and cache.dtype in _FP8_KV_DTYPES
 
 
+def bind_attention_kv(attn, name: str, k_cache: torch.Tensor, v_cache: torch.Tensor) -> None:
+    """Bind one attention layer's K/V cache (BF16, FP8, or FP8 with packed K)."""
+    k_fp8, v_fp8 = _is_fp8_kv(k_cache), _is_fp8_kv(v_cache)
+    if k_fp8 != v_fp8:
+        raise ValueError(
+            f"{name}: K cache {k_cache.dtype} and V cache {v_cache.dtype} "
+            "must both be FP8 or both BF16"
+        )
+    # Packed K (neuron_config.fp8_packed_kv) is one dim higher than V,
+    # which is never packed.
+    packed = k_cache.dim() == v_cache.dim() + 1
+    if packed and not (k_fp8 and k_cache.dim() == 5 and v_cache.dim() == 4):
+        raise ValueError(
+            f"{name}: unexpected KV layout K {tuple(k_cache.shape)} "
+            f"{k_cache.dtype}, V {tuple(v_cache.shape)} {v_cache.dtype}"
+        )
+    if k_fp8 and attn.kv_scale_t is None:
+        raise RuntimeError(f"{name}: FP8 KV cache bound before its KV scales were loaded")
+    attn.k_cache = k_cache
+    attn.v_cache = v_cache
+    attn.fp8_packed = packed
+
+
 def _quantize_kv(x: torch.Tensor, q, dtype: torch.dtype) -> torch.Tensor:
     """Cache write: ``fp8(clamp(x * q, +-FP8_CLAMP_MAX))`` (q = 1 / dequant)."""
     return (x.to(torch.float32) * q).clamp(-FP8_CLAMP_MAX, FP8_CLAMP_MAX).to(dtype)
@@ -1877,25 +1900,7 @@ class HYV3ForCausalLM(nn.Module, SupportsEagle3):
                 raise KeyError(f"KV cache for layer {name} not initialized")
             attn = layer.self_attn
             k_cache, v_cache = kv_caches[name]
-            k_fp8, v_fp8 = _is_fp8_kv(k_cache), _is_fp8_kv(v_cache)
-            if k_fp8 != v_fp8:
-                raise ValueError(
-                    f"{name}: K cache {k_cache.dtype} and V cache {v_cache.dtype} "
-                    "must both be FP8 or both BF16"
-                )
-            # Packed K (neuron_config.fp8_packed_kv) is one dim higher than V,
-            # which is never packed.
-            packed = k_cache.dim() == v_cache.dim() + 1
-            if packed and not (k_fp8 and k_cache.dim() == 5 and v_cache.dim() == 4):
-                raise ValueError(
-                    f"{name}: unexpected KV layout K {tuple(k_cache.shape)} "
-                    f"{k_cache.dtype}, V {tuple(v_cache.shape)} {v_cache.dtype}"
-                )
-            if k_fp8 and attn.kv_scale_t is None:
-                raise RuntimeError(f"{name}: FP8 KV cache bound before its KV scales were loaded")
-            attn.k_cache = k_cache
-            attn.v_cache = v_cache
-            attn.fp8_packed = packed
+            bind_attention_kv(attn, name, k_cache, v_cache)
         # The persistent KV pool of this rank (acceptance: KV bytes per cached token).
         k0, v0 = kv_caches["layers.0.self_attn"]
         pool_bytes = sum(

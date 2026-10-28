@@ -225,10 +225,52 @@ Target verify (batch-8 NEFF, 6 x 4 real tokens) + draft: 71.9 + 4.5 ms,
 |---|---|---|
 | DCP (or attention DP 8 x TP 8) together with MTP | attention: each rank reads 1/8 of the history | the largest single item at 8 requests (55% of the step) and in prefill (48%). DCP + MTP needs framework work (vllm#50391 upstream; Neuron issue drafted) |
 | ~~EP=32 (6 experts per rank group)~~ | the MoE waiting at 1 request | measured: c=1 TPOT -4% (ITL 47.4 -> 44.9 ms, 2.5 of the ~10 ms waiting), c=8 +5%, prefill +13%. EP=64 stays (`results/bench/pd_split_85k_nodcp_fp8kv_mtp3_ep32/`) |
-| Expert load balancing (placement by measured load, later EPLB-style replicas) | the MoE waiting | up to ~10 ms of the 47.5 ms single-request step (20%) and ~1 s of the 14.3 s cold prefill (7%); little at 8 requests with `moe_tkg` |
+| ~~Expert load balancing (static placement by measured load)~~ | the MoE waiting | measured on captured routing, see "Expert load" below: a placement fitted on the load cuts the busiest rank's hits by ~8% (T=4) and its prefill tokens by ~9% on held-out requests, i.e. ~0.5 ms of the 47.5 ms step and ~1% of the prefill. Not worth implementing |
 | ~~`HY3_DECODE_HITS_MAX_T=32` for 8-request MTP steps~~ | MoE compute at 8 requests | measured: **slower**. At 32 tokens (256 expert choices over 192 experts) a rank's 3 experts are almost always hit, so hits saves no reads but keeps its runtime loop and adds waiting: step 76.7 -> 85.7 ms, TPOT 51.0 -> 56.0 ms, 138 -> 127 tok/s (`results/bench/pd_split_85k_nodcp_fp8kv_mtp3_maxt32/`). The default (4 x (k + 1) = 16) stays |
 | Sparse / block-sparse prefill attention | prefill attention, quadratic in prompt length | 48% of the cold 85k prefill; needs an NKI kernel and accuracy validation |
 | Fewer, fused kernels per layer (norm + router + shared expert) | per-layer fixed cost in decode | part of the 16.8 ms MoE compute and of attention's fixed cost at 1 request |
+
+## Expert load: would a static expert placement help?
+
+`scripts/expert_load.sh` serves the model with a `tensor_capture` of each MoE
+layer's routed experts (`moe_route.<layer>` in `HYV3MoE.forward`, a no-op
+without the capture config) and `scripts/expert_load_client.py` sends real
+text: 112 ShareGPT prompts of 1k / 4k / 8k / 16k tokens and 40 MATH-500
+problems, 128 generated tokens each (685k prefill and 19k decode tokens).
+`scripts/expert_load.py` replays the captured routing on other placements of
+the 192 experts over the 64 ranks; placements are fitted on half of the
+requests and evaluated on the other half (`results/expert_load/analysis.md`).
+
+| placement | prefill: busiest rank's tokens / mean | decode, 1 token | 4 tokens (1 request + MTP) | 8 tokens | 32 tokens (8 + MTP) |
+|---|---|---|---|---|---|
+| current (expert e on rank e // 3) | 4.76 | 1.27 | 2.07 | 2.70 | 3.00 |
+| random | 4.75 | 1.27 | 2.07 | 2.70 | 3.00 |
+| balanced by load | 4.35 | 1.18 | 1.91 | 2.56 | 3.00 |
+| balanced by load + co-selection | 4.33 | 1.18 | 1.90 | 2.55 | 3.00 |
+| mean rank (any placement) | 1 | 0.13 | 0.38 | 0.79 | 1.72 |
+
+Decode columns: distinct local experts hit on the busiest rank per step
+(mean over steps and layers; a rank holds 3).
+
+- The popularity is skewed (the most used expert of a layer gets 8x the mean,
+  the top 10% of experts 41% of the selections), but **the hot experts depend on
+  the request**: within one prefill pass the busiest rank gets 4.3-4.5x the
+  mean tokens even for 4k-16k chunks, and a placement fitted on all passes
+  (in-sample) only brings that to 3.6-3.8x. The current linear placement is
+  as good as a random one.
+- Decode: in a 4-token step the busiest rank hits 2.07 experts while the mean
+  rank hits 0.38; the fitted placement lowers that to 1.91. At ~0.05 ms per
+  extra expert read per layer this is ~0.6 ms of the 47.5 ms step (~1%); at 32
+  tokens every rank hits all its experts whatever the placement.
+- Prefill: 9% fewer tokens on the busiest rank; the MoE waiting is 7% of the
+  85k prefill and the routed-expert kernel time grows less than linearly with
+  the tokens, so the gain is ~1% of the prefill.
+- Replicating hot experts (EPLB-style redundancy) would need per-request
+  choices to help, and every extra expert slot costs ~1.5 GB per rank (79
+  layers x 18.9 MB), about what separates 8 from 7 concurrent 85k requests.
+
+So the per-step waiting comes from which experts each request routes to, not
+from a placement that a static or slowly updated layout can fix.
 
 Communication itself (the same-size attention collectives) is 3-4% of every
 phase measured here, and the NEFFs run back to back, so neither the

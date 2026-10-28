@@ -867,6 +867,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/bench_real_prompts.py` | TTFT / TPOT / throughput on MATH-500 chat prompts, plus MTP acceptance from `/metrics` |
 | `scripts/check_mtp.py` | MTP vs plain greedy output (lossless check) and acceptance; `KV_DTYPE=fp8`, `PREFIX_CACHING=1`, `DUMP_IDS` |
 | `scripts/profile_85k.sh` / `scripts/profile_85k_client.py` | device-profiling server (85k FP8 KV + MTP config, fewest NEFFs) and the profiled sessions (cold prefill, 1- and N-request decode) |
+| `scripts/expert_load.sh` / `expert_load_client.py` / `expert_load.py` | capture each token's routed experts (tensor_capture of `moe_route.<layer>`), real-text workload, and the expert-placement simulation (docs/PROFILE_85K.md, "Expert load") |
 | `scripts/profile_analyze.py` | tables for docs/PROFILE_85K.md from neuron-explorer parquet exports: per-phase times and MoE waiting per layer and rank |
 | `scripts/check_mtp_gaps.py` | HF FP32 log-probs at the first token where the plain and MTP runs differ (near-tie or defect) |
 | `scripts/bench_matrix.sh` | `vllm bench serve` matrix, random dataset, a distinct seed per cell so cells never share prefix-cache entries |

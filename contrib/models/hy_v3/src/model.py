@@ -58,6 +58,7 @@ from vllm.model_executor.models.interfaces import SupportsEagle3
 
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
+from vllm_neuron.accuracy.tensor_capture import capture_tensor
 from vllm_neuron.functional.moe.moe_tkg_wrapper import moe_tkg_wrapper
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
 from vllm_neuron.model.neuron_config import NeuronConfig
@@ -1196,10 +1197,12 @@ class HYV3MoE(nn.Module):
         weights = scores[topk] / sum(scores[topk]) * router_scaling_factor
     """
 
-    def __init__(self, config: HYV3Config):
+    def __init__(self, config: HYV3Config, layer_idx: int | None = None):
         super().__init__()
         from vllm.config import get_current_vllm_config
 
+        # Names the routing capture (see forward); None skips it.
+        self.layer_idx = layer_idx
         self.tp_group = get_tp_group()
         self.world_size = self.tp_group.world_size
         self.hidden_size = config.hidden_size
@@ -1355,6 +1358,11 @@ class HYV3MoE(nn.Module):
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
         normed = (x * ln_w.to(torch.float32)).to(hidden_states.dtype)
         affinities, top_k_index = self._route(normed)
+        # Expert load statistics (scripts/expert_load.py): with a neuron_config
+        # tensor_capture active, each rank saves its tokens' top-k experts
+        # (prefill: its SP shard; decode: every token). A no-op otherwise.
+        if self.layer_idx is not None:
+            capture_tensor(f"moe_route.{self.layer_idx}", top_k_index)
 
         if is_prefill:
             # Shared expert: full weights on SP-local tokens, output complete.
@@ -1554,7 +1562,9 @@ class HYV3DecoderLayer(nn.Module):
         )
         self.self_attn = HYV3Attention(config, layer_idx)
         self.mlp = (
-            HYV3MoE(config) if config.is_moe_layer(layer_idx) else HYV3DenseMLP(config)
+            HYV3MoE(config, layer_idx)
+            if config.is_moe_layer(layer_idx)
+            else HYV3DenseMLP(config)
         )
 
     def forward(

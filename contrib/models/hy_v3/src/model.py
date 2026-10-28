@@ -142,6 +142,18 @@ _FP8_KV_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # kernel is viable, so the fallback write-back can be exercised on every bucket.
 _FORCE_UNPACKED_DECODE = os.environ.get("HY3_FP8_KV_FORCE_UNPACKED_DECODE") == "1"
 
+# EXPERIMENTAL accuracy study of block-sparse decode attention (Quest-style):
+# HY3_SPARSE_DECODE=<fraction> keeps that fraction of each request's 32-token
+# KV blocks (plus HY3_SPARSE_SINK_BLOCKS first and HY3_SPARSE_RECENT_BLOCKS
+# last ones), chosen per layer by an upper bound of q . k from each block's
+# per-dimension K min / max. The kept blocks are compacted into the block table
+# the decode kernel reads, so the result is exactly attention over them. The
+# selection reads the whole K history every step: it measures accuracy, not
+# speed. BF16 KV, no DCP, one token per request per step only.
+_SPARSE_DECODE = float(os.environ.get("HY3_SPARSE_DECODE", "0") or 0)
+_SPARSE_SINK = int(os.environ.get("HY3_SPARSE_SINK_BLOCKS", "1"))
+_SPARSE_RECENT = int(os.environ.get("HY3_SPARSE_RECENT_BLOCKS", "4"))
+
 
 def _is_fp8_kv(cache: torch.Tensor | None) -> bool:
     return cache is not None and cache.dtype in _FP8_KV_DTYPES
@@ -257,6 +269,48 @@ class HYV3RMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return (self.weight * hidden_states).to(input_dtype)
+
+
+def sparse_keep_blocks(q, k_cache, block_table, n_hist, block_size, frac, sink, recent):
+    """EXPERIMENTAL (HY3_SPARSE_DECODE): the KV blocks one decode token attends to.
+
+    q: [nh, B, D] fp32 queries after QK-norm + RoPE; k_cache: [blocks, kvh,
+    block_size, D]; block_table: [B, nb]; n_hist: [B] history tokens. Keeps
+    ceil(frac x valid blocks) blocks per request (at least the first ``sink``
+    and last ``recent``) by the Quest bound max_k(q . k) <= sum_d max(q_d min_d,
+    q_d max_d). Returns (block table with the kept blocks first in their
+    original order, history tokens they hold).
+    """
+    nh, B, D = q.shape
+    kvh = k_cache.shape[1]
+    kb = k_cache[block_table.long()]  # [B, nb, kvh, block_size, D]
+    kmin = kb.amin(3).to(torch.float32)
+    kmax = kb.amax(3).to(torch.float32)
+    qg = q.view(kvh, nh // kvh, B, D).permute(2, 0, 1, 3)  # [B, kvh, g, D]
+    bound = torch.maximum(
+        qg.unsqueeze(1) * kmin.unsqueeze(3), qg.unsqueeze(1) * kmax.unsqueeze(3)
+    ).sum(-1)  # [B, nb, kvh, g]
+    score = bound.amax(dim=(2, 3))  # [B, nb]
+    nb = block_table.shape[1]
+    n = n_hist.to(torch.long)
+    nbv = torch.div(n + block_size - 1, block_size, rounding_mode="floor")
+    idx = torch.arange(nb, device=q.device).view(1, nb)
+    valid = idx < nbv.view(B, 1)
+    forced = valid & ((idx < sink) | (idx >= (nbv - recent).view(B, 1)))
+    big = torch.finfo(torch.float32).max
+    score = torch.where(forced, big, torch.where(valid, score, -big))
+    n_keep = torch.maximum(torch.ceil(nbv.to(torch.float32) * frac).to(torch.long), forced.sum(1))
+    k_max = min(nb, int(nb * frac) + sink + recent + 1)
+    top = torch.topk(score, k_max, dim=1).values  # descending
+    thr = top.gather(1, (torch.clamp(n_keep, max=k_max) - 1).view(B, 1))
+    keep = valid & (score >= thr)
+    # Compact: kept blocks to the front in their original order; the others
+    # land on the last slot, past the kept count, where the mask hides them.
+    dest = torch.where(keep, torch.cumsum(keep.to(torch.long), dim=1) - 1, nb - 1)
+    compact = torch.zeros_like(block_table).scatter(1, dest, block_table)
+    cnt = keep.sum(1)
+    fill = n - block_size * (nbv - 1)  # tokens in the last block, always kept
+    return compact, block_size * (cnt - 1) + fill
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -647,6 +701,44 @@ class HYV3Attention(nn.Module):
             attn_output = self.tp_group.reduce_scatter(attn_output, dim=0)
         return attn_output.contiguous()
 
+    def _sparse_decode_blocks(self, X, ln_w, position_embeddings, positions, block_table, block_size):
+        """EXPERIMENTAL (HY3_SPARSE_DECODE): kept KV blocks of each request.
+
+        Returns the block table with the kept blocks first (in their original
+        order) and the number of history tokens they hold.
+        """
+        B, S, H = X.shape
+        nh, kvh, D = self.num_attention_heads_per_rank, self.num_key_value_heads_per_rank, self.head_dim
+        # Query as the decode kernel computes it: RMSNorm, STATIC FP8 QKV, QK-norm, RoPE.
+        x = X.to(torch.float32)
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.rms_norm_eps)
+        xn = (x * ln_w.view(1, 1, -1).to(torch.float32)).to(self.dtype)
+        qkv = NF.qkv_proj(
+            hidden=xn.view(1, B * S, H),
+            qkv_weights=self.qkv_proj_weight,
+            bias=None,
+            d_head=D,
+            quantization_type=QuantizationType.STATIC,
+            qkv_w_scale=self.qkv_weight_scale,
+            qkv_in_scale=self.qkv_input_scale,
+            num_q_heads=nh,
+            num_kv_heads=kvh,
+        ).squeeze(0)
+        q = qkv[:, : nh * D].view(B * S, nh, D).transpose(0, 1)
+        q = self._qk_norm(q, self.q_norm)
+        cos, sin = position_embeddings
+        cos = cos.unsqueeze(0).to(torch.float32)
+        sin = sin.unsqueeze(0).to(torch.float32)
+        q = q.to(torch.float32) * cos + _rotate_half(q.to(torch.float32)) * sin  # [nh, B, D]
+        compact, prior = sparse_keep_blocks(
+            q.view(nh, B, D), self.k_cache, block_table, positions.view(B, S)[:, 0],
+            block_size, _SPARSE_DECODE, _SPARSE_SINK, _SPARSE_RECENT,
+        )
+        # Study diagnostics (tensor_capture): kept history and the query norm.
+        capture_tensor(f"sparse_prior.{self.layer_idx}", prior)
+        capture_tensor(f"sparse_qnorm.{self.layer_idx}", q.norm(dim=-1))
+        return compact, prior
+
     def forward_decode(
         self,
         hidden_states: torch.Tensor,
@@ -703,8 +795,29 @@ class HYV3Attention(nn.Module):
             owner = torch.div(remaining, block_size, rounding_mode="trunc") % W
             dcp_active_mask = (owner == R).float()
 
+        sparse = (
+            _SPARSE_DECODE > 0
+            and self.dcp_size == 1
+            and S_decode == 1
+            and not _is_fp8_kv(self.k_cache)
+        )
+        attention_mask = None
+        if sparse:
+            block_table, prior = self._sparse_decode_blocks(
+                X, ln_w, position_embeddings, positions, block_table, block_size
+            )
+            attention_mask = NF.gen_attention_decode_mask(
+                pos_ids=prior.view(1, B).to(torch.float32),
+                bs=B,
+                q_head=self.num_attention_heads_per_rank,
+                s_active=S_decode,
+                s_prior=S_ctx,
+                start_pos=None,
+                block_len=block_size,
+            )
         # The decode mask is identical for every layer: build it once per step.
-        attention_mask = attn_metadata.get(_DECODE_MASK_CACHE_KEY)
+        if attention_mask is None:
+            attention_mask = attn_metadata.get(_DECODE_MASK_CACHE_KEY)
         if attention_mask is None:
             attention_mask = NF.gen_attention_decode_mask(
                 pos_ids=positions.view(1, B * S_decode).to(torch.float32),

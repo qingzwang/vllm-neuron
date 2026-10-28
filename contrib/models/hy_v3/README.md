@@ -705,6 +705,12 @@ core with one bucket). Decode only (pass 2, ~100% hit), same 80 requests
 - Where the time goes in this configuration (device profile of a cold 85k
   prefill and of 1- and 6-request decode, MoE load imbalance per layer, and how
   the model is split over the 64 ranks): [docs/PROFILE_85K.md](docs/PROFILE_85K.md).
+- The 8-request verify steps have 32 tokens, above the hits limit (16), so they
+  run the all-expert `moe_tkg`. Raising `HY3_DECODE_HITS_MAX_T` to 32 is
+  slower (c=8 pass 2: ITL 76.7 -> 85.7 ms, TPOT 51.0 -> 56.0 ms, 138 -> 127
+  tok/s; c=4 unchanged; `results/bench/pd_split_85k_nodcp_fp8kv_mtp3_maxt32/`):
+  at 32 tokens nearly every local expert is hit, so the hits kernel saves no
+  weight reads and only adds its runtime loop and cross-rank waiting.
 - MTP with FP8 KV needs scales for the MTP layer (`model.layers.80`):
   `kv_profiles/Hy3-FP8_mtp_neuron.safetensors` is the shipped profile plus that
   layer (`calibrate_kv_scales_neuron.py calibrate --mtp`); the MTP acceptance

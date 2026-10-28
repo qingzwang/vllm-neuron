@@ -17,7 +17,8 @@
 # decode context bucket below 86016: with all three, the batch-8 decode NEFFs
 # do not fit next to the KV (Allocation Failure at batch 8, 65536).
 # Env: MODEL, PORT, MTP_K, KV_DTYPE, KV_CAP as for serve.sh; with MTP_K,
-#      HY3_DECODE_HITS_MAX_T defaults to 4 x (MTP_K + 1) (4-request verify steps).
+#      HY3_DECODE_HITS_MAX_T defaults to 4 x (MTP_K + 1) (4-request verify steps;
+#      8-request steps keep moe_tkg, which is faster there than hits at 32).
 # Benchmark: bench_pd_split.sh "1 4 8".
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)

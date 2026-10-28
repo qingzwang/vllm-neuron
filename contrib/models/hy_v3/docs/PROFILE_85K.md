@@ -137,7 +137,8 @@ Limits:
 - **8-request verify steps use `moe_tkg`.** They have 32 tokens, above
   `HY3_DECODE_HITS_MAX_T` = 16 (4 x (k + 1)), so the routed experts run the
   all-expert kernel: no routed-expert imbalance, but every rank reads all 3
-  experts. Whether `moe_tkg_hits_batch` is faster at 32 tokens is not measured.
+  experts. `HY3_DECODE_HITS_MAX_T=32` (the hits kernel at 32 tokens) is
+  slower, see below.
 - 8 of 64 ranks sampled; per-expert routing counts are not recorded.
 
 ## Cold prefill, 85,000 tokens (c1_cold)
@@ -224,7 +225,7 @@ Target verify (batch-8 NEFF, 6 x 4 real tokens) + draft: 71.9 + 4.5 ms,
 |---|---|---|
 | DCP (or attention DP 8 x TP 8) together with MTP | attention: each rank reads 1/8 of the history | the largest single item at 8 requests (55% of the step) and in prefill (48%). DCP + MTP needs framework work (vllm#50391 upstream; Neuron issue drafted) |
 | Expert load balancing (placement by measured load, later EPLB-style replicas) | the MoE waiting | up to ~10 ms of the 47.5 ms single-request step (20%) and ~1 s of the 14.3 s cold prefill (7%); little at 8 requests with `moe_tkg` |
-| `HY3_DECODE_HITS_MAX_T=32` for 8-request MTP steps | MoE compute at 8 requests | `moe_tkg` reads all 3 experts (21.9 ms); hits would read only the hit ones but adds imbalance waiting. To measure |
+| ~~`HY3_DECODE_HITS_MAX_T=32` for 8-request MTP steps~~ | MoE compute at 8 requests | measured: **slower**. At 32 tokens (256 expert choices over 192 experts) a rank's 3 experts are almost always hit, so hits saves no reads but keeps its runtime loop and adds waiting: step 76.7 -> 85.7 ms, TPOT 51.0 -> 56.0 ms, 138 -> 127 tok/s (`results/bench/pd_split_85k_nodcp_fp8kv_mtp3_maxt32/`). The default (4 x (k + 1) = 16) stays |
 | Sparse / block-sparse prefill attention | prefill attention, quadratic in prompt length | 48% of the cold 85k prefill; needs an NKI kernel and accuracy validation |
 | Fewer, fused kernels per layer (norm + router + shared expert) | per-layer fixed cost in decode | part of the 16.8 ms MoE compute and of attention's fixed cost at 1 request |
 

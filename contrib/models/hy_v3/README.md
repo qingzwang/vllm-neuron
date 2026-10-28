@@ -711,6 +711,13 @@ core with one bucket). Decode only (pass 2, ~100% hit), same 80 requests
   tok/s; c=4 unchanged; `results/bench/pd_split_85k_nodcp_fp8kv_mtp3_maxt32/`):
   at 32 tokens nearly every local expert is hit, so the hits kernel saves no
   weight reads and only adds its runtime loop and cross-rank waiting.
+- EP=32 (`EP=32`, 6 experts per EP group, expert TP=2) instead of 64: decode
+  pass 2 TPOT 23.4 -> 22.4 ms at c=1 (ITL 47.4 -> 44.9 ms), 39.2 -> 38.8 at c=4,
+  51.0 -> 53.3 at c=8 (138 -> 133 tok/s); prefill 13% slower (c=1 TTFT 2.14 ->
+  2.41 s, 0.52 -> 0.46 requests/s; `results/bench/pd_split_85k_nodcp_fp8kv_mtp3_ep32/`).
+  More experts per rank evens out the single-request hits only a little (2.5 ms
+  of the ~10 ms waiting), while the half-width experts cost prefill and the
+  8-request all-expert steps, so EP=64 stays.
 - MTP with FP8 KV needs scales for the MTP layer (`model.layers.80`):
   `kv_profiles/Hy3-FP8_mtp_neuron.safetensors` is the shipped profile plus that
   layer (`calibrate_kv_scales_neuron.py calibrate --mtp`); the MTP acceptance

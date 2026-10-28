@@ -702,6 +702,9 @@ core with one bucket). Decode only (pass 2, ~100% hit), same 80 requests
   at c=1 / 4 / 8, i.e. TPOT -31% / -34% / -32% over FP8 KV alone.
 - The step itself is still cheapest with DCP=8 (each rank reads 1/8 of the
   history): MTP together with DCP would combine both, see the MTP limitations.
+- Where the time goes in this configuration (device profile of a cold 85k
+  prefill and of 1- and 6-request decode, MoE load imbalance per layer, and how
+  the model is split over the 64 ranks): [docs/PROFILE_85K.md](docs/PROFILE_85K.md).
 - MTP with FP8 KV needs scales for the MTP layer (`model.layers.80`):
   `kv_profiles/Hy3-FP8_mtp_neuron.safetensors` is the shipped profile plus that
   layer (`calibrate_kv_scales_neuron.py calibrate --mtp`); the MTP acceptance
@@ -850,6 +853,8 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `scripts/serve_latency.sh` | single-request latency config (no prefix caching, prefill buckets 512..16384); `MTP_K=<k>` enables MTP |
 | `scripts/bench_real_prompts.py` | TTFT / TPOT / throughput on MATH-500 chat prompts, plus MTP acceptance from `/metrics` |
 | `scripts/check_mtp.py` | MTP vs plain greedy output (lossless check) and acceptance; `KV_DTYPE=fp8`, `PREFIX_CACHING=1`, `DUMP_IDS` |
+| `scripts/profile_85k.sh` / `scripts/profile_85k_client.py` | device-profiling server (85k FP8 KV + MTP config, fewest NEFFs) and the profiled sessions (cold prefill, 1- and N-request decode) |
+| `scripts/profile_analyze.py` | tables for docs/PROFILE_85K.md from neuron-explorer parquet exports: per-phase times and MoE waiting per layer and rank |
 | `scripts/check_mtp_gaps.py` | HF FP32 log-probs at the first token where the plain and MTP runs differ (near-tie or defect) |
 | `scripts/bench_matrix.sh` | `vllm bench serve` matrix, random dataset, a distinct seed per cell so cells never share prefix-cache entries |
 | `scripts/serve_256k.sh` | long-context config: max_model_len 256000, DCP=8, prefill buckets up to 4096 (with DCP the 8192 bucket fails to compile, `NCC_IGCA037`) |

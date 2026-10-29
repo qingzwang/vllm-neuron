@@ -1,7 +1,7 @@
 #!/bin/bash
 # Serve tencent/Hy3-FP8 on a trn2.48xlarge (TP=64, full EP), prefix caching on.
 #
-# Usage: serve.sh <max_model_len> <max_num_seqs> '<num_seqs_buckets json>' '<decode_ctx_buckets json>'
+# Usage: serve.sh <max_model_len> <max_num_seqs> '<num_seqs_buckets json>' ['<decode_ctx_buckets json>']
 # Env:
 #   MODEL            checkpoint path or HF id (default: tencent/Hy3-FP8)
 #   PREFILL_BUCKETS  prefill (Q) buckets, JSON list (default: [2048]). The largest
@@ -61,6 +61,6 @@ exec vllm serve "${MODEL:-tencent/Hy3-FP8}" "${SPEC_ARGS[@]}" \
     --additional-config "{\"neuron_config\": {${EP:+\"ep_degree\": $EP,} $PACKED_NC
         \"num_batched_tokens_buckets\": $PREFILL_BUCKETS,
         \"kv_segment_size_buckets\": ${KV_SEGMENTS:-[2048]},
-        \"num_seqs_buckets\": $3,
-        \"decode_context_length_buckets\": $4
+        \"num_seqs_buckets\": $3${4:+,
+        \"decode_context_length_buckets\": $4}
     }}"

@@ -83,8 +83,8 @@ def run(items, out, base_url="http://127.0.0.1:8000"):
         ok += pred == r["answer"]
         res.append({"id": r["id"], "tokens": r["tokens"], "answer": r["answer"], "pred": pred, "text": text})
         print(i, r["tokens"], r["answer"], pred, f"acc {ok}/{i + 1}", flush=True)
-    with open(out, "w") as f:
-        json.dump(res, f, ensure_ascii=False, indent=1)
+        with open(out, "w") as f:  # after every item: a crashed server keeps the answers so far
+            json.dump(res, f, ensure_ascii=False, indent=1)
 
 
 def compare(ref_path, *paths):

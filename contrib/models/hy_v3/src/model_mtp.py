@@ -52,6 +52,7 @@ from .model import (
     HYV3RotaryEmbedding,
     bind_attention_kv,
     decoder_layer_weight_mappings,
+    prepare_sparse_decode,
 )
 
 logger = logging.getLogger(__name__)
@@ -231,12 +232,14 @@ class HYV3MTPForCausalLM(nn.Module):
             if param.is_meta:
                 raise RuntimeError(f"MTP parameter {name} was not loaded")
         self._load_kv_cache_scales(checkpoint_path, device)
+        prepare_sparse_decode(self.layers[0], device)
 
     def load_weights_lite(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None = None
     ) -> None:
         """CPU compile: only the KV scales (decode uses them as graph constants)."""
         self._load_kv_cache_scales(checkpoint_path, device)
+        prepare_sparse_decode(self.layers[0], device, from_weights=False)
 
     def _load_kv_cache_scales(self, checkpoint_path: str, device) -> None:
         """<-- FP8 KV: the MTP layer's K/V scales, entry ``start_layer_idx`` (80)
@@ -293,7 +296,10 @@ class HYV3MTPForCausalLM(nn.Module):
         if self.layer_name not in kv_caches:
             raise KeyError(f"KV cache for layer {self.layer_name} not initialized")
         k_cache, v_cache = kv_caches[self.layer_name]
-        bind_attention_kv(self.layers[0].self_attn, self.layer_name, k_cache, v_cache)
+        bind_attention_kv(
+            self.layers[0].self_attn, self.layer_name, k_cache, v_cache,
+            sparse=os.environ.get("HY3_SPARSE_DRAFT", "1") != "0",
+        )
 
     # ── forward ───────────────────────────────────────────────────────────
 

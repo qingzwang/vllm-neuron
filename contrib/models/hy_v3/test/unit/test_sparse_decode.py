@@ -1,63 +1,141 @@
 # SPDX-License-Identifier: Apache-2.0
-"""EXPERIMENTAL block-sparse decode selection (model.sparse_keep_blocks), on CPU."""
+"""EXPERIMENTAL block-sparse decode (HY3_SPARSE_DECODE) helpers, on CPU."""
 
 import torch
-from hy_v3_neuron.model import sparse_keep_blocks
+from hy_v3_neuron.model import (
+    _SUMMARY_EMPTY,
+    sparse_budget_blocks,
+    sparse_select_blocks,
+    update_k_summary_prefill,
+)
 
-BS, D = 32, 16
-
-
-def _setup(n_hist, nb=12, nh=2, kvh=1, seed=0):
-    g = torch.Generator().manual_seed(seed)
-    k_cache = torch.randn(40, kvh, BS, D, generator=g, dtype=torch.bfloat16) * 0.1
-    block_table = torch.randperm(40, generator=g)[: 2 * nb].view(2, nb).to(torch.int32)
-    q = torch.randn(nh, 2, D, generator=g)
-    return q, k_cache, block_table, torch.tensor(n_hist)
+BS, D, KVH, NBLK = 32, 16, 1, 64
 
 
-def _hist_tokens(k_cache, table_row, n_tokens):
-    """History K of one request as the decode kernel reads it: the table's blocks in order."""
-    rows = k_cache[table_row.long()][:, 0].reshape(-1, D)
-    return rows[:n_tokens]
+def _empty():
+    return (torch.full((NBLK, KVH, D), _SUMMARY_EMPTY, dtype=torch.bfloat16),
+            torch.full((NBLK, KVH, D), -_SUMMARY_EMPTY, dtype=torch.bfloat16))
 
 
-def test_full_fraction_is_dense():
-    q, kc, bt, n = _setup([300, 37])
-    compact, prior = sparse_keep_blocks(q, kc, bt, n, BS, 1.0, 1, 2)
-    assert prior.tolist() == [300, 37]
-    for b, nn in enumerate(n.tolist()):
-        nbv = -(-nn // BS)
-        assert compact[b, :nbv].tolist() == bt[b, :nbv].tolist()
+def _slots(table_row, positions):
+    return torch.tensor([int(table_row[p // BS]) * BS + p % BS for p in positions])
 
 
-def test_keeps_the_block_with_the_matching_key():
-    q, kc, bt, n = _setup([360, 360])
-    hot = int(bt[0, 5])
-    kc[hot, 0, 7] = (q[:, 0].mean(0) * 50).to(torch.bfloat16)  # a key aligned with request 0's query
-    # 0.5 of 12 blocks = 6: the sink, the 2 recent ones and 3 chosen by score.
-    compact, prior = sparse_keep_blocks(q, kc, bt, n, BS, 0.5, 1, 2)
-    nbv = -(-360 // BS)  # 12 blocks
-    cnt = (prior[0] - (360 - BS * (nbv - 1))) // BS + 1
-    kept = compact[0, :cnt].tolist()
-    assert hot in kept
-    assert kept[0] == int(bt[0, 0])  # sink first
-    assert kept[-2:] == bt[0, nbv - 2 : nbv].tolist()  # recent blocks last, in order
-    assert kept == [x for x in bt[0, :nbv].tolist() if x in kept]  # original order kept
+def test_budget_is_a_multiple_of_256_and_capped():
+    assert sparse_budget_blocks(2688, 0.125, 1, 4) == 512  # 336 + 5 -> 512
+    assert sparse_budget_blocks(1024, 0.1, 1, 4) == 256
+    assert sparse_budget_blocks(200, 0.5, 1, 4) == 200  # not smaller: dense
 
 
-def test_compacted_attention_equals_attention_over_kept_blocks():
-    q, kc, bt, n = _setup([333, 333], seed=3)
-    compact, prior = sparse_keep_blocks(q, kc, bt, n, BS, 0.4, 1, 2)
-    nbv = -(-333 // BS)
-    fill = 333 - BS * (nbv - 1)
-    cnt = int((prior[0] - fill) // BS + 1)
-    kept = compact[0, :cnt].tolist()
-    # Reference: the kept blocks' tokens taken from the original table (full
-    # blocks, the last one partial).
-    ref = []
-    for i, blk in enumerate(bt[0, :nbv].tolist()):
-        if blk in kept:
-            ref.append(kc[blk, 0, : (fill if i == nbv - 1 else BS)])
-    ref = torch.cat(ref)
-    got = _hist_tokens(kc, compact[0], int(prior[0]))
-    assert torch.equal(got, ref)
+def test_prefill_summaries_match_the_written_keys():
+    g = torch.Generator().manual_seed(0)
+    table = torch.randperm(NBLK - 1, generator=g)[:10] + 1  # block 0 is the null block here
+    keys = {}
+    kmin, kmax = _empty()
+    # A stale summary on a reused block must not survive a fresh write.
+    kmin[table[2]] = -100.0
+    kmax[table[2]] = 100.0
+
+    def prefill(start, n, T):
+        k = torch.randn(KVH, T, D, generator=g)
+        pos = list(range(start, start + n))
+        for i, p in enumerate(pos):  # a re-computed token has the same K
+            if p in keys:
+                k[:, i] = keys[p]
+        slots = torch.full((T,), -1)
+        slots[:n] = _slots(table, pos)
+        for i, p in enumerate(pos):
+            keys[p] = k[:, i]
+        update_k_summary_prefill(kmin, kmax, k, slots, BS)
+
+    prefill(0, 64, 64)       # two full blocks
+    prefill(64, 41, 64)      # 41 tokens: block 2 full, block 3 partial, padding after
+    prefill(104, 1, 32)      # the re-computed last token: continues block 3
+    for b in range(4):
+        ks = torch.stack([keys[t] for t in range(b * BS, min(105, (b + 1) * BS))])
+        torch.testing.assert_close(kmin[table[b]].float(), ks.amin(0).to(torch.bfloat16).float())
+        torch.testing.assert_close(kmax[table[b]].float(), ks.amax(0).to(torch.bfloat16).float())
+
+
+def _keys_and_summaries(n, g):
+    table = (torch.randperm(NBLK - 1, generator=g)[:8] + 1).view(1, 8)
+    k = torch.randn(KVH, 8 * BS, D, generator=g)
+    kmin, kmax = _empty()
+    slots = torch.full((8 * BS,), -1)
+    slots[:n] = _slots(table[0], range(n))
+    update_k_summary_prefill(kmin, kmax, k, slots, BS)
+    return table, k, kmin, kmax
+
+
+def test_bound_is_an_upper_bound_and_the_hot_block_is_kept():
+    g = torch.Generator().manual_seed(1)
+    n = 250
+    table, k, kmin, kmax = _keys_and_summaries(n, g)
+    q = torch.randn(2, 1, 1, D, generator=g)  # 2 query heads on the KV head
+    k[0, 3 * BS + 5] = q[:, 0, 0].mean(0) * 20  # a key aligned with the query
+    kmin, kmax = _empty()
+    slots = torch.full((8 * BS,), -1)
+    slots[:n] = _slots(table[0], range(n))
+    update_k_summary_prefill(kmin, kmax, k, slots, BS)
+    # The bound of each block is >= the true max of q . k over its tokens.
+    smin, smax = kmin[table[0].long()].float(), kmax[table[0].long()].float()
+    for b in range(-(-n // BS)):
+        toks = k[0, b * BS : min(n, (b + 1) * BS)]
+        true = (q[:, 0, 0] @ toks.T).max()
+        bound = (q[:, 0, 0].clamp(min=0) @ smax[b, 0] + q[:, 0, 0].clamp(max=0) @ smin[b, 0]).max()
+        assert bound >= true - 1e-2
+    compact, prior = sparse_select_blocks(q, kmin, kmax, table, torch.tensor([n]), BS, 5, 1, 2)
+    nbv = -(-n // BS)
+    kept = compact[0, :4].tolist()  # n_sel - 1 kept, then the block after the history
+    assert int(table[0, 3]) in kept
+    assert kept[0] == int(table[0, 0]) and kept[-2:] == table[0, nbv - 2 : nbv].tolist()
+    assert kept == [x for x in table[0].tolist() if x in kept]  # original order
+    assert int(prior[0]) == 3 * BS + (n - BS * (nbv - 1))
+    # Past the kept blocks: the block after the history (here the history fills
+    # the table, so the index is clamped to its last block).
+    assert compact[0, 4:].tolist() == [int(table[0, min(nbv, 7)])]
+
+
+def test_budget_covering_the_history_is_dense():
+    g = torch.Generator().manual_seed(2)
+    n = 150
+    table, k, kmin, kmax = _keys_and_summaries(n, g)
+    q = torch.randn(1, 1, 4, D, generator=g)  # one request, 4 verify tokens
+    compact, prior = sparse_select_blocks(q, kmin, kmax, table, torch.tensor([n]), BS, 6, 1, 2)
+    nbv = -(-n // BS)
+    assert compact[0].tolist() == table[0, :6].tolist()  # = the table, incl. the next block
+    assert int(prior[0]) == n
+
+
+def test_blocks_written_by_decode_are_kept():
+    """Blocks past the prompt have no summary (decode does not write one): always kept."""
+    g = torch.Generator().manual_seed(3)
+    table = (torch.randperm(NBLK - 1, generator=g)[:12] + 1).view(1, 12)
+    kmin, kmax = _empty()
+    k = torch.randn(KVH, 6 * BS, D, generator=g)
+    slots = torch.full((6 * BS,), -1)
+    slots[: 5 * BS + 7] = _slots(table[0], range(5 * BS + 7))  # prompt: 5 blocks + 7 tokens
+    update_k_summary_prefill(kmin, kmax, k, slots, BS)
+    n = 9 * BS + 3  # decode filled the 6th block and wrote into blocks 7-9
+    q = torch.randn(1, 1, 1, D, generator=g)
+    compact, prior = sparse_select_blocks(q, kmin, kmax, table, torch.tensor([n]), BS, 9, 1, 2)
+    kept = compact[0, :8].tolist()
+    # Blocks 5 (prompt end, continued by decode) to 9 have to be kept, the sink too.
+    for b in [0, 5, 6, 7, 8, 9]:
+        assert int(table[0, b]) in kept
+    assert int(prior[0]) == 7 * BS + 3
+
+
+
+def test_the_block_after_the_history_stays_in_the_table():
+    """MTP verify tokens crossing a block boundary are read back through the table."""
+    g = torch.Generator().manual_seed(5)
+    n = 7 * BS + 30  # 8 history blocks, 30 tokens in the last: a 4-token step crosses into block 8
+    table, k, kmin, kmax = _keys_and_summaries(min(n, 8 * BS), g)
+    table = torch.cat([table, (torch.arange(4) + 50).view(1, 4)], dim=1)  # blocks 8-11
+    q = torch.randn(1, 1, 4, D, generator=g)
+    compact, prior = sparse_select_blocks(q, kmin, kmax, table, torch.tensor([n]), BS, 4, 1, 1)
+    assert compact.shape == (1, 4)
+    assert int(compact[0, 2]) == int(table[0, 7])  # the last history block, kept
+    assert int(compact[0, 3]) == int(table[0, 8])  # the next one
+    assert int(prior[0]) == 2 * BS + 30

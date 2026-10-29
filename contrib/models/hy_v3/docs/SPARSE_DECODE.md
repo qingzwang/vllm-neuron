@@ -1,15 +1,19 @@
-# Block-sparse decode attention: accuracy study (experimental)
+# Block-sparse decode attention (experimental, off)
 
 At 85k context, attention is 55% of an 8-request MTP decode step and 27% of a
 single-request one ([PROFILE_85K.md](PROFILE_85K.md)); most of it is reading
 the KV history. This study asks whether decode can attend to a fraction of
 the history without losing accuracy, before building a fast implementation.
-Status: **accuracy measured; no speed-up yet** (the study implementation
-reads the whole K every step). Off by default.
+Status: the study below found no accuracy loss at 12.5% of the blocks; the
+implementation that reads only the kept blocks
+([Implementation](#implementation)) keeps that accuracy on the full model with
+FP8 KV + MTP, but its block selection in torch costs more per step than the
+attention it saves: decode is **~2x slower**. Off by default.
 
-## Method
+## Accuracy study
 
-`HY3_SPARSE_DECODE=<fraction>` (src/model.py, `sparse_keep_blocks`), decode
+The study implementation (commit 80c4bdb, since replaced) read the whole K
+every step: `HY3_SPARSE_DECODE=<fraction>`, decode
 only (prefill stays dense), BF16 KV, no DCP, one token per request per step:
 
 1. In every layer the decode query is computed as the decode kernel does it
@@ -24,11 +28,8 @@ only (prefill stays dense), BF16 KV, no DCP, one token per request per step:
    order and the history length is set to the tokens they hold, so the
    unchanged decode megakernel computes exact attention over them.
 
-`test/unit/test_sparse_decode.py` checks the selection and the compaction on
-CPU (fraction 1 is dense; the block holding a matching key is kept; the
-compacted table reads exactly the kept tokens).
-
-Evaluation (`scripts/sparse_decode_study.sh`: max_model_len 86016, prefix
+Evaluation (`scripts/sparse_decode_study.sh`, which now runs the
+implementation below: max_model_len 86016, prefix
 caching, chunked 4096-token prefill, one request at a time; each fraction is
 its own server, the dense run is the reference):
 
@@ -72,20 +73,61 @@ model, these task types (retrieval, continuation, long-document multiple
 choice); generations of 16-64 tokens; BF16 KV (FP8 packed K would need the
 summaries from the unpacked values).
 
-## Towards a fast implementation
+## Implementation
 
-What the study does every step, a real implementation keeps or avoids:
+`HY3_SPARSE_DECODE=<fraction>` (src/model.py; no DCP), decode only:
 
-| step | study | fast version |
+| step | study | implementation |
 |---|---|---|
-| per-block K min / max | gathers every K block of the request | stored per block (2 x 128 values per block and KV head, 1/16 of K) and updated at KV write (prefill blocks, decode token) |
-| bound | over the gathered summary | over the stored summaries: reads 1/16 of the K bytes |
-| decode attention | full-length context bucket, masked | a context bucket sized to the kept tokens (e.g. 16384 for 12.5% of 86016): the kernel reads only those blocks |
+| per-block K min / max | gathered from the K cache every step | `k_sum_min` / `k_sum_max` [blocks, kv heads, 128] BF16 next to the KV cache (`bind_attention_kv`), written by prefill (`update_k_summary_prefill`, from the K before FP8 quantization); 1/16 of the FP8 KV bytes |
+| query for the bound | the kernel's | computed again in torch (`_sparse_decode_blocks`) from own copies of the Q weight columns (dequantized to BF16) and the norm gammas, with RoPE from the positions (`prepare_sparse_decode`) |
+| kept blocks | a fraction of each request's history | `sparse_budget_blocks`: the fraction of the decode context bucket, rounded up to a multiple of 256 blocks (0.125 of 2688 -> 512 blocks, 16k tokens) |
+| decode attention | full-width table, masked | the kept blocks as a [B, 512] block table and `s_prior` 16384: the kernel reads only them |
 
-The last row needs the runner to pick the decode context bucket from the kept
-tokens instead of the context length (it otherwise slices the block table to
-the context bucket), so it touches the framework. Expected effect from the
-85k profile (attention grows ~5.8 ms per 85k-token request per step): at 8
-requests with MTP the attention part would drop from ~42 to ~15-20 ms of a
-76.6 ms step (~-30%); at one request ~-9%. With MTP the selection takes the
-union over the 4 verify tokens.
+With MTP the bound is the max over the 4 verify tokens, and the draft layer
+selects for its own cache too (`HY3_SPARSE_DRAFT=0` turns that off).
+
+Pitfalls found on the way (all covered by `test/unit/test_sparse_decode.py`
+or comments in the code):
+
+- **Torch ops reading tensors that also feed the decode megakernel** (the
+  cos / sin, the QKV weight, the norm gammas) gave wrong attention results;
+  hence the own weight copies and RoPE.
+- **The kernel reads a step's earlier verify tokens back through the block
+  table**: when the 4 MTP tokens cross a block boundary, the block after the
+  history must be in the compacted table. At most `n_sel - 1` blocks are
+  kept for that. Without it, LongBench v2 lost 5 of 78 items (with 3
+  unparsable answers), while the needle test still passed.
+- Summaries are written at prefill only (an in-place update in the decode
+  graph corrupted the KV cache): blocks decode wrote have none and are always
+  kept, with the sink and the last 4 blocks.
+- A block-table width that is not a multiple of 256 makes the kernel split
+  the 32-token blocks, which the compacted table does not survive.
+- HBM: the summaries (~0.9 GB per rank at 697k tokens) do not fit next to
+  the 32768-bucket decode NEFFs (`nrt_tensor_allocate` at runtime), so
+  `serve_85k.sh` drops that bucket when `HY3_SPARSE_DECODE` is set.
+
+### Results (full model, `serve_85k.sh` FP8 KV + MTP k=3, 0.125)
+
+Accuracy (`results/sparse_decode/lb_full_fp8mtp_*.json`): LongBench v2
+**55% vs 56%** dense, the same answer on **95/100** items (the 5 others are
+coherent near-ties, 8 unparsable in both), needle 12/12 (run before the
+verify-token fix).
+
+Speed: P/D split, `bench_pd_split.sh "1 4 8"` (85k prompts with a 78k shared
+prefix, 256 output tokens, pass 2;
+`results/bench/pd_split_85k_nodcp_fp8kv_mtp3_sparse` vs
+`..._mtp3`):
+
+| concurrency | TPOT dense | TPOT sparse | ITL dense | ITL sparse | MTP tokens / step |
+|---|---|---|---|---|---|
+| 1 | 23.4 ms | 49.4 ms | 47.4 ms | 100.5 ms | 2.0 / 2.0 |
+| 4 | 39.2 ms | 69.2 ms | 66.6 ms | 128.1 ms | 2.0 / 2.0 |
+| 8 | 51.0 ms | 81.5 ms | 76.7 ms | 137.1 ms | 2.0 / 2.0 |
+
+Every step is ~55-60 ms slower at any concurrency: a per-layer fixed cost of
+about 0.7 ms in 80 target and 3 draft layer calls, the torch selection
+(gather of 2688 block summaries, bound, top-k of 511, sort, gather) on top of
+the kernel. The attention it saves is ~25 ms per step at 8 requests by the
+[85k profile](PROFILE_85K.md). A speed-up needs the selection in an NKI
+kernel (or fused into the decode megakernel), well under 0.3 ms per layer.

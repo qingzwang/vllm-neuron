@@ -6,136 +6,174 @@ from hy_v3_neuron.model import (
     _SUMMARY_EMPTY,
     sparse_budget_blocks,
     sparse_select_blocks,
+    update_k_summary_decode,
     update_k_summary_prefill,
 )
 
-BS, D, KVH, NBLK = 32, 16, 1, 64
+BS, GROUP, D, KVH, NBLK = 32, 4, 16, 1, 128
+L = BS * GROUP  # tokens per group
 
 
 def _empty():
-    return (torch.full((NBLK, KVH, D), _SUMMARY_EMPTY, dtype=torch.bfloat16),
-            torch.full((NBLK, KVH, D), -_SUMMARY_EMPTY, dtype=torch.bfloat16))
+    k_sum = torch.empty(NBLK, 2, KVH, D, dtype=torch.bfloat16)
+    k_sum[:, 0] = _SUMMARY_EMPTY
+    k_sum[:, 1] = -_SUMMARY_EMPTY
+    return k_sum
+
+
+def _table(n_blocks, g):
+    return torch.randperm(NBLK - 1, generator=g)[:n_blocks] + 1  # block 0 is the null block
 
 
 def _slots(table_row, positions):
     return torch.tensor([int(table_row[p // BS]) * BS + p % BS for p in positions])
 
 
+def _expected(keys, table_row, n):
+    """Per-group min / max of the keys of positions < n, by the group's first block."""
+    out = {}
+    for gi in range(-(-n // L)):
+        ks = torch.stack([keys[p] for p in range(gi * L, min(n, (gi + 1) * L))])
+        out[int(table_row[gi * GROUP])] = (ks.amin(0), ks.amax(0))
+    return out
+
+
+def _check(k_sum, exp):
+    for blk, (mn, mx) in exp.items():
+        torch.testing.assert_close(k_sum[blk, 0].float(), mn.to(torch.bfloat16).float())
+        torch.testing.assert_close(k_sum[blk, 1].float(), mx.to(torch.bfloat16).float())
+
+
 def test_budget_is_a_multiple_of_256_and_capped():
-    assert sparse_budget_blocks(2688, 0.125, 1, 4) == 512  # 336 + 5 -> 512
-    assert sparse_budget_blocks(1024, 0.1, 1, 4) == 256
-    assert sparse_budget_blocks(200, 0.5, 1, 4) == 200  # not smaller: dense
+    assert sparse_budget_blocks(2688, 0.125, 4, 8) == 512  # 336 + 12 -> 512
+    assert sparse_budget_blocks(1024, 0.1, 4, 8) == 256
+    assert sparse_budget_blocks(200, 0.5, 4, 8) == 200  # not smaller: dense
+
+
+def _prefill(k_sum, table, keys, start, n, T, g):
+    k = torch.randn(KVH, T, D, generator=g)
+    pos = list(range(start, start + n))
+    for i, p in enumerate(pos):  # a re-computed token has the same K
+        if p in keys:
+            k[:, i] = keys[p]
+    slots = torch.full((T,), -1)
+    slots[:n] = _slots(table, pos)
+    for i, p in enumerate(pos):
+        keys[p] = k[:, i]
+    update_k_summary_prefill(k_sum, k, slots, table, BS, GROUP)
 
 
 def test_prefill_summaries_match_the_written_keys():
     g = torch.Generator().manual_seed(0)
-    table = torch.randperm(NBLK - 1, generator=g)[:10] + 1  # block 0 is the null block here
+    table = _table(12, g)
     keys = {}
-    kmin, kmax = _empty()
+    k_sum = _empty()
     # A stale summary on a reused block must not survive a fresh write.
-    kmin[table[2]] = -100.0
-    kmax[table[2]] = 100.0
-
-    def prefill(start, n, T):
-        k = torch.randn(KVH, T, D, generator=g)
-        pos = list(range(start, start + n))
-        for i, p in enumerate(pos):  # a re-computed token has the same K
-            if p in keys:
-                k[:, i] = keys[p]
-        slots = torch.full((T,), -1)
-        slots[:n] = _slots(table, pos)
-        for i, p in enumerate(pos):
-            keys[p] = k[:, i]
-        update_k_summary_prefill(kmin, kmax, k, slots, BS)
-
-    prefill(0, 64, 64)       # two full blocks
-    prefill(64, 41, 64)      # 41 tokens: block 2 full, block 3 partial, padding after
-    prefill(104, 1, 32)      # the re-computed last token: continues block 3
-    for b in range(4):
-        ks = torch.stack([keys[t] for t in range(b * BS, min(105, (b + 1) * BS))])
-        torch.testing.assert_close(kmin[table[b]].float(), ks.amin(0).to(torch.bfloat16).float())
-        torch.testing.assert_close(kmax[table[b]].float(), ks.amax(0).to(torch.bfloat16).float())
+    k_sum[table[4], 0] = -100.0
+    k_sum[table[4], 1] = 100.0
+    _prefill(k_sum, table, keys, 0, 160, 256, g)  # group 0 full, group 1 partial, padding after
+    _prefill(k_sum, table, keys, 160, 200, 256, g)  # starts inside group 1 (a 5-block prefix hit)
+    _prefill(k_sum, table, keys, 359, 1, 128, g)  # the re-computed last token
+    _check(k_sum, _expected(keys, table, 360))
 
 
-def _keys_and_summaries(n, g):
-    table = (torch.randperm(NBLK - 1, generator=g)[:8] + 1).view(1, 8)
-    k = torch.randn(KVH, 8 * BS, D, generator=g)
-    kmin, kmax = _empty()
-    slots = torch.full((8 * BS,), -1)
-    slots[:n] = _slots(table[0], range(n))
-    update_k_summary_prefill(kmin, kmax, k, slots, BS)
-    return table, k, kmin, kmax
-
-
-def test_bound_is_an_upper_bound_and_the_hot_block_is_kept():
+def test_decode_steps_fold_into_the_summaries():
     g = torch.Generator().manual_seed(1)
-    n = 250
-    table, k, kmin, kmax = _keys_and_summaries(n, g)
-    q = torch.randn(2, 1, 1, D, generator=g)  # 2 query heads on the KV head
-    k[0, 3 * BS + 5] = q[:, 0, 0].mean(0) * 20  # a key aligned with the query
-    kmin, kmax = _empty()
-    slots = torch.full((8 * BS,), -1)
+    table = _table(12, g).view(1, 12)
+    keys = {}
+    k_sum = _empty()
+    k_sum[table[0, 8], 0] = -100.0  # stale: group 2 starts in decode, fresh
+    k_sum[table[0, 8], 1] = 100.0
+    _prefill(k_sum, table[0], keys, 0, 250, 256, g)
+    n, written, cache = 250, [], {}
+    while n < 270:  # 4-token steps, 2 accepted each: crosses into group 2 at 256
+        k = torch.randn(1, 4, KVH, D, generator=g)
+        pos = torch.arange(n, n + 4)
+        for i, p in enumerate(pos.tolist()):
+            written.append((p, k[0, i]))
+            cache[p] = k[0, i]  # the slot's current key
+        slots = _slots(table[0], pos.tolist())
+        update_k_summary_decode(k_sum, k, pos, slots, table, BS, GROUP)
+        n += 2
+    # Group 1 (no step starts it) holds every key written into it, rejected ones included.
+    ks = torch.stack([keys[p] for p in range(L, 250)] + [x for p, x in written if p < 2 * L])
+    _check(k_sum, {int(table[0, GROUP]): (ks.amin(0), ks.amax(0))})
+    # Group 2 is restarted by the step at 256: a bound of the keys in the cache, no stale values.
+    s = k_sum[int(table[0, 2 * GROUP])].float()
+    now = torch.stack([x for p, x in cache.items() if p >= 2 * L]).to(torch.bfloat16).float()
+    assert (s[0] <= now.amin(0)).all() and (s[1] >= now.amax(0)).all()
+    assert s.abs().max() < 100
+
+
+def test_padding_rows_write_only_the_null_block():
+    g = torch.Generator().manual_seed(2)
+    table = _table(8, g).view(1, 8)
+    k_sum = _empty()
+    before = k_sum.clone()
+    k = torch.randn(1, 4, KVH, D, generator=g)
+    update_k_summary_decode(k_sum, k, torch.zeros(4, dtype=torch.long), torch.full((4,), -1), table, BS, GROUP)
+    assert torch.equal(k_sum[1:], before[1:])
+
+
+def _summaries(n, n_blocks, g, hot=None):
+    table = _table(n_blocks, g).view(1, n_blocks)
+    k = torch.randn(KVH, n_blocks * BS, D, generator=g)
+    if hot is not None:
+        k[0, hot[0]] = hot[1]
+    k_sum = _empty()
+    slots = torch.full((n_blocks * BS,), -1)
     slots[:n] = _slots(table[0], range(n))
-    update_k_summary_prefill(kmin, kmax, k, slots, BS)
-    # The bound of each block is >= the true max of q . k over its tokens.
-    smin, smax = kmin[table[0].long()].float(), kmax[table[0].long()].float()
-    for b in range(-(-n // BS)):
-        toks = k[0, b * BS : min(n, (b + 1) * BS)]
+    update_k_summary_prefill(k_sum, k, slots, table[0], BS, GROUP)
+    return table, k, k_sum
+
+
+def test_bound_is_an_upper_bound_and_the_hot_group_is_kept():
+    g = torch.Generator().manual_seed(3)
+    n, nb = 1000, 40  # 8 history groups, the last one partial; 10 in the table
+    q = torch.randn(2, 1, 1, D, generator=g)  # 2 query heads on the KV head
+    table, k, k_sum = _summaries(n, nb, g, hot=(3 * L + 5, q[:, 0, 0].mean(0) * 20))
+    for gi in range(-(-n // L)):
+        toks = k[0, gi * L : min(n, (gi + 1) * L)]
         true = (q[:, 0, 0] @ toks.T).max()
-        bound = (q[:, 0, 0].clamp(min=0) @ smax[b, 0] + q[:, 0, 0].clamp(max=0) @ smin[b, 0]).max()
+        s = k_sum[int(table[0, gi * GROUP])].float()
+        bound = (q[:, 0, 0].clamp(min=0) @ s[1, 0] + q[:, 0, 0].clamp(max=0) @ s[0, 0]).max()
         assert bound >= true - 1e-2
-    compact, prior = sparse_select_blocks(q, kmin, kmax, table, torch.tensor([n]), BS, 5, 1, 2)
-    nbv = -(-n // BS)
-    kept = compact[0, :4].tolist()  # n_sel - 1 kept, then the block after the history
-    assert int(table[0, 3]) in kept
-    assert kept[0] == int(table[0, 0]) and kept[-2:] == table[0, nbv - 2 : nbv].tolist()
-    assert kept == [x for x in table[0].tolist() if x in kept]  # original order
-    assert int(prior[0]) == 3 * BS + (n - BS * (nbv - 1))
-    # Past the kept blocks: the block after the history (here the history fills
-    # the table, so the index is clamped to its last block).
-    assert compact[0, 4:].tolist() == [int(table[0, min(nbv, 7)])]
+    # 5 groups in the table: 4 kept (sink, hot, 2 recent) + the one after the history
+    compact, prior = sparse_select_blocks(q, k_sum, table, torch.tensor([n]), BS, GROUP, 20, 1, 2)
+    nsv = -(-n // L)
+    kept = (0, 3, nsv - 2, nsv - 1)
+    assert compact[0].tolist() == torch.cat(
+        [table[0, gi * GROUP : (gi + 1) * GROUP] for gi in (*kept, nsv)]
+    ).tolist()
+    assert int(prior[0]) == 3 * L + (n - L * (nsv - 1))
 
 
 def test_budget_covering_the_history_is_dense():
-    g = torch.Generator().manual_seed(2)
-    n = 150
-    table, k, kmin, kmax = _keys_and_summaries(n, g)
+    g = torch.Generator().manual_seed(4)
+    n = 300  # 3 groups
+    table, _, k_sum = _summaries(n, 32, g)
     q = torch.randn(1, 1, 4, D, generator=g)  # one request, 4 verify tokens
-    compact, prior = sparse_select_blocks(q, kmin, kmax, table, torch.tensor([n]), BS, 6, 1, 2)
-    nbv = -(-n // BS)
-    assert compact[0].tolist() == table[0, :6].tolist()  # = the table, incl. the next block
+    compact, prior = sparse_select_blocks(q, k_sum, table, torch.tensor([n]), BS, GROUP, 16, 1, 1)
+    assert compact[0].tolist() == table[0, :16].tolist()  # the table, incl. the next group
     assert int(prior[0]) == n
 
 
-def test_blocks_written_by_decode_are_kept():
-    """Blocks past the prompt have no summary (decode does not write one): always kept."""
-    g = torch.Generator().manual_seed(3)
-    table = (torch.randperm(NBLK - 1, generator=g)[:12] + 1).view(1, 12)
-    kmin, kmax = _empty()
-    k = torch.randn(KVH, 6 * BS, D, generator=g)
-    slots = torch.full((6 * BS,), -1)
-    slots[: 5 * BS + 7] = _slots(table[0], range(5 * BS + 7))  # prompt: 5 blocks + 7 tokens
-    update_k_summary_prefill(kmin, kmax, k, slots, BS)
-    n = 9 * BS + 3  # decode filled the 6th block and wrote into blocks 7-9
-    q = torch.randn(1, 1, 1, D, generator=g)
-    compact, prior = sparse_select_blocks(q, kmin, kmax, table, torch.tensor([n]), BS, 9, 1, 2)
-    kept = compact[0, :8].tolist()
-    # Blocks 5 (prompt end, continued by decode) to 9 have to be kept, the sink too.
-    for b in [0, 5, 6, 7, 8, 9]:
-        assert int(table[0, b]) in kept
-    assert int(prior[0]) == 7 * BS + 3
-
-
-
-def test_the_block_after_the_history_stays_in_the_table():
-    """MTP verify tokens crossing a block boundary are read back through the table."""
+def test_the_group_after_the_history_stays_in_the_table():
+    """MTP verify tokens crossing a group boundary are read back through the table."""
     g = torch.Generator().manual_seed(5)
-    n = 7 * BS + 30  # 8 history blocks, 30 tokens in the last: a 4-token step crosses into block 8
-    table, k, kmin, kmax = _keys_and_summaries(min(n, 8 * BS), g)
-    table = torch.cat([table, (torch.arange(4) + 50).view(1, 4)], dim=1)  # blocks 8-11
+    n = 6 * L  # history ends exactly at a group boundary
+    table, _, k_sum = _summaries(n, 32, g)
     q = torch.randn(1, 1, 4, D, generator=g)
-    compact, prior = sparse_select_blocks(q, kmin, kmax, table, torch.tensor([n]), BS, 4, 1, 1)
-    assert compact.shape == (1, 4)
-    assert int(compact[0, 2]) == int(table[0, 7])  # the last history block, kept
-    assert int(compact[0, 3]) == int(table[0, 8])  # the next one
-    assert int(prior[0]) == 2 * BS + 30
+    compact, prior = sparse_select_blocks(q, k_sum, table, torch.tensor([n]), BS, GROUP, 12, 1, 1)
+    assert compact[0, 4:8].tolist() == table[0, 20:24].tolist()  # the last history group, kept
+    assert compact[0, 8:].tolist() == table[0, 24:28].tolist()  # the next one
+    assert int(prior[0]) == 2 * L
+
+
+def test_padding_requests_get_no_history():
+    g = torch.Generator().manual_seed(6)
+    table, _, k_sum = _summaries(500, 32, g)
+    table = torch.cat([table, torch.full((1, 32), -1)])
+    q = torch.randn(1, 2, 1, D, generator=g)
+    _, prior = sparse_select_blocks(q, k_sum, table, torch.tensor([500, 0]), BS, GROUP, 12, 1, 1)
+    assert int(prior[1]) == 0

@@ -145,15 +145,20 @@ _FORCE_UNPACKED_DECODE = os.environ.get("HY3_FP8_KV_FORCE_UNPACKED_DECODE") == "
 
 # EXPERIMENTAL block-sparse decode attention (Quest-style, docs/SPARSE_DECODE.md):
 # HY3_SPARSE_DECODE=<fraction> lets each decode step of a request attend to at
-# most that fraction of the decode context bucket's 32-token KV blocks (plus
-# HY3_SPARSE_SINK_BLOCKS first and HY3_SPARSE_RECENT_BLOCKS last ones, rounded
-# up to a multiple of 256 blocks), chosen per layer by an upper bound of
-# q . k from per-block K min / max summaries kept next to the KV cache. The
+# most that fraction of the decode context bucket (rounded up to a multiple of
+# 256 blocks), in groups of HY3_SPARSE_GROUP 32-token blocks (128 tokens),
+# chosen per layer by an upper bound of q . k from per-group K min / max
+# summaries kept next to the KV cache (always kept: the first
+# HY3_SPARSE_SINK_GROUPS and the last HY3_SPARSE_RECENT_GROUPS groups). The
 # kept blocks go to the decode kernel as a narrower block table, so it reads
-# only them. No DCP.
+# only them. Decode steps of fewer than HY3_SPARSE_MIN_BATCH requests stay
+# dense (the selection's fixed cost is more than the attention it saves).
+# No DCP.
 _SPARSE_DECODE = float(os.environ.get("HY3_SPARSE_DECODE", "0") or 0)
-_SPARSE_SINK = int(os.environ.get("HY3_SPARSE_SINK_BLOCKS", "1"))
-_SPARSE_RECENT = int(os.environ.get("HY3_SPARSE_RECENT_BLOCKS", "4"))
+_SPARSE_GROUP = int(os.environ.get("HY3_SPARSE_GROUP", "4"))
+_SPARSE_SINK = int(os.environ.get("HY3_SPARSE_SINK_GROUPS", "1"))
+_SPARSE_RECENT = int(os.environ.get("HY3_SPARSE_RECENT_GROUPS", "2"))
+_SPARSE_MIN_BATCH = int(os.environ.get("HY3_SPARSE_MIN_BATCH", "4"))
 
 
 def _is_fp8_kv(cache: torch.Tensor | None) -> bool:
@@ -184,9 +189,13 @@ def bind_attention_kv(
     attn.v_cache = v_cache
     attn.fp8_packed = packed
     if sparse and _SPARSE_DECODE > 0 and attn.dcp_size == 1:
+        # [blocks, (min, max), kvh, D]: a group's summary lives at the row of
+        # its first block. Empty: min > max.
         shape = (v_cache.shape[0], v_cache.shape[1], v_cache.shape[-1])
-        attn.k_sum_min = torch.full(shape, _SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device)
-        attn.k_sum_max = torch.full(shape, -_SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device)
+        attn.k_sum = torch.stack([
+            torch.full(shape, _SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device),
+            torch.full(shape, -_SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device),
+        ], dim=1)
 
 
 def _quantize_kv(x: torch.Tensor, q, dtype: torch.dtype) -> torch.Tensor:
@@ -278,7 +287,7 @@ class HYV3RMSNorm(nn.Module):
         return (self.weight * hidden_states).to(input_dtype)
 
 
-_SUMMARY_EMPTY = 3.0e38  # min / max of a block nothing was written to (BF16-representable)
+_SUMMARY_EMPTY = 3.0e38  # min / max of a group nothing was written to (BF16-representable)
 
 
 def sparse_budget_blocks(nb: int, frac: float, sink: int, recent: int) -> int:
@@ -293,116 +302,180 @@ def sparse_budget_blocks(nb: int, frac: float, sink: int, recent: int) -> int:
     return min(k, nb)
 
 
-def update_k_summary_prefill(kmin, kmax, k, slot_mapping, block_size):
-    """Fold one prefill chunk's K into the per-block K min / max.
+def update_k_summary_prefill(k_sum, k, slot_mapping, block_row, block_size, group):
+    """Fold one prefill chunk's K into the per-group K min / max.
 
-    k: [kvh, T, D] (after QK-norm + RoPE), slot_mapping: [T] (-1 = padding).
-    Assumes the chunk starts at a block boundary, except a chunk of tokens that
-    continue one block (the re-computed last token of a full prefix hit), which
-    is merged with the block's summary.
+    k_sum: [blocks, 2, kvh, D], k: [kvh, T, D] (after QK-norm + RoPE),
+    slot_mapping: [T] (-1 = padding), block_row: [nb] the request's block
+    table (one prefill per step). The chunk's tokens are contiguous; a group
+    the chunk starts inside of (a prefix hit that ends inside a group, the
+    re-computed last token) is merged with its summary, the others are
+    written fresh.
     """
     kvh, T, D = k.shape
-    G = T // block_size
-    blk, off = paged_slot_indices(slot_mapping, block_size, kmin.shape[0])
-    valid = (slot_mapping >= 0).view(T, 1, 1)
-    kk = k.permute(1, 0, 2).to(torch.float32)
-    gmin = torch.where(valid, kk, _SUMMARY_EMPTY).view(G, block_size, kvh, D).amin(1)
-    gmax = torch.where(valid, kk, -_SUMMARY_EMPTY).view(G, block_size, kvh, D).amax(1)
-    gblk = blk.view(G, block_size)[:, 0]
-    cont = (off.view(G, block_size)[:, 0] != 0).view(G, 1, 1)
-    gmin = torch.where(cont, torch.minimum(kmin[gblk].to(torch.float32), gmin), gmin)
-    gmax = torch.where(cont, torch.maximum(kmax[gblk].to(torch.float32), gmax), gmax)
-    kmin.index_put_((gblk,), gmin.to(kmin.dtype))
-    kmax.index_put_((gblk,), gmax.to(kmax.dtype))
+    L = block_size * group
+    nb = block_row.shape[0]
+    dev = k.device
+    blk, off = paged_slot_indices(slot_mapping, block_size, k_sum.shape[0])
+    valid = slot_mapping >= 0
+    # Logical position of the first token, from where its block is in the table.
+    lb0 = torch.argmax((block_row.to(torch.long) == blk[0]).to(torch.int32))
+    p0 = lb0 * block_size + off[0]
+    r = p0 % L
+    # Shift the tokens by r so that the group boundaries fall on multiples of L.
+    src = torch.arange(T + L, device=dev) - r
+    ok = (src >= 0) & (src < T)
+    src = torch.clamp(src, min=0, max=T - 1)
+    kk = k.permute(1, 0, 2).to(torch.float32)[src]  # [T + L, kvh, D]
+    v = (ok & valid[src]).view(-1, 1, 1)
+    G = T // L + 1
+    gmin = torch.where(v, kk, _SUMMARY_EMPTY).view(G, L, kvh, D).amin(1)
+    gmax = torch.where(v, kk, -_SUMMARY_EMPTY).view(G, L, kvh, D).amax(1)
+    gvalid = v.view(G, L).any(dim=1)
+    gi = torch.arange(G, device=dev)
+    sb = p0 // L + gi
+    key = block_row.to(torch.long)[torch.clamp(sb * group, max=nb - 1)].clamp(min=0)
+    key = torch.where(gvalid, key, 0)  # all-padding groups: the null block
+    cont = ((gi == 0) & (r != 0)).view(G, 1, 1)
+    old = k_sum[key].to(torch.float32)
+    gmin = torch.where(cont, torch.minimum(old[:, 0], gmin), gmin)
+    gmax = torch.where(cont, torch.maximum(old[:, 1], gmax), gmax)
+    k_sum.index_put_((key,), torch.stack([gmin, gmax], dim=1).to(k_sum.dtype))
+
+
+def update_k_summary_decode(k_sum, k, positions, slot_mapping, block_table, block_size, group):
+    """Fold one decode step's K into the per-group K min / max.
+
+    k: [B, S, kvh, D] (after QK-norm + RoPE), positions / slot_mapping: [B * S]
+    (slot -1 = padding). A request's S tokens span at most two groups: the one
+    of its first token (merged, or fresh when that token starts the group) and
+    the next one (fresh). Rejected speculative tokens stay in the summary,
+    which only loosens the bound.
+    """
+    B, S = k.shape[:2]
+    L = block_size * group
+    nb = block_table.shape[1]
+    pos = positions.view(B, S).to(torch.long)
+    valid = slot_mapping.view(B, S) >= 0
+    sb = torch.div(pos, L, rounding_mode="floor")
+    sb0 = sb[:, :1]
+    in_a = (sb == sb0) & valid
+    in_b = (sb != sb0) & valid
+    kk = k.to(torch.float32)
+
+    def reduce(m):
+        m = m.view(B, S, 1, 1)
+        return (torch.where(m, kk, _SUMMARY_EMPTY).amin(dim=1),
+                torch.where(m, kk, -_SUMMARY_EMPTY).amax(dim=1))
+
+    min_a, max_a = reduce(in_a)
+    min_b, max_b = reduce(in_b)
+    t = block_table.to(torch.long)
+    key_a = t.gather(1, torch.clamp(sb0 * group, max=nb - 1)).view(B).clamp(min=0)
+    key_b = t.gather(1, torch.clamp((sb0 + 1) * group, max=nb - 1)).view(B).clamp(min=0)
+    has_a, has_b = in_a.any(dim=1), in_b.any(dim=1)
+    key_a = torch.where(has_a, key_a, 0)  # padding rows: the null block
+    fresh = (pos[:, 0] % L == 0).view(B, 1, 1)
+    old = k_sum[key_a].to(torch.float32)
+    new_a = torch.stack([
+        torch.where(fresh, min_a, torch.minimum(old[:, 0], min_a)),
+        torch.where(fresh, max_a, torch.maximum(old[:, 1], max_a)),
+    ], dim=1)
+    new_b = torch.stack([min_b, max_b], dim=1)
+    # No second group: write the first one twice (same row, same values).
+    key_b = torch.where(has_b, key_b, key_a)
+    new_b = torch.where(has_b.view(B, 1, 1, 1), new_b, new_a)
+    k_sum.index_put_((torch.cat([key_a, key_b]),), torch.cat([new_a, new_b]).to(k_sum.dtype))
 
 
 def prepare_sparse_decode(layer, device, from_weights: bool = True) -> None:
     """EXPERIMENTAL (HY3_SPARSE_DECODE): own copies of the weights the selection reads.
 
-    The selection computes the decode query in torch. Reading the parameters the
-    decode megakernel also reads (QKV weight, QK-norm and input RMSNorm gammas)
-    from those torch ops gave wrong attention results; separate copies (the Q
-    columns dequantized to BF16, ~1 MB per layer and rank) do not.
+    The selection computes the decode Q and K in torch. Reading the parameters
+    the decode megakernel also reads (QKV weight, QK-norm and input RMSNorm
+    gammas) from those torch ops gave wrong attention results; separate copies
+    (the Q and K columns dequantized to BF16, ~2 MB per layer and rank) do not.
     ``from_weights=False`` (CPU compile) allocates placeholders.
     """
     attn = layer.self_attn
     if _SPARSE_DECODE <= 0 or attn.dcp_size > 1:
         return
-    nh, D, H = attn.num_attention_heads_per_rank, attn.head_dim, attn.hidden_size
+    nh, kvh = attn.num_attention_heads_per_rank, attn.num_key_value_heads_per_rank
+    D, H = attn.head_dim, attn.hidden_size
     if from_weights:
-        w = attn.qkv_proj_weight.detach().to("cpu")[:, : nh * D].to(torch.float32)
-        w = w * attn.qkv_weight_scale.detach().to("cpu").to(torch.float32)[0, 0]
+        w = attn.qkv_proj_weight.detach().to("cpu")[:, : (nh + kvh) * D].to(torch.float32)
+        sc = attn.qkv_weight_scale.detach().to("cpu").to(torch.float32)[0]
+        w = torch.cat([w[:, : nh * D] * sc[0], w[:, nh * D :] * sc[1]], dim=1)
         qn = attn.q_norm.weight.detach().to("cpu").clone()
+        kn = attn.k_norm.weight.detach().to("cpu").clone()
         ln = layer.input_layernorm.weight.detach().to("cpu").clone()
     else:
-        w, qn, ln = torch.zeros(H, nh * D), torch.ones(D), torch.ones(H)
+        w, qn, kn, ln = torch.zeros(H, (nh + kvh) * D), torch.ones(D), torch.ones(D), torch.ones(H)
 
     def param(t, dtype):
         return nn.Parameter(t.to(dtype).contiguous().to(device), requires_grad=False)
 
-    attn.sparse_wq = param(w, attn.dtype)
+    attn.sparse_wqk = param(w, attn.dtype)
     attn.sparse_qnorm_w = param(qn, torch.float32)
+    attn.sparse_knorm_w = param(kn, torch.float32)
     attn.sparse_ln_w = param(ln, torch.float32)
 
 
-def sparse_select_blocks(q, kmin, kmax, block_table, n_hist, block_size, n_sel, sink, recent):
+def sparse_select_blocks(q, k_sum, block_table, n_hist, block_size, group, n_sel, sink, recent):
     """The ``n_sel`` blocks a decode step attends to, and the history tokens they hold.
 
-    q: [nh, B, S, D] fp32 (QK-norm + RoPE), kmin / kmax: [blocks, kvh, D],
-    block_table: [B, nb], n_hist: [B] history tokens. Scores every block with
-    the Quest bound max_k q . k <= relu(q) . max + min(q, 0) . min (max over
-    the step's queries and the KV head's query heads), always keeps the first
-    ``sink`` and last ``recent`` valid blocks, and returns the kept blocks in
-    their original order ([B, n_sel]; past the kept count the entries are
-    masked) and the number of history tokens in them ([B]). At most
-    ``n_sel - 1`` blocks are kept: the kernel reads a step's earlier tokens
-    back through the table (MTP verify), so the block after the history must
-    stay in it when they cross a block boundary.
+    q: [nh, B, S, D] fp32 (QK-norm + RoPE), k_sum: [blocks, 2, kvh, D],
+    block_table: [B, nb], n_hist: [B] history tokens. Scores every group of
+    ``group`` blocks with the Quest bound
+    max_k q . k <= relu(q) . max + min(q, 0) . min (max over the step's queries
+    and the KV head's query heads), always keeps the first ``sink`` and the
+    last ``recent`` valid groups, and returns the kept groups' blocks in their
+    original order ([B, n_sel]) and the number of history tokens in them ([B]).
+    At most ``n_sel / group - 1`` groups are kept: the kernel reads a step's
+    earlier tokens back through the table (MTP verify), so the group after the
+    history must stay in it when they cross into it.
     """
     nh, B, S, D = q.shape
-    kvh = kmin.shape[1]
-    nb = block_table.shape[1]
+    kvh = k_sum.shape[2]
     t = block_table.to(torch.long)
-    tg = torch.clamp(t, min=0)  # unallocated entries are -1; their scores are masked
-    smin = kmin[tg].to(torch.float32)  # [B, nb, kvh, D]
-    smax = kmax[tg].to(torch.float32)
-    # A block without a summary (min > max) scores 0 here and is kept below:
+    nb = t.shape[1]
+    ns, L, k_g = nb // group, block_size * group, n_sel // group
+    first = torch.clamp(t.view(B, ns, group)[:, :, 0], min=0)  # unallocated: -1, masked below
+    summ = k_sum[first].to(torch.float32)  # [B, ns, 2, kvh, D]
+    smin, smax = summ[:, :, 0], summ[:, :, 1]
+    # A group without a summary (min > max) scores 0 here and is kept below:
     # the +-3e38 sentinels times q would overflow into inf - inf = NaN, which
     # top-k does not order.
-    empty_blk = smax < smin  # [B, nb, kvh, D]
-    empty = empty_blk.any(dim=-1).any(dim=-1)  # [B, nb]
-    smin = torch.where(empty_blk, 0.0, smin)
-    smax = torch.where(empty_blk, 0.0, smax)
+    empty_g = smax < smin
+    empty = empty_g.any(dim=-1).any(dim=-1)  # [B, ns]
+    smin = torch.where(empty_g, 0.0, smin)
+    smax = torch.where(empty_g, 0.0, smax)
     qg = q.view(kvh, nh // kvh, B, S, D).permute(2, 0, 1, 3, 4).reshape(B, kvh, -1, D)
     qpos, qneg = torch.clamp(qg, min=0), torch.clamp(qg, max=0)
     bound = torch.einsum("bhqd,bnhd->bnhq", qpos, smax) + torch.einsum("bhqd,bnhd->bnhq", qneg, smin)
-    score = bound.amax(dim=(2, 3))  # [B, nb]
+    score = bound.amax(dim=(2, 3))  # [B, ns]
     n = n_hist.to(torch.long).view(B, 1)
-    nbv = torch.div(n + block_size - 1, block_size, rounding_mode="floor")
-    idx = torch.arange(nb, device=q.device).view(1, nb)
-    valid = idx < nbv
-    # Summaries are written at prefill only (an in-place summary update in the
-    # decode graph corrupted the KV cache): blocks decode wrote have none and
-    # are always kept, with the prompt's last block, which decode continues.
-    empty = valid & empty
-    first_empty = torch.where(empty, idx, nb).amin(dim=1, keepdim=True)
-    forced = valid & ((idx < sink) | (idx >= torch.minimum(nbv - recent, first_empty - 1)))
+    nsv = torch.div(n + L - 1, L, rounding_mode="floor")
+    idx = torch.arange(ns, device=q.device).view(1, ns)
+    valid = idx < nsv
+    forced = valid & ((idx < sink) | (idx >= nsv - recent) | empty)
     big = torch.finfo(torch.float32).max
-    # The last block ranks first: it must stay even if the forced ones overflow.
-    score = torch.where(valid & (idx == nbv - 1), big, torch.where(forced, big / 2, torch.where(valid, score, -big)))
-    top = torch.topk(score, n_sel - 1, dim=1).indices  # [B, n_sel - 1]
-    # Kept blocks first, in their original order. After them come the blocks
-    # that follow the history in the request's table: the step's own tokens
-    # are written there, and the kernel may read those slots as history.
-    key = torch.sort(torch.where(top < nbv, top, top + nb), dim=1).values
-    cnt = torch.minimum(nbv, torch.full_like(nbv, n_sel - 1))  # [B, 1]
+    # The last group ranks first: it must stay even if the forced ones overflow.
+    score = torch.where(valid & (idx == nsv - 1), big, torch.where(forced, big / 2, torch.where(valid, score, -big)))
+    top = torch.topk(score, k_g - 1, dim=1).indices  # [B, k_g - 1]
+    # Kept groups first, in their original order; then the groups that follow
+    # the history in the request's table (the step's own tokens are written
+    # there, and the kernel may read those slots as history).
+    key = torch.sort(torch.where(top < nsv, top, top + ns), dim=1).values
     key = torch.cat([key, key.new_zeros(B, 1)], dim=1)
-    j = torch.arange(n_sel, device=q.device).view(1, n_sel)
-    pick = torch.where(j < cnt, key, torch.clamp(nbv + j - cnt, max=nb - 1))
-    compact = t.gather(1, pick).to(block_table.dtype)
+    cnt = torch.minimum(nsv, torch.full_like(nsv, k_g - 1))  # [B, 1]
+    j = torch.arange(k_g, device=q.device).view(1, k_g)
+    pick = torch.where(j < cnt, key, torch.clamp(nsv + j - cnt, max=ns - 1))
+    blocks = (pick.unsqueeze(-1) * group + torch.arange(group, device=q.device)).view(B, n_sel)
+    compact = t.gather(1, blocks).to(block_table.dtype)
     cnt = cnt.view(B)
-    fill = n.view(B) - block_size * (nbv.view(B) - 1)  # tokens in the last (always kept) block
-    return compact, block_size * (cnt - 1) + fill
+    fill = n.view(B) - L * (nsv.view(B) - 1)  # tokens in the last (always kept) group
+    return compact, L * (cnt - 1) + fill
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -526,10 +599,9 @@ class HYV3Attention(nn.Module):
         self.k_cache = None
         self.v_cache = None
         self.fp8_packed = False
-        # EXPERIMENTAL sparse decode: per-block K min / max ([blocks, kvh, D]),
+        # EXPERIMENTAL sparse decode: per-group K min / max ([blocks, 2, kvh, D]),
         # allocated with the cache (bind_attention_kv) when HY3_SPARSE_DECODE is set.
-        self.k_sum_min = None
-        self.k_sum_max = None
+        self.k_sum = None
         # FP8 KV quantizing scales q = 1 / dequant (cache = fp8(x * q)), set by
         # load_weights / load_weights_lite (_load_kv_cache_scales); FP8 KV
         # refuses to bind before they are set (kv_scale_t is None).
@@ -712,8 +784,10 @@ class HYV3Attention(nn.Module):
             _write_packed_k(self.k_cache, k_rows, *index)
         else:
             self.k_cache.index_put_(index, k_rows)
-        if self.k_sum_min is not None:
-            update_k_summary_prefill(self.k_sum_min, self.k_sum_max, k, slot_mapping, block_size)
+        if self.k_sum is not None:
+            update_k_summary_prefill(
+                self.k_sum, k, slot_mapping, meta["block_table_tensor"][0], block_size, _SPARSE_GROUP
+            )
 
         # Step 4: Attention
         kv_segment_size = meta.get("kv_segment_size")
@@ -800,23 +874,25 @@ class HYV3Attention(nn.Module):
             attn_output = self.tp_group.reduce_scatter(attn_output, dim=0)
         return attn_output.contiguous()
 
-    def _sparse_decode_blocks(self, X, ln_w, position_embeddings, positions, slot_mapping,
-                              block_table, block_size, n_sel):
-        """EXPERIMENTAL (HY3_SPARSE_DECODE): the ``n_sel`` blocks each request attends to.
+    def _sparse_decode_blocks(self, X, positions, slot_mapping, block_table, block_size, n_sel):
+        """EXPERIMENTAL (HY3_SPARSE_DECODE): fold the step's K into the summaries
+        and, when ``n_sel`` is set, select the ``n_sel`` blocks each request
+        attends to.
 
-        Returns ``(block_table [B, n_sel], history tokens [B])``.
+        Returns ``(block_table [B, n_sel], history tokens [B])`` or None.
         """
         B, S, H = X.shape
         nh, kvh, D = self.num_attention_heads_per_rank, self.num_key_value_heads_per_rank, self.head_dim
-        # Q as the decode kernel computes it (RMSNorm, QKV projection, QK-norm,
-        # RoPE), with BF16 activations and the weight copies of
+        # Q and K as the decode kernel computes them (RMSNorm, QKV projection,
+        # QK-norm, RoPE), with BF16 activations and the weight copies of
         # prepare_sparse_decode (not the kernel's own parameters).
         x = X.to(torch.float32).view(B * S, H)
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.rms_norm_eps)
         xn = (x * self.sparse_ln_w.view(1, -1)).to(self.dtype)
-        q = (xn @ self.sparse_wq).view(B * S, nh, D).transpose(0, 1).to(torch.float32)
-        q = q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + self.q_norm.variance_epsilon)
-        q = q * self.sparse_qnorm_w
+        qk = (xn @ self.sparse_wqk).view(B * S, nh + kvh, D).transpose(0, 1).to(torch.float32)
+        qk = qk * torch.rsqrt(qk.pow(2).mean(-1, keepdim=True) + self.q_norm.variance_epsilon)
+        q = qk[:nh] * self.sparse_qnorm_w
+        k = qk[nh:] * self.sparse_knorm_w
         # RoPE from the positions, not from position_embeddings: reading the
         # cos / sin that also feed the decode kernel (cos_kernel / sin_kernel)
         # in these torch ops gave wrong attention results.
@@ -825,11 +901,22 @@ class HYV3Attention(nn.Module):
         )
         freqs = positions.view(-1, 1).to(torch.float32) * inv_freq.view(1, -1)
         emb = torch.cat((freqs, freqs), dim=-1).unsqueeze(0)  # [1, B * S, D]
-        q = q * emb.cos() + _rotate_half(q) * emb.sin()  # [nh, B * S, D]
-        return sparse_select_blocks(
-            q.view(nh, B, S, D), self.k_sum_min, self.k_sum_max, block_table,
-            positions.view(B, S)[:, 0], block_size, n_sel, _SPARSE_SINK, _SPARSE_RECENT,
+        cos, sin = emb.cos(), emb.sin()
+        q = q * cos + _rotate_half(q) * sin  # [nh, B * S, D]
+        k = k * cos + _rotate_half(k) * sin  # [kvh, B * S, D]
+        out = None
+        if n_sel:
+            # Before this step's K is folded in: the group the step writes is
+            # always kept.
+            out = sparse_select_blocks(
+                q.view(nh, B, S, D), self.k_sum, block_table, positions.view(B, S)[:, 0],
+                block_size, _SPARSE_GROUP, n_sel, _SPARSE_SINK, _SPARSE_RECENT,
+            )
+        update_k_summary_decode(
+            self.k_sum, k.view(kvh, B, S, D).permute(1, 2, 0, 3), positions, slot_mapping,
+            block_table, block_size, _SPARSE_GROUP,
         )
+        return out
 
     def forward_decode(
         self,
@@ -887,19 +974,21 @@ class HYV3Attention(nn.Module):
             owner = torch.div(remaining, block_size, rounding_mode="trunc") % W
             dcp_active_mask = (owner == R).float()
 
-        n_sel = (
-            sparse_budget_blocks(block_table.shape[1], _SPARSE_DECODE, _SPARSE_SINK, _SPARSE_RECENT)
-            if self.k_sum_min is not None
-            else block_table.shape[1]
-        )
         attention_mask = None
-        sparse = n_sel < block_table.shape[1]
-        if sparse:
-            # >>> EXPERIMENTAL sparse decode: the kernel reads n_sel blocks.
-            block_table, prior = self._sparse_decode_blocks(
-                X, ln_w, position_embeddings, positions, slot_mapping, block_table,
-                block_size, n_sel,
+        n_sel = 0
+        if self.k_sum is not None:
+            nb = block_table.shape[1]
+            n_sel = sparse_budget_blocks(
+                nb, _SPARSE_DECODE, _SPARSE_SINK * _SPARSE_GROUP, _SPARSE_RECENT * _SPARSE_GROUP
             )
+            if n_sel >= nb or B < _SPARSE_MIN_BATCH or nb % _SPARSE_GROUP:
+                n_sel = 0
+            # >>> EXPERIMENTAL sparse decode: the kernel reads n_sel blocks.
+            selected = self._sparse_decode_blocks(
+                X, positions, slot_mapping, block_table, block_size, n_sel
+            )
+        if n_sel:
+            block_table, prior = selected
             S_ctx = n_sel * block_size
             # History tokens: the kept blocks' (repeated per verify token).
             prior_pos = prior.view(B, 1) + torch.arange(S_decode, device=X.device).view(1, -1)

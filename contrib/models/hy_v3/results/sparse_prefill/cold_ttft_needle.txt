@@ -23,6 +23,15 @@ cold request 1: 12.10 s, prompt tokens 85000
 cold request 2: 12.13 s, prompt tokens 85000
 cold request 3: 12.07 s, prompt tokens 85000
 cold TTFT median 12.13 s
+## HY3_SPARSE_PREFILL_METHOD=stem HY3_SPARSE_PREFILL=0.25 + HY3_SPARSE_DECODE=0.125
+cold request 0: 12.13 s, prompt tokens 85000
+cold request 1: 12.00 s, prompt tokens 85000
+cold request 2: 12.05 s, prompt tokens 85000
+cold request 3: 12.00 s, prompt tokens 85000
+cold TTFT median 12.05 s
 # needle
 0.25: 12/12 passed
 0.125: 12/12 passed
+stem 0.125: 12/12 passed
+stem 0.25: 12/12 passed
+stem 192 groups, mu 1: 12/12 passed

@@ -177,6 +177,22 @@ _SPARSE_SEL_CACHE_KEY = "_hy_v3_sparse_selection"
 # chunk's queries. The kept prior blocks and the chunk's own blocks make the
 # BF16 copy the segmented kernel reads.
 _SPARSE_PREFILL = float(os.environ.get("HY3_SPARSE_PREFILL", "0") or 0)
+# HY3_SPARSE_PREFILL_METHOD: how the prefill picks the groups.
+#   quest (default): the K min / max bound above, a fixed budget.
+#   stem: Stem (arXiv 2603.06274), with its own per-group summaries (mean K,
+#     max log ||V||): a group's metric for a 128-query block is
+#     mean(Q) . mean(K) + beta * max(0, max log ||V||); the budget starts at
+#     HY3_SPARSE_PREFILL of the table and decays linearly with the chunk's
+#     position to mu times that at the end of the table; HY3_STEM_SINK_GROUPS
+#     first and HY3_STEM_LOCAL_GROUPS last groups always kept.
+_SPARSE_PREFILL_METHOD = os.environ.get("HY3_SPARSE_PREFILL_METHOD", "quest").strip().lower() or "quest"
+if _SPARSE_PREFILL_METHOD not in ("quest", "stem"):
+    raise ValueError(f"HY3_SPARSE_PREFILL_METHOD={_SPARSE_PREFILL_METHOD!r}: expected quest or stem")
+_STEM = _SPARSE_PREFILL > 0 and _SPARSE_PREFILL_METHOD == "stem"
+_STEM_BETA = float(os.environ.get("HY3_STEM_BETA", "0.2"))
+_STEM_MU = float(os.environ.get("HY3_STEM_MU", "0.7"))
+_STEM_SINK = int(os.environ.get("HY3_STEM_SINK_GROUPS", "4"))
+_STEM_LOCAL = int(os.environ.get("HY3_STEM_LOCAL_GROUPS", "4"))
 
 
 def _is_fp8_kv(cache: torch.Tensor | None) -> bool:
@@ -214,6 +230,12 @@ def bind_attention_kv(
             torch.full(shape, _SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device),
             torch.full(shape, -_SUMMARY_EMPTY, dtype=torch.bfloat16, device=v_cache.device),
         ], dim=1)
+        if _STEM:
+            # [blocks, kvh, D + 1]: the group's mean K, then its max log ||V||.
+            attn.kv_stem = torch.zeros(
+                (v_cache.shape[0], v_cache.shape[1], v_cache.shape[-1] + 1),
+                dtype=torch.bfloat16, device=v_cache.device,
+            )
 
 
 def _quantize_kv(x: torch.Tensor, q, dtype: torch.dtype) -> torch.Tensor:
@@ -320,6 +342,39 @@ def sparse_budget_blocks(nb: int, frac: float, sink: int, recent: int) -> int:
     return min(k, nb)
 
 
+def _prefill_groups(slot_mapping, block_row, block_size, group, n_blocks, T):
+    """Group layout of one prefill chunk's T contiguous tokens.
+
+    Returns ``src`` [T + L] (token index per group slot, the tokens shifted so
+    that group boundaries fall on multiples of L), ``ok`` [T + L] (a real
+    token), ``key`` [G] (the cache row of each group's first block; all-padding
+    groups: the null block), ``cont`` [G] (the chunk starts inside that group:
+    merge with its summary) and ``r`` (tokens of the first group before the
+    chunk).
+    """
+    L = block_size * group
+    nb = block_row.shape[0]
+    dev = slot_mapping.device
+    blk, off = paged_slot_indices(slot_mapping, block_size, n_blocks)
+    valid = slot_mapping >= 0
+    # Logical position of the first token, from where its block is in the table.
+    lb0 = torch.argmax((block_row.to(torch.long) == blk[0]).to(torch.int32))
+    p0 = lb0 * block_size + off[0]
+    r = p0 % L
+    src = torch.arange(T + L, device=dev) - r
+    ok = (src >= 0) & (src < T)
+    src = torch.clamp(src, min=0, max=T - 1)
+    ok = ok & valid[src]
+    G = T // L + 1
+    gvalid = ok.view(G, L).any(dim=1)
+    gi = torch.arange(G, device=dev)
+    sb = p0 // L + gi
+    key = block_row.to(torch.long)[torch.clamp(sb * group, max=nb - 1)].clamp(min=0)
+    key = torch.where(gvalid, key, 0)
+    cont = (gi == 0) & (r != 0)
+    return src, ok, key, cont, r
+
+
 def update_k_summary_prefill(k_sum, k, slot_mapping, block_row, block_size, group):
     """Fold one prefill chunk's K into the per-group K min / max.
 
@@ -332,33 +387,47 @@ def update_k_summary_prefill(k_sum, k, slot_mapping, block_row, block_size, grou
     """
     kvh, T, D = k.shape
     L = block_size * group
-    nb = block_row.shape[0]
-    dev = k.device
-    blk, off = paged_slot_indices(slot_mapping, block_size, k_sum.shape[0])
-    valid = slot_mapping >= 0
-    # Logical position of the first token, from where its block is in the table.
-    lb0 = torch.argmax((block_row.to(torch.long) == blk[0]).to(torch.int32))
-    p0 = lb0 * block_size + off[0]
-    r = p0 % L
-    # Shift the tokens by r so that the group boundaries fall on multiples of L.
-    src = torch.arange(T + L, device=dev) - r
-    ok = (src >= 0) & (src < T)
-    src = torch.clamp(src, min=0, max=T - 1)
+    src, ok, key, cont, _ = _prefill_groups(slot_mapping, block_row, block_size, group, k_sum.shape[0], T)
+    G = key.shape[0]
     kk = k.permute(1, 0, 2).to(torch.float32)[src]  # [T + L, kvh, D]
-    v = (ok & valid[src]).view(-1, 1, 1)
-    G = T // L + 1
+    v = ok.view(-1, 1, 1)
     gmin = torch.where(v, kk, _SUMMARY_EMPTY).view(G, L, kvh, D).amin(1)
     gmax = torch.where(v, kk, -_SUMMARY_EMPTY).view(G, L, kvh, D).amax(1)
-    gvalid = v.view(G, L).any(dim=1)
-    gi = torch.arange(G, device=dev)
-    sb = p0 // L + gi
-    key = block_row.to(torch.long)[torch.clamp(sb * group, max=nb - 1)].clamp(min=0)
-    key = torch.where(gvalid, key, 0)  # all-padding groups: the null block
-    cont = ((gi == 0) & (r != 0)).view(G, 1, 1)
+    cont = cont.view(G, 1, 1)
     old = k_sum[key].to(torch.float32)
     gmin = torch.where(cont, torch.minimum(old[:, 0], gmin), gmin)
     gmax = torch.where(cont, torch.maximum(old[:, 1], gmax), gmax)
     k_sum.index_put_((key,), torch.stack([gmin, gmax], dim=1).to(k_sum.dtype))
+
+
+def _log_vnorm(v):
+    """log ||v||_2 over the last dim (fp32)."""
+    return torch.log(torch.clamp(v.to(torch.float32).pow(2).sum(-1).sqrt(), min=1e-6))
+
+
+def update_stem_summary_prefill(kv_stem, k, v, slot_mapping, block_row, block_size, group):
+    """EXPERIMENTAL (HY3_SPARSE_PREFILL_METHOD=stem): fold one prefill chunk's
+    K / V into the per-group mean K and max log ||V||.
+
+    kv_stem: [blocks, kvh, D + 1], k / v: [kvh, T, D] (K after QK-norm + RoPE).
+    A group the chunk starts inside of holds ``r`` earlier tokens: its mean is
+    merged with that count.
+    """
+    kvh, T, D = k.shape
+    L = block_size * group
+    src, ok, key, cont, r = _prefill_groups(slot_mapping, block_row, block_size, group, kv_stem.shape[0], T)
+    G = key.shape[0]
+    kk = k.permute(1, 0, 2).to(torch.float32)[src]  # [T + L, kvh, D]
+    lv = _log_vnorm(v).permute(1, 0)[src]  # [T + L, kvh]
+    m = ok.view(-1, 1)
+    ksum = torch.where(m.view(-1, 1, 1), kk, 0.0).view(G, L, kvh, D).sum(1)
+    cnt = ok.view(G, L).sum(1).to(torch.float32).view(G, 1, 1)
+    vmax = torch.where(m, lv, -_SUMMARY_EMPTY).view(G, L, kvh).amax(1)
+    old = kv_stem[key].to(torch.float32)
+    n_old = torch.where(cont, r, 0).to(torch.float32).view(G, 1, 1)
+    mean = (old[..., :D] * n_old + ksum) / torch.clamp(n_old + cnt, min=1.0)
+    vmax = torch.where(cont.view(G, 1), torch.maximum(old[..., D], vmax), vmax)
+    kv_stem.index_put_((key,), torch.cat([mean, vmax.unsqueeze(-1)], dim=-1).to(kv_stem.dtype))
 
 
 def update_k_summary_decode(k_sum, k, positions, slot_mapping, block_table, block_size, group):
@@ -406,6 +475,49 @@ def update_k_summary_decode(k_sum, k, positions, slot_mapping, block_table, bloc
     k_sum.index_put_((torch.cat([key_a, key_b]),), torch.cat([new_a, new_b]).to(k_sum.dtype))
 
 
+def update_stem_summary_decode(kv_stem, k, v, positions, slot_mapping, block_table, block_size, group):
+    """EXPERIMENTAL (HY3_SPARSE_PREFILL_METHOD=stem): fold one decode step's K / V
+    into the per-group mean K and max log ||V||.
+
+    k / v: [B, S, kvh, D]; same two-group layout as update_k_summary_decode.
+    The first group holds ``pos % L`` earlier tokens (rejected speculative
+    tokens of the previous step count among them until overwritten).
+    """
+    B, S, kvh, D = k.shape
+    L = block_size * group
+    nb = block_table.shape[1]
+    pos = positions.view(B, S).to(torch.long)
+    valid = slot_mapping.view(B, S) >= 0
+    sb = torch.div(pos, L, rounding_mode="floor")
+    sb0 = sb[:, :1]
+    in_a = (sb == sb0) & valid
+    in_b = (sb != sb0) & valid
+    kk = k.to(torch.float32)
+    lv = _log_vnorm(v)  # [B, S, kvh]
+
+    def reduce(m):
+        return (torch.where(m.view(B, S, 1, 1), kk, 0.0).sum(dim=1),
+                m.sum(dim=1).to(torch.float32).view(B, 1, 1),
+                torch.where(m.view(B, S, 1), lv, -_SUMMARY_EMPTY).amax(dim=1))
+
+    sum_a, cnt_a, vmax_a = reduce(in_a)
+    sum_b, cnt_b, vmax_b = reduce(in_b)
+    t = block_table.to(torch.long)
+    key_a = t.gather(1, torch.clamp(sb0 * group, max=nb - 1)).view(B).clamp(min=0)
+    key_b = t.gather(1, torch.clamp((sb0 + 1) * group, max=nb - 1)).view(B).clamp(min=0)
+    has_a, has_b = in_a.any(dim=1), in_b.any(dim=1)
+    key_a = torch.where(has_a, key_a, 0)
+    n_old = (pos[:, 0] % L).to(torch.float32).view(B, 1, 1)
+    old = kv_stem[key_a].to(torch.float32)
+    mean_a = (old[..., :D] * n_old + sum_a) / torch.clamp(n_old + cnt_a, min=1.0)
+    vmax_a = torch.where(n_old.view(B, 1) > 0, torch.maximum(old[..., D], vmax_a), vmax_a)
+    new_a = torch.cat([mean_a, vmax_a.unsqueeze(-1)], dim=-1)
+    new_b = torch.cat([sum_b / torch.clamp(cnt_b, min=1.0), vmax_b.unsqueeze(-1)], dim=-1)
+    key_b = torch.where(has_b, key_b, key_a)
+    new_b = torch.where(has_b.view(B, 1, 1), new_b, new_a)
+    kv_stem.index_put_((torch.cat([key_a, key_b]),), torch.cat([new_a, new_b]).to(kv_stem.dtype))
+
+
 def prepare_sparse_decode(layer, device, from_weights: bool = True) -> None:
     """EXPERIMENTAL (HY3_SPARSE_DECODE): own copies of the weights the selection reads.
 
@@ -424,11 +536,14 @@ def prepare_sparse_decode(layer, device, from_weights: bool = True) -> None:
         w = attn.qkv_proj_weight.detach().to("cpu")[:, : (nh + kvh) * D].to(torch.float32)
         sc = attn.qkv_weight_scale.detach().to("cpu").to(torch.float32)[0]
         w = torch.cat([w[:, : nh * D] * sc[0], w[:, nh * D :] * sc[1]], dim=1)
+        wv = attn.qkv_proj_weight.detach().to("cpu")[:, (nh + kvh) * D : (nh + 2 * kvh) * D]
+        wv = wv.to(torch.float32) * sc[2]
         qn = attn.q_norm.weight.detach().to("cpu").clone()
         kn = attn.k_norm.weight.detach().to("cpu").clone()
         ln = layer.input_layernorm.weight.detach().to("cpu").clone()
     else:
         w, qn, kn, ln = torch.zeros(H, (nh + kvh) * D), torch.ones(D), torch.ones(D), torch.ones(H)
+        wv = torch.zeros(H, kvh * D)
 
     def param(t, dtype):
         return nn.Parameter(t.to(dtype).contiguous().to(device), requires_grad=False)
@@ -437,6 +552,8 @@ def prepare_sparse_decode(layer, device, from_weights: bool = True) -> None:
     attn.sparse_qnorm_w = param(qn, torch.float32)
     attn.sparse_knorm_w = param(kn, torch.float32)
     attn.sparse_ln_w = param(ln, torch.float32)
+    if _STEM:  # the V columns, for the decode-time Stem summary update
+        attn.sparse_wv = param(wv, attn.dtype)
 
 
 def sparse_select_blocks(q, k_sum, block_table, n_hist, block_size, group, n_sel, sink, recent):
@@ -528,6 +645,69 @@ def sparse_prefill_blocks(q, k_sum, block_row, prior, valid, block_size, group, 
     src = torch.where(j < head, top[torch.clamp(j // group, max=k_g - 1)] * group + j % group,
                       full * group + j - head)
     dense = full <= k_g
+    src = torch.where(dense, j, src)
+    c = torch.where(dense, pb, head + pb - full * group)
+    blocks = t[torch.clamp(src, max=nb - 1)].clamp(min=0)
+    return blocks, (c * block_size).view(1, 1).to(torch.int32)
+
+
+def stem_budget_groups(nb: int, group: int, frac: float, sink: int, local: int) -> int:
+    """Stem's initial budget in groups: ``frac`` of the table, at least sink + local."""
+    return max(math.ceil(nb // group * frac), sink + local)
+
+
+def stem_prefill_blocks(q, kv_stem, block_row, prior, valid, block_size, group, k_g, sink, local, beta, mu):
+    """EXPERIMENTAL (HY3_SPARSE_PREFILL_METHOD=stem): the blocks a segmented
+    prefill chunk reads, chosen with Stem's metric and position-decay budget.
+
+    q: [nh, T, D] (QK-norm + RoPE), kv_stem: [blocks, kvh, D + 1], block_row,
+    prior, valid as for sparse_prefill_blocks; k_g: the initial budget in
+    groups. Per 128-token query block (one group's length) of the chunk and
+    query head, every complete prior group j gets
+    M = mean(Q) . mean(K_j) + beta * max(0, max log ||V_j||) (the exact block
+    mean of the logits for the routing term, which Stem estimates by
+    anti-diagonal sampling); the chunk shares one selection, so a group's
+    score is its best M minus the row's best, over the chunk's rows. The
+    budget decays linearly from k_g groups at position 0 to mu * k_g at the
+    end of the table, taken at the chunk's first token; the first ``sink`` and
+    last ``local`` complete groups and the incomplete one are always kept.
+    Same return layout as sparse_prefill_blocks.
+    """
+    nh, T, D = q.shape
+    kvh = kv_stem.shape[1]
+    t = block_row.to(torch.long)
+    nb = t.shape[0]
+    ns, L = nb // group, block_size * group
+    summ = kv_stem[torch.clamp(t.view(ns, group)[:, 0], min=0)].to(torch.float32)  # [ns, kvh, D + 1]
+    nqb = T // L
+    vq = valid.view(1, T, 1)
+    cnt = valid.view(nqb, L).sum(-1).to(torch.float32)  # real queries per query block
+    qbar = torch.where(vq, q.to(torch.float32), 0.0).view(nh, nqb, L, D).sum(2) / torch.clamp(
+        cnt, min=1.0).view(1, nqb, 1)
+    qbar = qbar.reshape(kvh, (nh // kvh) * nqb, D)
+    m = torch.bmm(qbar, summ[..., :D].permute(1, 2, 0))  # [kvh, rows, ns]
+    m = m + beta * torch.clamp(summ[..., D], min=0).permute(1, 0).unsqueeze(1)
+    p = prior.reshape(()).to(torch.long)
+    full = torch.div(p, L, rounding_mode="floor")  # complete prior groups
+    pb = torch.div(p, block_size, rounding_mode="floor")  # prior blocks
+    idx = torch.arange(ns, device=q.device)
+    big = torch.finfo(torch.float32).max
+    cand = idx < full
+    m = torch.where(cand, m, -big)
+    m = m - m.amax(dim=-1, keepdim=True)  # each row's best group: 0
+    rows = (cnt > 0).view(1, 1, nqb).expand(kvh, nh // kvh, nqb).reshape(kvh, -1, 1)
+    score = torch.where(rows, m, -big).amax(dim=(0, 1))  # [ns]
+    forced = (idx < sink) | (idx >= full - local)
+    score = torch.where(cand, torch.where(forced, big, score), -big)
+    # Position decay: k(p) = k_g (1 - (1 - mu) p / N), N the table's tokens.
+    k_dyn = torch.floor(k_g * (1.0 - (1.0 - mu) * p.to(torch.float32) / (nb * block_size)))
+    k_dyn = torch.clamp(k_dyn.to(torch.long), min=sink + local, max=k_g)
+    top = torch.topk(score, k_g, dim=0).indices  # sorted: forced first, then by score
+    j = torch.arange(k_g * group + group + T // block_size, device=q.device)
+    head = k_dyn * group
+    src = torch.where(j < head, top[torch.clamp(j // group, max=k_g - 1)] * group + j % group,
+                      full * group + j - head)
+    dense = full <= k_dyn
     src = torch.where(dense, j, src)
     c = torch.where(dense, pb, head + pb - full * group)
     blocks = t[torch.clamp(src, max=nb - 1)].clamp(min=0)
@@ -658,6 +838,9 @@ class HYV3Attention(nn.Module):
         # EXPERIMENTAL sparse decode: per-group K min / max ([blocks, 2, kvh, D]),
         # allocated with the cache (bind_attention_kv) when HY3_SPARSE_DECODE is set.
         self.k_sum = None
+        # EXPERIMENTAL Stem sparse prefill: per-group mean K and max log ||V||
+        # ([blocks, kvh, D + 1]), with HY3_SPARSE_PREFILL_METHOD=stem.
+        self.kv_stem = None
         # FP8 KV quantizing scales q = 1 / dequant (cache = fp8(x * q)), set by
         # load_weights / load_weights_lite (_load_kv_cache_scales); FP8 KV
         # refuses to bind before they are set (kv_scale_t is None).
@@ -844,6 +1027,10 @@ class HYV3Attention(nn.Module):
             update_k_summary_prefill(
                 self.k_sum, k, slot_mapping, meta["block_table_tensor"][0], block_size, _SPARSE_GROUP
             )
+        if self.kv_stem is not None:
+            update_stem_summary_prefill(
+                self.kv_stem, k, v, slot_mapping, meta["block_table_tensor"][0], block_size, _SPARSE_GROUP
+            )
 
         # Step 4: Attention
         kv_segment_size = meta.get("kv_segment_size")
@@ -861,7 +1048,18 @@ class HYV3Attention(nn.Module):
                 # k * q_k / v * q_v: Q carries the K dequant (_fp8_prefill_q) and
                 # the output the V dequant (linear in V, so after the DCP LSE
                 # combine too; runtime scales, see set_kv_scales).
-                if self.k_sum is not None and _SPARSE_PREFILL > 0 and self.dcp_size == 1:
+                if self.kv_stem is not None and self.dcp_size == 1:
+                    # >>> EXPERIMENTAL Stem sparse prefill: copy only the kept prior blocks.
+                    nb = block_table.shape[1]
+                    k_g = stem_budget_groups(nb, _SPARSE_GROUP, _SPARSE_PREFILL, _STEM_SINK, _STEM_LOCAL)
+                    if k_g < nb // _SPARSE_GROUP and nb % _SPARSE_GROUP == 0 and q.shape[1] % (
+                            block_size * _SPARSE_GROUP) == 0:
+                        blocks, prior_tokens = stem_prefill_blocks(
+                            q, self.kv_stem, block_table[0], prior_tokens, slot_mapping >= 0, block_size,
+                            _SPARSE_GROUP, k_g, _STEM_SINK, _STEM_LOCAL, _STEM_BETA, _STEM_MU,
+                        )
+                        block_table = blocks.view(1, -1).to(block_table.dtype)
+                elif self.k_sum is not None and _SPARSE_PREFILL > 0 and self.dcp_size == 1:
                     # >>> EXPERIMENTAL sparse prefill: copy only the kept prior blocks.
                     nb = block_table.shape[1]
                     n_sel = sparse_budget_blocks(nb, _SPARSE_PREFILL, _SPARSE_SINK * _SPARSE_GROUP,
@@ -987,6 +1185,12 @@ class HYV3Attention(nn.Module):
             self.k_sum, k.view(kvh, B, S, D).permute(1, 2, 0, 3), positions, slot_mapping,
             block_table, block_size, _SPARSE_GROUP,
         )
+        if self.kv_stem is not None:
+            v = (xn @ self.sparse_wv).view(B, S, kvh, D)
+            update_stem_summary_decode(
+                self.kv_stem, k.view(kvh, B, S, D).permute(1, 2, 0, 3), v, positions, slot_mapping,
+                block_table, block_size, _SPARSE_GROUP,
+            )
         return out
 
     def forward_decode(

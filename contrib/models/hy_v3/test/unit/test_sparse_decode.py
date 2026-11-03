@@ -307,3 +307,159 @@ def test_sparse_prefill_attention_matches_the_kept_tokens():
         w = torch.softmax((q[0, i].to(torch.bfloat16).float() @ ks.T) * D ** -0.5, dim=0)
         ref[i] = w @ vs
     torch.testing.assert_close(out.view(T, D), ref, atol=2e-2, rtol=2e-2)
+
+
+# ---- Stem sparse prefill (HY3_SPARSE_PREFILL_METHOD=stem) ----
+
+from hy_v3_neuron.model import (  # noqa: E402
+    stem_budget_groups,
+    stem_prefill_blocks,
+    update_stem_summary_decode,
+    update_stem_summary_prefill,
+)
+
+
+def _stem_expected(keys, vals, table_row, n):
+    """Per-group mean K and max log ||V|| of positions < n, by the group's first block."""
+    out = {}
+    for gi in range(-(-n // L)):
+        ps = range(gi * L, min(n, (gi + 1) * L))
+        ks = torch.stack([keys[p] for p in ps])
+        lv = torch.stack([vals[p].norm(dim=-1).log() for p in ps])
+        out[int(table_row[gi * GROUP])] = (ks.mean(0), lv.amax(0))
+    return out
+
+
+def _stem_check(kv_stem, exp):
+    for blk, (mk, lv) in exp.items():
+        torch.testing.assert_close(kv_stem[blk, :, :D].float(), mk.to(torch.bfloat16).float(), atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(kv_stem[blk, :, D].float(), lv.to(torch.bfloat16).float(), atol=2e-2, rtol=2e-2)
+
+
+def _stem_prefill(kv_stem, table, keys, vals, start, n, T, g):
+    k = torch.randn(KVH, T, D, generator=g)
+    v = torch.randn(KVH, T, D, generator=g) * 3
+    pos = list(range(start, start + n))
+    for i, p in enumerate(pos):  # a re-computed token has the same K / V
+        if p in keys:
+            k[:, i], v[:, i] = keys[p], vals[p]
+    slots = torch.full((T,), -1)
+    slots[:n] = _slots(table, pos)
+    for i, p in enumerate(pos):
+        keys[p], vals[p] = k[:, i], v[:, i]
+    update_stem_summary_prefill(kv_stem, k, v, slots, table, BS, GROUP)
+
+
+def test_stem_prefill_summaries_match_the_written_tokens():
+    g = torch.Generator().manual_seed(20)
+    table = _table(12, g)
+    keys, vals = {}, {}
+    kv_stem = torch.zeros(NBLK, KVH, D + 1, dtype=torch.bfloat16)
+    kv_stem[table[4]] = 50.0  # a stale summary on a reused block must not survive a fresh write
+    _stem_prefill(kv_stem, table, keys, vals, 0, 160, 256, g)  # group 0 full, group 1 partial
+    _stem_prefill(kv_stem, table, keys, vals, 160, 200, 256, g)  # starts inside group 1: merged
+    _stem_check(kv_stem, _stem_expected(keys, vals, table, 360))
+
+
+def test_stem_decode_steps_fold_into_the_summaries():
+    g = torch.Generator().manual_seed(21)
+    table = _table(12, g)
+    keys, vals = {}, {}
+    kv_stem = torch.zeros(NBLK, KVH, D + 1, dtype=torch.bfloat16)
+    _stem_prefill(kv_stem, table, keys, vals, 0, 120, 128, g)
+    n, S = 120, 4
+    while n < 300:  # 4-token verify steps that cross group boundaries
+        k = torch.randn(1, S, KVH, D, generator=g)
+        v = torch.randn(1, S, KVH, D, generator=g) * 3
+        pos = torch.arange(n, n + S)
+        update_stem_summary_decode(kv_stem, k, v, pos, _slots(table, pos.tolist()), table.view(1, -1), BS, GROUP)
+        for i in range(S):
+            keys[n + i], vals[n + i] = k[0, i], v[0, i]
+        n += S
+    _stem_check(kv_stem, _stem_expected(keys, vals, table, n))
+
+
+def _stem_setup(prior, g, n_blocks=64):
+    table = _table(n_blocks, g)
+    keys, vals = {}, {}
+    kv_stem = torch.zeros(NBLK, KVH, D + 1, dtype=torch.bfloat16)
+    if prior:
+        _stem_prefill(kv_stem, table, keys, vals, 0, prior, -(-prior // L) * L, g)
+    return table, keys, vals, kv_stem
+
+
+def test_stem_short_history_is_dense():
+    g = torch.Generator().manual_seed(22)
+    prior, T = 5 * BS, 128
+    table, _, _, kv_stem = _stem_setup(prior, g)
+    q = torch.randn(2, T, D, generator=g)
+    blocks, kept = stem_prefill_blocks(q, kv_stem, table, torch.tensor([[prior]]), torch.ones(T, dtype=torch.bool),
+                                       BS, GROUP, 8, 2, 2, 0.2, 0.7)
+    assert int(kept) == prior
+    assert blocks[: 5 + T // BS].tolist() == table[: 5 + T // BS].tolist()
+
+
+def test_stem_keeps_sink_local_routed_and_magnitude_groups():
+    g = torch.Generator().manual_seed(23)
+    prior, T = 40 * BS, 128  # 10 complete groups
+    table, keys, vals, kv_stem = _stem_setup(prior, g)
+    q = torch.randn(1, T, D, generator=g) * 0.1
+    q[0, :, 0] += 2.0  # the chunk's mean query points along dim 0
+    rows = kv_stem[table[torch.arange(10) * GROUP]].clone()
+    rows[:, :, :D] = 0
+    rows[:, :, D] = 0
+    rows[4, :, 0] = 5.0  # group 4: routed (mean K along dim 0)
+    rows[6, :, D] = 20.0  # group 6: large V (magnitude term 0.2 * 20 = 4 > the others')
+    kv_stem[table[torch.arange(10) * GROUP]] = rows
+    blocks, kept = stem_prefill_blocks(q, kv_stem, table, torch.tensor([[prior]]), torch.ones(T, dtype=torch.bool),
+                                       BS, GROUP, 6, 1, 2, 0.2, 1.0)  # 6 groups: sink, 2 local, 3 by metric
+    got = sorted(int(t) for t in blocks[: int(kept) // BS].view(-1, GROUP)[:, 0])
+    want = sorted(int(table[gi * GROUP]) for gi in (0, 4, 6, 8, 9))
+    assert int(kept) == 6 * L and set(want) <= set(got)
+
+
+def test_stem_budget_decays_with_the_chunk_position():
+    g = torch.Generator().manual_seed(24)
+    nb = 64  # 16 groups, 2048 tokens of table
+    prior, T = 48 * BS, 128  # 12 complete groups, at 3/4 of the table
+    table, _, _, kv_stem = _stem_setup(prior, g, nb)
+    q = torch.randn(1, T, D, generator=g)
+    k_g = stem_budget_groups(nb, GROUP, 0.5, 2, 2)
+    assert k_g == 8
+    _, kept = stem_prefill_blocks(q, kv_stem, table, torch.tensor([[prior]]), torch.ones(T, dtype=torch.bool),
+                                  BS, GROUP, k_g, 2, 2, 0.2, 0.5)
+    assert int(kept) == 5 * L  # floor(8 * (1 - 0.5 * 1536 / 2048)) = 5 groups
+
+
+def test_stem_attention_matches_the_kept_tokens():
+    import vllm_neuron.functional as NF
+    from hy_v3_neuron.model import _request_blocks_bf16
+
+    g = torch.Generator().manual_seed(25)
+    prior, T = 24 * BS, 128
+    table, keys, vals, kv_stem = _stem_setup(prior, g)
+    k = torch.stack([keys[p] for p in range(prior)] + [torch.randn(KVH, D, generator=g) for _ in range(T)], dim=1)
+    v = torch.stack([vals[p] for p in range(prior)] + [torch.randn(KVH, D, generator=g) for _ in range(T)], dim=1)
+    q = torch.randn(1, T, D, generator=g)
+    blocks, kept = stem_prefill_blocks(q, kv_stem, table, torch.tensor([[prior]]), torch.ones(T, dtype=torch.bool),
+                                       BS, GROUP, 3, 1, 1, 0.2, 1.0)
+    kc = torch.zeros(NBLK, KVH, BS, D)
+    vc = torch.zeros(NBLK, KVH, BS, D)
+    for pos in range(prior + T):
+        kc[table[pos // BS], :, pos % BS] = k[:, pos]
+        vc[table[pos // BS], :, pos % BS] = v[:, pos]
+    k_attn, v_attn, local = _request_blocks_bf16(kc.to(torch.bfloat16), vc.to(torch.bfloat16),
+                                                  blocks.view(1, -1).to(torch.int32), False, torch.bfloat16)
+    out = NF.segmented_attention(q.to(torch.bfloat16), k_cache=k_attn, v_cache=v_attn, block_tables=local,
+                                 prior_tokens=kept, block_size=BS, kv_segment_size=128, scale=D ** -0.5,
+                                 tp_q=True, tp_out=False).float()
+    row = table.tolist()
+    kept_pos = [p for p in range(prior) if row[p // BS] in blocks[: int(kept) // BS].tolist()]
+    assert len(kept_pos) == int(kept) == 3 * L
+    ref = torch.empty(T, D)
+    for i in range(T):
+        ks = torch.cat([k[0, kept_pos], k[0, prior : prior + i + 1]]).to(torch.bfloat16).float()
+        vs = torch.cat([v[0, kept_pos], v[0, prior : prior + i + 1]]).to(torch.bfloat16).float()
+        w = torch.softmax((q[0, i].to(torch.bfloat16).float() @ ks.T) * D ** -0.5, dim=0)
+        ref[i] = w @ vs
+    torch.testing.assert_close(out.view(T, D), ref, atol=2e-2, rtol=2e-2)

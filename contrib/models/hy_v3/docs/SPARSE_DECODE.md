@@ -14,7 +14,8 @@ TPOT 51.0 -> 42.9 ms, +20% output throughput), 4-request steps 9% faster;
 Off by default. The same selection for the prefill
 ([Sparse prefill](#sparse-prefill-hy3_sparse_prefillfraction-experimental-off),
 `HY3_SPARSE_PREFILL`, off) makes a cold 85k prefill 15% and prefix-hit
-prefills 29-33% faster; with both, 8-request TPOT 51.8 -> 36.3 ms.
+prefills 29-33% faster; with both, 8-request TPOT 51.8 -> 36.3 ms. The prefill can choose
+with Quest (default) or Stem ([Stem selection](#stem-selection-hy3_sparse_prefill_methodstem-experimental)).
 
 ## Accuracy study
 
@@ -261,3 +262,65 @@ change.)
 - Prefill alone (decode dense) is not useful: decode pays the summary updates
   (3-10 ms per step) with nothing to gain from them. Use it together with
   `HY3_SPARSE_DECODE`.
+
+### Stem selection (`HY3_SPARSE_PREFILL_METHOD=stem`, experimental)
+
+An alternative to the Quest bound for the prefill (decode stays Quest):
+[Stem](https://arxiv.org/abs/2603.06274) ("Rethinking Causal Information Flow
+in Sparse Attention"), adapted to the chunk-shared block table the segmented
+kernel needs (`stem_prefill_blocks`):
+
+- Summaries: per 128-token group the mean K and the max log ||V||
+  (`kv_stem`, [blocks, kvh, D + 1] BF16, next to `k_sum`), updated by the
+  prefill and by decode (decode computes V with its own copy of the V
+  columns).
+- Metric per 128-query block of the chunk and group:
+  `mean(Q) . mean(K) + beta * max(0, max log ||V||)` (`HY3_STEM_BETA`, 0.2).
+  The first term is the exact block mean of the logits, which the paper
+  estimates by anti-diagonal sampling. The chunk shares one selection: a
+  group's score is its best metric minus the row's best, over the chunk's
+  query blocks.
+- Budget: `HY3_SPARSE_PREFILL` of the table's groups at position 0, decaying
+  linearly with the chunk's first position to `HY3_STEM_MU` (0.7) times that
+  at the end of the table; the first `HY3_STEM_SINK_GROUPS` (4) and last
+  `HY3_STEM_LOCAL_GROUPS` (4) complete groups and the incomplete one always
+  kept. Not rounded to 256 blocks, so at the same fraction Stem reads less
+  than Quest: 0.25 is 168 -> 118 groups (Quest 192), 0.125 is 84 -> 59
+  (Quest 128).
+- Selection 0.27 ms per layer on one core, like Quest's.
+
+Accuracy (decode dense; `results/sparse_prefill/lb_stem_*.json`, `cont_stem_*.json`):
+
+| | groups | needle | LongBench v2 | same answer as dense | right -> wrong / wrong -> right | same, >= 50k tokens (24) | continuations |
+|---|---|---|---|---|---|---|---|
+| dense | | 12/12 | 56% | | | | |
+| Quest 0.25 | 192 | 12/12 | 58% | 88/100 | 4 / 6 | 18/24 | 19/19 |
+| Stem, 192 groups, no decay (`0.28571`, `HY3_STEM_MU=1`) | 192 | 12/12 | 55% | 89/100 | 5 / 4 | 20/24 | 19/19 |
+| Stem 0.25 | 168 -> 118 | 12/12 | 54% | 90/100 | 5 / 3 | 21/24 | 19/19 |
+| Quest 0.125 | 128 | 12/12 | 51% | 90/100 | 7 / 2 | 20/24 | 19/19 |
+| Stem 0.125 | 84 -> 59 | 12/12 | 52% | 82/100 | 8 / 4 | 17/24 | 19/19 |
+
+At the same budget the two metrics agree with dense equally often (89 vs
+88/100); Stem 0.25 keeps that with ~3/4 of the blocks; at 0.125 (about half
+Quest's blocks) it changes more answers. All differences in accuracy are
+within the noise of 100 items.
+
+Speed (with `HY3_SPARSE_DECODE=0.125`; `results/bench/pd_split_85k_nodcp_fp8kv_mtp3_stem_sdecode`):
+
+| | Quest 0.25 | Stem 0.25 |
+|---|---|---|
+| cold 85k prefill TTFT | 12.13 s | 12.05 s |
+| P: 78k prefix hit, TTFT c1 / c4 / c8 | 1.52 / 5.19 / 10.34 s | **1.43 / 4.87 / 9.70 s (-6%)** |
+| D pass 2, ITL c1 / c4 / c8 | 50.2 / 60.6 / 57.2 ms | 57.3 / 61.8 / 58.4 ms |
+| D pass 2, TPOT c1 / c4 / c8 | 24.9 / 34.2 / 36.3 ms | 27.8 / 34.6 / 36.7 ms |
+| D pass 2, output tok/s c1 / c4 / c8 | 37.3 / 106.0 / 194.2 | 32.8 / 104.6 / 189.4 |
+
+- Prefill: the first 7 chunks of a cold prompt are dense with either method,
+  so the cold TTFT barely changes; a prefill after 78k reads ~120 instead of
+  192 groups: 6% faster.
+- Decode pays for the Stem summaries: a V projection and a second summary
+  update in every layer, +7 ms per step at 1 request (ITL 50.2 -> 57.3 ms,
+  where decode is dense anyway), +1 ms at 4-8.
+- So Quest stays the default. Stem is for workloads with many long prefix-hit
+  prefills and little single-request decode; dropping the decode-time Stem
+  update (stale summaries for decoded tokens) would remove its decode cost.

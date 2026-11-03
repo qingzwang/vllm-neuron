@@ -16,7 +16,8 @@
 # [1, 4, 8], KV_CAP 0.60 (0.61 with MTP), about 8.1x, and only the 32768
 # decode context bucket below 86016: with all three, the batch-8 decode NEFFs
 # do not fit next to the KV (Allocation Failure at batch 8, 65536).
-# Env: MODEL, PORT, MTP_K, KV_DTYPE, KV_CAP as for serve.sh, HY3_SPARSE_DECODE, HY3_SPARSE_PREFILL; with MTP_K,
+# Env: MODEL, PORT, MTP_K, KV_DTYPE, KV_CAP as for serve.sh, HY3_SPARSE_DECODE, HY3_SPARSE_PREFILL
+#      (HY3_SPARSE_PREFILL_METHOD quest | stem); with MTP_K,
 #      HY3_DECODE_HITS_MAX_T defaults to 4 x (MTP_K + 1) (4-request verify steps;
 #      8-request steps keep moe_tkg, which is faster there than hits at 32).
 # Benchmark: bench_pd_split.sh "1 4 8".

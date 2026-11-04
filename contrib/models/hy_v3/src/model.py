@@ -121,6 +121,19 @@ _MOE_CTE_FP8W = os.environ.get("HY3_MOE_CTE_FP8W", "1") != "0"
 # Ranks per group sharing one copy of the shared expert during decode.
 _SHARED_DECODE_SHARDS = 8
 
+# EXPERIMENTAL decode routed experts split over groups of G ranks (TP-G x EP):
+# HY3_DECODE_MOE_TP=G gives every rank, besides its EP64 experts, a decode copy
+# of chunk (rank % G) -- 1536 / G intermediate columns -- of the 3G experts its
+# group of G consecutive ranks owns (the same bytes as its 3 experts). A decode
+# step of at most HY3_DECODE_MOE_TP_MAX_T tokens runs the hits kernel over the
+# group's hit experts on those chunks, so a hit expert costs each group member
+# one chunk instead of its owner the whole expert: the busiest rank's work at
+# 1-2 requests is ~2x smaller (the routing is skewed, see results/expert_load).
+# The chunks' partial outputs add up in the existing all-reduce. Costs the HBM of
+# a second copy of the routed experts (~57 MB per layer and rank).
+_DECODE_MOE_TP = int(os.environ.get("HY3_DECODE_MOE_TP", "0") or 0)
+_DECODE_MOE_TP_MAX_T = int(os.environ.get("HY3_DECODE_MOE_TP_MAX_T", "8") or 8)
+
 # The decode attention mask is identical for every layer; it is built once per
 # step and cached in attn_metadata under this key.
 _DECODE_MASK_CACHE_KEY = "_hy_v3_decode_mask"
@@ -1859,6 +1872,22 @@ class HYV3MoE(nn.Module):
         self.gate_up_proj_scale_tkg = _fp32_param(L, 2, 1)
         self.down_proj_scale_tkg = _fp32_param(L, 1)
 
+        # EXPERIMENTAL HY3_DECODE_MOE_TP: the group's experts, this rank's chunk.
+        G = _DECODE_MOE_TP
+        self.decode_moe_tp = 0
+        if (G > 1 and self.ep_degree == self.world_size and self.ep_degree % G == 0
+                and config.moe_intermediate_size % G == 0):
+            self.decode_moe_tp = G
+            Lg, Ig = L * G, config.moe_intermediate_size // G
+            self.gate_up_proj_weight_tpd = nn.Parameter(
+                torch.empty(Lg, H, 2, Ig, dtype=_FP8_DTYPE), requires_grad=False
+            )
+            self.down_proj_weight_tpd = nn.Parameter(
+                torch.empty(Lg, Ig, H, dtype=_FP8_DTYPE), requires_grad=False
+            )
+            self.gate_up_proj_scale_tkg_tpd = _fp32_param(Lg, 2, 1)
+            self.down_proj_scale_tkg_tpd = _fp32_param(Lg, 1)
+
         # <-- MODEL-SPECIFIC: shared expert(s), full weights on every rank
         shared_size = config.moe_intermediate_size * config.num_shared_experts
         self.shared_mlp = HYV3StaticFP8MLP(config, shared_size, tp_sharded=False)
@@ -1930,6 +1959,30 @@ class HYV3MoE(nn.Module):
             self.down_proj_scale_tkg,
             ep(expert_scale_loader(L, 1, lambda s: s.view(L, 1))),
         )
+        if self.decode_moe_tp:
+            G = self.decode_moe_tp
+            Lg, Ig, grp = L * G, self.gate_up_proj_weight_tpd.shape[-1], self.ep_rank // G
+            group_experts = list(range(grp * Lg, (grp + 1) * Lg))
+
+            def epg(loader):
+                return expert_parallel_grouped_loader(
+                    group_experts, loader, total_num_experts=self.total_num_experts
+                )
+
+            set_weight_loader(
+                self.gate_up_proj_weight_tpd, epg(expert_gate_up_loader(Lg, Ig, self.ep_rank % G))
+            )
+            set_weight_loader(
+                self.down_proj_weight_tpd, epg(expert_down_loader(Lg, Ig, self.ep_rank % G))
+            )
+            set_weight_loader(
+                self.gate_up_proj_scale_tkg_tpd,
+                epg(expert_scale_loader(Lg, 2, lambda s: s.view(Lg, 2, 1))),
+            )
+            set_weight_loader(
+                self.down_proj_scale_tkg_tpd,
+                epg(expert_scale_loader(Lg, 1, lambda s: s.view(Lg, 1))),
+            )
 
     def _route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return hy3_route(
@@ -2097,6 +2150,25 @@ class HYV3MoE(nn.Module):
         return 1 < num_tokens <= limit
 
     def _forward_decode(self, normed, affinities, top_k_index, rank, extra=None):
+        if self.decode_moe_tp and normed.shape[0] <= _DECODE_MOE_TP_MAX_T:
+            # >>> EXPERIMENTAL HY3_DECODE_MOE_TP: this rank's chunk of every
+            # expert of its group that any token routed to.
+            group = torch.div(self._ep_row(normed.device), self.decode_moe_tp, rounding_mode="floor")
+            output = routed_experts_tkg_hits_batch(
+                normed,
+                affinities,
+                top_k_index,
+                group.view(1, 1),
+                self.gate_up_proj_weight_tpd,
+                self.down_proj_weight_tpd,
+                self.gate_up_proj_scale_tkg_tpd,
+                self.down_proj_scale_tkg_tpd,
+            )
+            if extra is not None:
+                output = output + extra
+            if self.world_size > 1:
+                output = self.tp_group.all_reduce(output)
+            return output
         if self._use_hit_batch_decode(normed.shape[0]):
             output = routed_experts_tkg_hits_batch(
                 normed,
@@ -2351,6 +2423,11 @@ def decoder_layer_weight_mappings(
     m[f"{mp}.gate_up_proj_scale_tkg"] = gate_up_s
     m[f"{mp}.down_proj_scale"] = experts("down_proj", "weight_scale")
     m[f"{mp}.down_proj_scale_tkg"] = experts("down_proj", "weight_scale")
+    if getattr(layer.mlp, "decode_moe_tp", 0):
+        m[f"{mp}.gate_up_proj_weight_tpd"] = m[f"{mp}.gate_up_proj_weight"]
+        m[f"{mp}.down_proj_weight_tpd"] = m[f"{mp}.down_proj_weight"]
+        m[f"{mp}.gate_up_proj_scale_tkg_tpd"] = gate_up_s
+        m[f"{mp}.down_proj_scale_tkg_tpd"] = m[f"{mp}.down_proj_scale_tkg"]
     gated_mlp(f"{mp}.shared_mlp", f"{smp}.shared_mlp")
     if layer.mlp.shared_mlp_decode is not None:
         gated_mlp(f"{mp}.shared_mlp_decode", f"{smp}.shared_mlp")

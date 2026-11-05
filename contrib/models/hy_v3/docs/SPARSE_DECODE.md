@@ -9,8 +9,10 @@ implementation that reads only the kept blocks
 ([Implementation](#implementation)) keeps that accuracy on the full model
 with FP8 KV + MTP (LongBench v2 54% vs 56%, 98/100 same answers, needle
 12/12) and makes 8-request decode steps **25% faster** (ITL 76.7 -> 57.2 ms,
-TPOT 51.0 -> 42.9 ms, +20% output throughput), 4-request steps 9% faster;
-1 request is 6% slower (it stays dense but keeps the summaries up to date).
+TPOT 51.0 -> 42.9 ms, +20% output throughput), 4-request steps 9% faster.
+Since `HY3_SPARSE_MIN_BATCH` defaults to 1 (2026-11-05) a single request is
+sparse too: its step 50.2 -> 44.0 ms, TPOT 23.4 (dense) -> 21.9 ms, same
+continuations and needle results ([Batch 1](#batch-1)).
 Off by default. The same selection for the prefill
 ([Sparse prefill](#sparse-prefill-hy3_sparse_prefillfraction-experimental-off),
 `HY3_SPARSE_PREFILL`, off) makes a cold 85k prefill 15% and prefix-hit
@@ -95,9 +97,11 @@ Every `HY3_SPARSE_SELECT_EVERY` (4) layers select; the 3 after each reuse
 its table and mask (all layers share the block table) and only fold their K
 into their summaries. With MTP the bound is the max over the 4 verify tokens, and the draft layer
 selects for its own cache too (`HY3_SPARSE_DRAFT=0` turns that off). Steps
-of fewer than `HY3_SPARSE_MIN_BATCH` (4) requests attend densely (the decode
+of fewer than `HY3_SPARSE_MIN_BATCH` requests attend densely (the decode
 NEFFs are per batch bucket): the selection costs about the same at any batch
 size, the attention it saves grows with it. They still update the summaries.
+The default was 4 while the selection ran in every layer; with the selection
+every 4 layers it pays off from one request on, and the default is 1 ([Batch 1](#batch-1)).
 
 Why groups: the selection is a handful of small torch ops per layer whose
 cost is mostly fixed. `scripts/sparse_select_bench.py` times them on one
@@ -324,3 +328,31 @@ Speed (with `HY3_SPARSE_DECODE=0.125`; `results/bench/pd_split_85k_nodcp_fp8kv_m
 - So Quest stays the default. Stem is for workloads with many long prefix-hit
   prefills and little single-request decode; dropping the decode-time Stem
   update (stale summaries for decoded tokens) would remove its decode cost.
+
+### Batch 1
+
+`HY3_SPARSE_MIN_BATCH` was 4: below that, the selection cost more than the attention it
+saved. With the selection every 4 layers and without the sort it pays off at one request,
+so the default is now 1. Full model, `serve_85k.sh` FP8 KV + MTP k=3,
+`HY3_SPARSE_PREFILL=0.25 HY3_SPARSE_DECODE=0.125`, `bench_pd_split.sh "1 4"` pass 2
+(`results/bench/pd_split_85k_nodcp_fp8kv_mtp3_sparse_min1`, `..._sparse_min1_tp4`; continuations
+`results/c1_combo/`):
+
+| | dense | sparse, MIN_BATCH 4 | **sparse, MIN_BATCH 1** | + `HY3_DECODE_MOE_TP=4`, `KV_CAP=0.37` |
+|---|---|---|---|---|
+| ITL c1 / c4 | 47.4 / 66.6 ms | 50.2 / 60.6 ms | **44.0 / 60.5 ms** | 40.9 / 60.5 ms |
+| TPOT c1 / c4 | 23.4 / 39.4 ms | 24.9 / 34.2 ms | **21.9 / 33.6 ms** | 20.3 / 45.1 ms |
+| output tok/s c1 / c4 | 38.0 / 91.7 | 37.3 / 106.0 | **41.5 / 105.8** | 38.0 / 75.2 |
+| prefix-hit TTFT c1 | 744 ms | 707 ms | **564 ms** | |
+| KV cache | 697k tokens | 697k | **697k** | 423k |
+| 64-token continuations identical to dense | | | **19/19** | 18/19 (one from token ~18) |
+| needle | 12/12 | 12/12 | **12/12** | 12/12 |
+
+- One request: the step is 12% shorter than with MIN_BATCH 4 and 7% shorter than dense.
+  Four requests are unchanged (they were sparse already).
+- Adding the 4-rank-group decode MoE takes another 3 ms off the 1-request step, but its
+  second copy of the experts shrinks the KV cache by 40%: in the benchmark the cached
+  prefixes are evicted between the passes (hit 92.3% instead of 99.9%), the re-prefills
+  interrupt decode, and TPOT and throughput get worse; one continuation also differs from
+  dense. So `HY3_DECODE_MOE_TP` stays off; sparse prefill + sparse decode with MIN_BATCH 1
+  is the recommended long-context configuration.

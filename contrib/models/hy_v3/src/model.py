@@ -169,14 +169,14 @@ _FORCE_UNPACKED_DECODE = os.environ.get("HY3_FP8_KV_FORCE_UNPACKED_DECODE") == "
 # summaries kept next to the KV cache (always kept: the first
 # HY3_SPARSE_SINK_GROUPS and the last HY3_SPARSE_RECENT_GROUPS groups). The
 # kept blocks go to the decode kernel as a narrower block table, so it reads
-# only them. Decode steps of fewer than HY3_SPARSE_MIN_BATCH requests stay
-# dense (the selection's fixed cost is more than the attention it saves).
-# No DCP.
+# only them. Decode steps of fewer than HY3_SPARSE_MIN_BATCH (1) requests stay
+# dense; with the selection made every 4 layers and no sort, it pays off from
+# one request on (1-request step 50.2 -> 44.0 ms at 85k). No DCP.
 _SPARSE_DECODE = float(os.environ.get("HY3_SPARSE_DECODE", "0") or 0)
 _SPARSE_GROUP = int(os.environ.get("HY3_SPARSE_GROUP", "4"))
 _SPARSE_SINK = int(os.environ.get("HY3_SPARSE_SINK_GROUPS", "1"))
 _SPARSE_RECENT = int(os.environ.get("HY3_SPARSE_RECENT_GROUPS", "2"))
-_SPARSE_MIN_BATCH = int(os.environ.get("HY3_SPARSE_MIN_BATCH", "4"))
+_SPARSE_MIN_BATCH = int(os.environ.get("HY3_SPARSE_MIN_BATCH", "1"))
 # HY3_SPARSE_SELECT_EVERY=R: layers 0, R, 2R, ... select; the R - 1 layers
 # after each reuse its selection (all layers share the block table). They
 # still fold their K into their own summaries.

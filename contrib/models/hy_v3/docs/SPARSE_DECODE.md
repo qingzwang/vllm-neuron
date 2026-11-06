@@ -356,3 +356,11 @@ so the default is now 1. Full model, `serve_85k.sh` FP8 KV + MTP k=3,
   interrupt decode, and TPOT and throughput get worse; one continuation also differs from
   dense. So `HY3_DECODE_MOE_TP` stays off; sparse prefill + sparse decode with MIN_BATCH 1
   is the recommended long-context configuration.
+
+`VLLM_NEURON_MEGA_DMA_ORDER_DERIVE=1` (the plugin's switch for
+`--internal-dma-order-constraints={"timing_mode":2} --internal-bir-enable-sb-allocation`:
+the compiler orders the DMAs with its timing model) on the same configuration
+(`..._sparse_min1_dmaorder`): continuations 19/19, needle 12/12; ITL c1 / c4 / c8
+44.0 / 60.5 / 57.2 -> 42.7 / 58.5 / 58.7 ms, TPOT 21.9 / 33.6 / 36.3 -> 20.9 / 32.7 / 36.8 ms,
+cold 85k prefill 12.13 -> 12.07 s, prefix-hit prefill c1 1.52 -> 1.51 s. 3-4% at 1-4 requests,
+2% slower steps at 8: an option for low-concurrency serving, not the default.

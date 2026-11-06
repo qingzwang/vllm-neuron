@@ -1,0 +1,17 @@
+[status Success]
+== k1
+vllm:spec_decode_num_drafts_total{engine="0",model_name="hy3"} 3934.0
+vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="hy3"} 3934.0
+vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="hy3"} 3447.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="hy3",position="0"} 3447.0
+=== MATH-500 reasoning_effort=no_think temp=0.0: accuracy 65.0% (13/20); avg completion tokens 370, truncated 7, wall 27s
+== k3
+vllm:spec_decode_num_drafts_total{engine="0",model_name="hy3"} 2631.0
+vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="hy3"} 7893.0
+vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="hy3"} 4873.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="hy3",position="0"} 2307.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="hy3",position="1"} 1606.0
+vllm:spec_decode_num_accepted_tokens_per_pos_total{engine="0",model_name="hy3",position="2"} 960.0
+=== MATH-500 reasoning_effort=no_think temp=0.0: accuracy 55.0% (11/20); avg completion tokens 375, truncated 9, wall 21s
+
+

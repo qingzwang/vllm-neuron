@@ -150,6 +150,23 @@ accepted (so it is cumulative: position 2 can only be accepted after position 1)
   plain. Random-token prompts are hardly ever accepted, so every k is slower
   than plain there. TTFT grows by ~40 ms (the draft's prefill pass).
 
+#### Same test on GPU (B200, upstream vLLM)
+
+8x B200 (p6-b200.48xlarge), `vllm/vllm-openai:v0.29.0`, `tencent/Hy3-FP8`, TP=8,
+`--speculative-config '{"method": "mtp", "num_speculative_tokens": k}'`, the same 20 MATH-500
+problems (`scripts/eval_math500.py no_think --limit 20 --temperature 0 --max-tokens 512
+--concurrency 1`), acceptance from the server's `vllm:spec_decode_*` counters
+(`results/mtp_gpu/`):
+
+| | Neuron (table above) | B200 vLLM 0.29 |
+|---|---|---|
+| k=1: acceptance, position 1 | 87.0% | 87.6% (3447 / 3934) |
+| k=3: acceptance, positions 1 / 2 / 3 | 85.4 / 59.4 / 33.4% | 87.7 / 61.0 / 36.5% |
+| k=3: tokens per step | 2.78 | 2.85 |
+
+The draft accepts as often on Neuron as on GPU: a much higher first-position number
+(e.g. 99%) comes from a different workload, sampling or metric, not from the port.
+
 #### Concurrency 4
 
 Same server and prompts, 40 MATH-500 problems sent 4 at a time

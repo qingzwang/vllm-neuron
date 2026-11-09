@@ -164,8 +164,22 @@ problems (`scripts/eval_math500.py no_think --limit 20 --temperature 0 --max-tok
 | k=3: acceptance, positions 1 / 2 / 3 | 85.4 / 59.4 / 33.4% | 87.7 / 61.0 / 36.5% |
 | k=3: tokens per step | 2.78 | 2.85 |
 
-The draft accepts as often on Neuron as on GPU: a much higher first-position number
-(e.g. 99%) comes from a different workload, sampling or metric, not from the port.
+Rerun on Neuron with exactly that command (`scripts/serve_latency.sh MTP_K=k`, BF16 KV;
+`results/mtp_gpu/neuron_math20_k*_metrics.txt`): k=1 86.4% (3489 / 4036), k=3 86.3 / 59.9 /
+33.8% (2.80 tokens per step); 11/20 and 12/20 correct (GPU 13/20, 11/20). So Neuron is 1-3
+points below GPU on the same prompts, and a much higher first-position number (e.g. 99%)
+comes from a different workload, sampling or metric.
+
+Teacher-forced target comparison (the GPU's 20 greedy sequences fed to both; GPU
+`prompt_logprobs`, Neuron the captured last-layer output through norm + lm_head on CPU;
+`scripts/tf_logprob_compare.py`, `tf_logprob_detail.py`): over the 7164 completion positions the
+top-1 tokens agree at 97.4%, the actual token's log-prob differs by 0.033 nats on average
+(p90 0.062); 124 of the 188 disagreements are near-ties (GPU top-1 vs top-2 < 0.5 nats), 13
+exceed 2 nats; agreement does not degrade with position. A known systematic difference: the
+checkpoint is `activation_scheme: static` (W8A8 everywhere, as GPU vLLM runs it), while on
+Neuron the routed experts run W8A16 (BF16 activations; `moe_tkg` ignores input scales on
+Trn2, the prefill kernel takes BF16). Likely the main source of the 1-3 points, not
+verified; which side is closer to the BF16 model needs a BF16 reference (not run).
 
 #### Concurrency 4
 

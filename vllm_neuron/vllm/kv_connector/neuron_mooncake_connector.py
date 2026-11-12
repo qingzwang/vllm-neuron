@@ -142,6 +142,15 @@ class NeuronMooncakeConnectorWorker(MooncakeConnectorWorker):
         par = self.vllm_config.parallel_config
         num_kv_heads = self.model_config.get_total_num_kv_heads()
         replicas = max(1, self.tp_size // num_kv_heads)
+        # PATCH unequal-TP DCP: the shards live on the decode side, so check the decode's KV-head
+        # replication (decode TP from the extra config, default this TP) and require one KV head per
+        # rank on this side, so a prefill rank's block equals a decode rank's block.
+        d_tp = int(cfg.get_from_extra_config("remote_tp_size", self.tp_size))
+        if d_tp != self.tp_size:
+            if self.tp_size < num_kv_heads or d_tp % self.tp_size:
+                raise ValueError(f"NeuronMooncakeConnector remote_dcp_size: prefill TP {self.tp_size} "
+                                 f"needs >= {num_kv_heads} KV heads' ranks and to divide decode TP {d_tp}")
+            replicas = max(1, d_tp // num_kv_heads)
         interleave = getattr(par, "cp_kv_cache_interleave_size", self.block_size)
         problems = []
         if not self.is_kv_producer:
@@ -170,8 +179,14 @@ class NeuronMooncakeConnectorWorker(MooncakeConnectorWorker):
             return await super()._build_transfer_params(
                 ready_reqs, agent_meta, local_regions, remote_regions
             )
-        if agent_meta.remote_tp_size != self.tp_size:
-            msg = f"remote_dcp_size needs equal TP (P {self.tp_size}, D {agent_meta.remote_tp_size})"
+        num_kv_heads = self.model_config.get_total_num_kv_heads()
+        if agent_meta.remote_tp_size != self.tp_size and not (
+            self.tp_size >= num_kv_heads and agent_meta.remote_tp_size % self.tp_size == 0
+            and agent_meta.remote_tp_rank // (agent_meta.remote_tp_size // num_kv_heads)
+            == self.tp_rank // (self.tp_size // num_kv_heads)):
+            msg = (f"remote_dcp_size: P TP {self.tp_size} rank {self.tp_rank} -> D TP "
+                   f"{agent_meta.remote_tp_size} rank {agent_meta.remote_tp_rank}: unsupported or "
+                   f"different KV head")
             return [], [], [], [d for d, _ in ready_reqs], msg
         dcp_rank = agent_meta.remote_tp_rank % self.remote_dcp_size
         src_ptrs: list[int] = []

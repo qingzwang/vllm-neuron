@@ -259,6 +259,33 @@ Both are open:
   1 / 2 / 4 / 8, max_model_len 262144. It ran AgentX at C = 1-16 without a hang (README), but its MTP
   acceptance is not recorded.
 
+## MBU and MFU per step
+
+Per target step, rank 0. MBU is HBM bytes / step time / 716 GB/s; MFU is TensorE FLOPs / step time /
+peak (BF16 167 TFLOPS per logical core; FP8 325).
+
+| | DCP=1, 1 request | DCP=1, 8 requests | DCP=8, 1 request |
+|---|---|---|---|
+| step | 32.5 ms | 60.0 ms | 29.1 ms |
+| **MBU, measured** (bytes of all DMA packets in the step) | **30%** (7.05 GB) | **47%** (20.1 GB) | **26%** (5.48 GB) |
+| MBU, required bytes only (weights + KV the step must read) | 29% (6.7 GB) | 44% (19.1 GB) | 25% (5.2 GB) |
+| TensorE FLOPs executed (`raw_flops` of the Tensor instructions) | 56.5 GFLOP | 440 GFLOP | 56.5 GFLOP |
+| **HFU**: executed FLOPs vs BF16 / FP8 peak | **1.0% / 0.5%** | **4.4% / 2.3%** | **1.2% / 0.6%** |
+| MFU: useful FLOPs (2 x 20.1B active params + attention, per token) vs BF16 peak | 0.3% | 1.3% | 0.3% |
+
+- **The step moves what it must, slowly.** The DMA bytes are within 5-6% of the bytes the step must
+  read, so there is little redundant traffic; the gap is the rate.
+- **TensorE executes about 3.4x the useful FLOPs.** The decode MoE computes all 3 local experts for
+  every token by design (it costs no extra time: the weights are read anyway).
+- **Do not use the profiler's built-in MBU / MFU for these steps:**
+  - The `Summary` values cover the whole capture session (2-3.6 s, including the idle time between
+    steps).
+  - The per-node HBM byte counters (`FrameworkNode` / `Instruction` `hbm_read_bytes`) give 4.5 /
+    8.6 / 5.2 GB per step, against 7.05 / 20.1 / 5.48 GB of DMA packets. They miss the DMAs whose
+    descriptors are generated at run time, mostly the paged-KV gathers, so their MBU (19 / 20 / 25%)
+    is too low.
+  - The node `mfu` (0.00-0.02%) is an operator-level PE occupancy formula, not FLOPs over time.
+
 ## Why the model maps badly onto the machine
 
 - **Each rank's work per layer is small.** Using the machine's 46 TB/s takes 64 ranks:

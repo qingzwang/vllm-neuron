@@ -187,7 +187,42 @@ def fig_dma():
     save(fig, "dma_ceiling.png")
 
 
+# ---- 5: DMA microbenchmark (scripts/dma_bench.py) ------------------------------------------------
+def fig_dma_bench():
+    rows = {}
+    for line in open(os.path.join(RES, "..", "dma_bench", "hbm_to_sbuf_lnc2.txt")):
+        f = line.split()
+        if len(f) == 6 and f[0] in ("none", "hwdge", "swdge", "gather"):
+            rows.setdefault(f[0], []).append((int(f[1]), float(f[4])))
+    fig, ax = plt.subplots(figsize=(8.5, 4.4))
+    fig.subplots_adjust(left=0.10, right=0.97, top=0.74, bottom=0.14)
+    titles(fig, "DMA 带宽 vs 每行字节数（HBM → SBUF，一个逻辑核）",
+           "每次 DMA 搬 [128 个 partition × 每行 F 字节]；gather = 每个 partition 按 SBUF 里的索引取一行（paged KV 的方式）")
+    style = {"none": (AXIS, "静态描述符"), "hwdge": (ORANGE, "硬件 DGE"), "swdge": (AQUA, "GpSimd 软件 DGE"),
+             "gather": (BLUE, "GpSimd gather")}
+    for mode, (col, name) in style.items():
+        xs, ys = zip(*rows[mode])
+        ax.plot(xs, ys, color=col, linewidth=2.2 if mode == "gather" else 1.8, marker="o", markersize=5,
+                markeredgecolor=SURF, markeredgewidth=1.5)
+    from matplotlib.lines import Line2D
+    fig.legend([Line2D([0], [0], color=c, linewidth=2, marker="o", markersize=5) for c, _ in style.values()],
+               [n for _, n in style.values()], loc="upper left", bbox_to_anchor=(0.09, 0.85), ncol=4, frameon=False, fontsize=10)
+    ax.axhline(716, color=AXIS, linewidth=1)
+    ax.text(512, 724, "HBM 716 GB/s", color=MUTED, fontsize=9, va="bottom")
+    ax.axvspan(1800, 4400, color=BAND, zorder=0, linewidth=0)
+    ax.text(2800, 40, "Hy3 现在的\n2-4 KB 包", ha="center", color=MUTED, fontsize=9)
+    ax.annotate("gather 2 KB：348 GB/s", xy=(2048, 347.6), xytext=(5200, 330), color=INK, fontsize=9.5,
+                arrowprops=dict(arrowstyle="-", color=MUTED, linewidth=0.8))
+    ax.set_xscale("log", base=2)
+    ax.set_xticks([512, 1024, 2048, 4096, 8192, 16384, 32768], ["512", "1K", "2K", "4K", "8K", "16K", "32K"])
+    ax.set_xlim(420, 40000); ax.set_ylim(0, 800)
+    ax.set_xlabel("每行（每个 partition）连续字节数"); ax.set_ylabel("GB/s")
+    ax.yaxis.grid(True, color=GRID, linewidth=0.8); ax.set_axisbelow(True)
+    save(fig, "dma_bench.png")
+
+
 if __name__ == "__main__":
+    fig_dma_bench()
     fig_layer()
     fig_timeline("c1", "1 个请求")
     fig_timeline("c8", "8 个请求")

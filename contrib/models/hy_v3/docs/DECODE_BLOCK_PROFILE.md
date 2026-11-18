@@ -6,9 +6,10 @@ not the collectives, not the FLOPs, not HBM bandwidth.
 
 Short answer:
 - Every part of a layer runs at 20-55% of its HBM-bandwidth bound.
-- Most of the gap is the cost of moving each rank's small per-layer data in 2 KB DMA pieces. Their
-  descriptors are generated at run time (software DGE on GpSimd), so the DMA engines are idle
-  35-50% of the kernel time and run at about 18-20 GB/s each when busy.
+- Most of the gap is in how each rank's small per-layer data is moved by DMA:
+  - attention gathers the paged KV in 2 KB rows, an access that a microbenchmark caps at 348 GB/s,
+    half of HBM;
+  - the MoE kernel keeps its DMA engines busy only about half the time.
 - On top of that, the attention kernel has about 125 us of fixed cost per layer.
 - The two all-reduces per layer (24-29 us each) overlap almost nothing.
 
@@ -151,7 +152,54 @@ alone. In the model the whole MoE block takes 166-191 us, about 2x its HBM bound
 
 ![DMA ceiling of the two kernels](decode_block_profile/dma_ceiling.png)
 
+## DMA microbenchmark: what a 2 KB row costs
+
+`scripts/dma_bench.py` streams HBM -> SBUF on one logical core (both physical cores, each its own
+half). Each DMA moves [128 partitions, F bytes], and every partition's row is F contiguous bytes.
+Device times come from a profile (`PROF=<dir>`, then `scripts/dma_bench_analyze.py`), as the slope
+between 2 and 10 passes over 64 MB.
+
+Every DMA's destination is read once (one byte per partition), because the compiler drops DMA
+writes that nothing reads. The bytes the profile saw match the expected bytes in every row.
+
+Modes:
+- **static**: descriptors built by the runtime before execution;
+- **hwdge**: built by the DGE hardware block;
+- **swdge**: built by GpSimd at run time;
+- **gather**: swdge with a row index per partition from SBUF, the paged-KV access.
+
+Results in `results/dma_bench/hbm_to_sbuf_lnc2.txt`:
+
+| GB/s per logical core | 512 B | 1 KB | 2 KB | 4 KB | 8 KB | 32 KB |
+|---|---|---|---|---|---|---|
+| static | 406 | 509 | 651 | 683 | 685 | 693 |
+| hwdge | 142 | 285 | 570 | 664 | 684 | 682 |
+| swdge | 192 | 383 | 628 | 667 | 685 | 692 |
+| gather | 87 | 173 | **348** | 661 | 683 | 695 |
+
+![DMA bandwidth vs row size](decode_block_profile/dma_bench.png)
+
+What this says about the model:
+- **Contiguous 2 KB rows are not the problem.** They stream at 570-650 GB/s in every mode, 80-90% of
+  HBM. So the MoE kernel's ~340-380 GB/s does not come from its row size. Its engines are idle half
+  the time: loads are issued in pieces between compute and do not keep enough DMAs in flight.
+- **Gathered 2 KB rows are.** A per-partition gather with 2 KB rows tops out at 348 GB/s, half of
+  HBM, and that is how `attention_tkg` reads the paged KV. The 8-request attention kernel's ~390 GB/s
+  sits at this ceiling.
+- **4 KB rows remove the gather penalty** (661 GB/s). So a KV layout whose gathered rows are 4 KB or
+  more, for example the unpacked 32-token block of one head or a larger block, would read at near
+  HBM speed.
+
+The transposing gather that `attention_tkg` uses for K (`DMA_GATHER_TRANSPOSE`) is not covered here.
+
 ## Collectives and overlap
+
+All 161 all-reduces of a step are 64-rank `Mesh` all-reduces (CcOp table):
+- median 24.2 us at 32 KB (1 request) and 28.6 us at 256 KB (8 requests), with about 1.8 us from
+  trigger to start;
+- 8x the data costs 4 us more, so they are latency-bound: the bus bandwidth is 2.7 and 18 GB/s;
+- nccom-test gives 22 / 27 us for the same sizes, so the model gets what the collective library
+  gives.
 
 While each all-reduce runs, any engine is busy for:
 - after attention: 1% (c1) and 1% (c8) of its time;
@@ -173,9 +221,13 @@ schedule) did not change device time.
 - **Each rank's work per layer is small.** Using the machine's 46 TB/s takes 64 ranks:
   - each rank has 1 Q head, 1 replicated KV head and 3 experts of 18.9 MB;
   - a layer moves 24-200 MB in 4-32 tokens of compute.
-- **Trn2 moves that data with DMA descriptors.** Paged KV and per-expert weight rows give 2-4 KB
-  descriptors, generated on GpSimd at run time. The DMA engines then idle 35-50% of the time and
-  run at about 75% of their rate when busy, which puts both big kernels near 400 GB/s per core.
+- **Trn2 moves that data with DMA descriptors.** The two big kernels lose bandwidth in two ways
+  (DMA microbenchmark above):
+  - **Attention gathers the paged KV in 2 KB rows.** That access tops out at 348 GB/s, half of HBM;
+    contiguous 2 KB rows or gathered 4 KB rows run at 650-660 GB/s.
+  - **The MoE weight rows are contiguous.** They could stream at ~600 GB/s, but the kernel keeps the
+    DMA engines busy only half the time.
+
   A GPU streams the same bytes as loads from many SMs, with no descriptor stage.
 - **Each layer also pays fixed costs:** ~125 us in the attention kernel, ~50 us of block glue and
   two 64-rank all-reduces of 24-29 us with no overlap. 80 layers repeat it, and at c1 that is more

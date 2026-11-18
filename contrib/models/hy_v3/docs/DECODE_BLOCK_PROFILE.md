@@ -117,7 +117,9 @@ c8, per DMA engine (`profile_dma_engines.py`):
 - when busy, each moves 17.5 GB/s. A 2 KB software-DGE packet takes about 100 ns;
 - 33 x 17.5 GB/s x 0.66 = 384 GB/s.
 
-Busy all the time, the same packets would give about 580-670 GB/s.
+These busy fractions are upper bounds: tiny completion packets (4-32 B) count as busy time. And
+"all engines busy" does not give 33 x 17.5 GB/s for a gather: the DMA microbenchmark below puts a
+2 KB-row gather at 348 GB/s, so the kernel is already at that access pattern's ceiling.
 
 What bounds it:
 - **The KV is read in 2 KB pieces.** One KV head per rank and 32-token paged blocks give 4 KB of K
@@ -149,8 +151,6 @@ descriptors.
 
 The single-core benchmark of the routed part (0.127 ms, README "Fused decode MoE") is the kernel
 alone. In the model the whole MoE block takes 166-191 us, about 2x its HBM bound.
-
-![DMA ceiling of the two kernels](decode_block_profile/dma_ceiling.png)
 
 ## DMA microbenchmark: what a 2 KB row costs
 
@@ -192,6 +192,10 @@ What this says about the model:
 
 The transposing gather that `attention_tkg` uses for K (`DMA_GATHER_TRANSPOSE`) is not covered here.
 
+The two kernels against the ceiling of their own access pattern:
+
+![DMA ceiling of the two kernels](decode_block_profile/dma_ceiling.png)
+
 ## Collectives and overlap
 
 All 161 all-reduces of a step are 64-rank `Mesh` all-reduces (CcOp table):
@@ -215,6 +219,45 @@ So only independent work can hide them, mainly the next kernel's weight loads (a
 fit in 28 us at 400 GB/s). Neither the compiler nor the kernels schedule such a prefetch across a
 kernel boundary today. The megakernel prototype (8 layers in one NKI kernel, no explicit DMA
 schedule) did not change device time.
+
+## DCP=8 (1 request)
+
+The same setup with `DCP=8` (`scripts/profile_85k.sh` now takes `DCP`; with MTP it sets
+`VLLM_NEURON_DCP_SPEC_DECODE=1`). DCP=8 shards each KV head's history over the 8 ranks that hold it,
+so each rank reads 1/8 of the KV. Each layer still has its two 64-rank all-reduces. Attention adds
+three 8-rank collectives (an AllGather of 1 KB, one of 256 B and an AllToAll of 8 KB, 5-7 us each).
+Results: `results/profile_decode_block/block_dcp8_c1.txt`, `kernel_dcp8_c1.txt`.
+
+| per layer (1 request) | DCP=1 | DCP=8 | DCP=8 bound |
+|---|---|---|---|
+| attention | 174 us | 134 us | 7 us (2.75 MB of KV + 2.1 MB of weights) |
+| all-reduce after attention | 24 us | 21 us | 22 us |
+| MoE | 172 us | 170 us | 85 us |
+| all-reduce after MoE | 25 us | 29 us | 22 us |
+| target NEFF / MTP draft NEFF | 32.5 / 3.0 ms | 29.0 / 2.3 ms | |
+
+![DCP=8 vs DCP=1, one request](decode_block_profile/dcp8_c1.png)
+
+- **The KV read becomes 1/8.** `attention_tkg` goes from 128 to 32 us per layer and from 16.6 to
+  2.2 MB.
+- **DCP adds fixed cost that takes most of the gain back:**
+  - the cross-rank combine in `attention_block_tkg_sharding` takes 27 us, 21 of them Sync-engine waits;
+  - the three 8-rank collectives take 17 us;
+  - no engine and no collective runs for 40 us of the phase.
+- **Attention at DCP=8 is almost all fixed cost:** 134 us against a 7 us bound. What is left to
+  remove is the block's fixed work, not the KV traffic.
+
+Two problems showed up in this configuration (dense decode, max_model_len 86016, batch buckets 1 / 8).
+Both are open:
+- **MTP accepts almost nothing.** The server reported a mean acceptance length of 1.08-1.12 tokens
+  per step, against 2.3 without DCP on the same prompts. So the per-step times above are right, but
+  this configuration produces fewer tokens per step than it should.
+- **The 8-request session did not run.** With 7 requests decoding and the 8th prefilling, all
+  workers stopped without an error; the engine gave up after 5 minutes. A restart then hung in
+  warmup (all workers spinning, no compiler running), and that run was stopped.
+- The deployed DCP configuration (`serve_agentx_dcp.sh`) differs: sparse decode, batch buckets
+  1 / 2 / 4 / 8, max_model_len 262144. It ran AgentX at C = 1-16 without a hang (README), but its MTP
+  acceptance is not recorded.
 
 ## Why the model maps badly onto the machine
 

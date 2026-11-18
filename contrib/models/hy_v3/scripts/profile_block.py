@@ -61,6 +61,7 @@ def dma_in(iv):
 
 
 allv = merge(ins[["start_ts", "end_ts"]].to_numpy())
+ccv = merge(cc[cc.operation != "BARRIER"][["start_ts", "end_ts"]].to_numpy())
 ins = ins.sort_values("start_ts"); st = ins.start_ts.to_numpy()
 rows = []
 for i in range(nl):
@@ -73,7 +74,8 @@ for i in range(nl):
         r[ph + "|DMA"] = int(dby[(dts >= s) & (dts < t)].sum())
     for ph, (s, t) in {"attn": (w0, a0), "moe": (a1, m0)}.items():
         g = ins.iloc[np.searchsorted(st, s):np.searchsorted(st, t)]
-        r[ph + "|idle"] = (t - s) - length(clip(allv, s, t))
+        r[ph + "|idle"] = (t - s) - length(merge(np.vstack([clip(allv, s, t), clip(ccv, s, t)])))
+        r[ph + "|cc"] = length(clip(ccv, s, t))  # collectives inside the phase (DCP's attention exchange)
         r[ph + "|DMA"] = int(dby[(dts >= s) & (dts < t)].sum())
         for p, gp in g.groupby("part"):
             iv = clip(merge(gp[["start_ts", "end_ts"]].to_numpy()), s, t)
@@ -95,7 +97,7 @@ print(f"whole step: {(t1 - t0) / 1e6:.2f} ms; sum of layer spans {df.span.sum() 
       f"attention {df.attn.sum() / 1e6:.2f}, attn AR {df.attn_AR.sum() / 1e6:.2f}, MoE {df.moe.sum() / 1e6:.2f}, MoE AR {df.moe_AR.sum() / 1e6:.2f}")
 for ph in ("attn", "moe"):
     print(f"\n[{ph} phase] {us(med[ph]):.1f} us, DMA {med[ph + '|DMA'] / 1e6:.2f} MB ({med[ph + '|DMA'] / max(med[ph], 1):.0f} GB/s), "
-          f"idle {us(med[ph + '|idle']):.1f} us; engine busy: " +
+          f"collectives inside {us(med[ph + '|cc']):.1f} us, idle {us(med[ph + '|idle']):.1f} us; engine busy: " +
           " ".join(f"{k.split('|')[2]} {us(med[k]):.0f}" for k in med.index if k.startswith(ph + "|eng|")))
     print(f"  {'group':28s} {'us':>7s} {'DMA MB':>7s} {'GB/s':>6s} {'instr':>6s}  engine busy us")
     ks = sorted([k for k in med.index if k.startswith(ph + ":") and "|" not in k], key=lambda k: -med[k])

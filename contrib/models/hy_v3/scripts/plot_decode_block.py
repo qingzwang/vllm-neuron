@@ -161,15 +161,15 @@ def fig_attention():
 
 # ---- 4: why the DMA stops near 400 GB/s ----------------------------------------------------------
 def fig_dma():
-    rows = [  # dma_engines_c8.txt
-        ("attention_tkg", "HBM 峰值", 716), ("attention_tkg", "33 个 DMA 引擎一直忙（每个 17.5 GB/s）", 578),
-        ("attention_tkg", "实测：引擎只有 66% 的时间在忙", 384),
-        ("moe_tkg_fused", "HBM 峰值", 716), ("moe_tkg_fused", "33 个 DMA 引擎一直忙（每个 19.9 GB/s）", 657),
-        ("moe_tkg_fused", "实测：引擎只有 51% 的时间在忙", 339)]
+    rows = [  # measured: dma_engines_c8.txt; ceilings: results/dma_bench (same access pattern, 2 KB rows)
+        ("attention_tkg", "HBM 峰值", 716), ("attention_tkg", "同样访问方式的上限（按索引 gather 2 KB 行）", 348),
+        ("attention_tkg", "实测", 384),
+        ("moe_tkg_fused", "HBM 峰值", 716), ("moe_tkg_fused", "同样访问方式的上限（连续 2 KB 行，软件 DGE）", 628),
+        ("moe_tkg_fused", "实测：DMA 引擎只有约一半时间在忙", 339)]
     fig, ax = plt.subplots(figsize=(9, 4.0))
     fig.subplots_adjust(left=0.40, right=0.93, top=0.76, bottom=0.13)
-    titles(fig, "两个大 kernel 为什么只有约 350-400 GB/s，而不是 716",
-           "8 个请求，rank 0。数据都是 2-4 KB 的小包，描述符由 GpSimd 在运行时生成（software DGE）")
+    titles(fig, "两个大 kernel 的 DMA 带宽：实测 vs 同样访问方式的上限",
+           "8 个请求，rank 0。上限来自 DMA microbenchmark（scripts/dma_bench.py）：attention 已顶到 gather 的上限，MoE 还差一半")
     ys = [5.6, 4.8, 4.0, 2.2, 1.4, 0.6]
     for (k, step, v), y in zip(rows, ys):
         meas = step.startswith("实测")
@@ -221,7 +221,52 @@ def fig_dma_bench():
     save(fig, "dma_bench.png")
 
 
+# ---- 6: DCP=8 vs DCP=1, one request -------------------------------------------------------------
+DCP_ROWS = [  # block_c1.txt, block_dcp8_c1.txt; DCP=8 bound: 1/8 of the KV (2.75 MB) + 2.1 MB weights
+    ("DCP=1  实测", [("attention", 173.9), ("all-reduce", 23.6), ("MoE", 172.0), ("all-reduce", 24.8)]),
+    ("DCP=8  实测", [("attention", 133.5), ("all-reduce", 21.3), ("MoE", 170.4), ("all-reduce", 29.3)]),
+    ("DCP=8  带宽下限", [("attention", 7), ("all-reduce", 22), ("MoE", 85), ("all-reduce", 22)]),
+]
+ATT_DCP8 = [  # attention phase at DCP=8, 1 request (us per layer; block_dcp8_c1.txt)
+    ("读 KV 算 attention（attention_tkg）", 32.3), ("DCP 合并代码（attention_block_tkg_sharding）", 26.6),
+    ("DCP 的 8 rank 集合通信", 16.6), ("attention block 其余（glue、写 cache）", 15.7), ("QKV / O 投影", 15.0),
+    ("引擎全空闲", 39.7)]
+
+
+def fig_dcp():
+    fig, (ax, bx) = plt.subplots(2, 1, figsize=(9, 5.6), gridspec_kw={"height_ratios": [1.1, 1.4]})
+    fig.subplots_adjust(left=0.36, right=0.92, top=0.80, bottom=0.08, hspace=0.55)
+    titles(fig, "DCP=8（1 个请求）：attention 读 KV 变成 1/8，但固定开销留下了",
+           "第 1-79 层中位数，rank 0，dense attention，FP8 KV，MTP k=3。上：一层；下：DCP=8 时 attention 阶段的组成")
+    ys = [2.0, 1.0, 0.0]
+    for (label, parts), y in zip(DCP_ROWS, ys):
+        x = 0
+        for p, v in parts:
+            ax.barh(y, max(v - 2, 0.5), left=x, height=0.55, color=COL[p], linewidth=0)
+            if v > 40:
+                ax.text(x + v / 2, y, f"{v:.0f}", ha="center", va="center", color="white", fontsize=9.5)
+            x += v
+        ax.text(x + 6, y, f"{x:.0f} µs", va="center", color=INK, fontsize=10)
+    ax.set_yticks(ys, [l for l, _ in DCP_ROWS])
+    for t, (l, _) in zip(ax.get_yticklabels(), DCP_ROWS):
+        t.set_color(INK if "实测" in l else INK2)
+    ax.set_xlim(0, 450); ax.set_ylim(-0.5, 2.5); ax.tick_params(axis="y", length=0)
+    ax.set_xlabel("每层 µs", fontsize=9.5); xgrid(ax)
+    legend(fig, ["attention", "all-reduce", "MoE"], [BLUE, ORANGE, AQUA], 0.36, 0.875)
+    names = [n for n, _ in ATT_DCP8][::-1]
+    vals = [v for _, v in ATT_DCP8][::-1]
+    cols = [AXIS if "空闲" in n else (ORANGE if "集合通信" in n else BLUE) for n in names]
+    bx.barh(range(len(vals)), vals, height=0.55, color=cols, linewidth=0)
+    for i, v in enumerate(vals):
+        bx.text(v + 1, i, f"{v:.0f}", va="center", color=INK, fontsize=9.5)
+    bx.set_yticks(range(len(vals)), names); bx.tick_params(axis="y", length=0)
+    bx.set_xlim(0, 50); bx.set_xlabel("µs（各部分是指令时间的并集，彼此有少量重叠；attention 阶段共 134 µs，下限约 7 µs）", fontsize=9)
+    xgrid(bx)
+    save(fig, "dcp8_c1.png")
+
+
 if __name__ == "__main__":
+    fig_dcp()
     fig_dma_bench()
     fig_layer()
     fig_timeline("c1", "1 个请求")

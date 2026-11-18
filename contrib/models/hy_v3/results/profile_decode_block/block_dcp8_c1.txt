@@ -1,0 +1,30 @@
+execution 38: 29.05 ms, 161 all-reduces of 32 KB -> 80 layers
+
+layers 1-79, median per layer (us): span 356.0 = attention 133.5 + attn AR 21.3 + MoE 170.4 + MoE AR 29.3;  DMA 69.00 MB/layer (194 GB/s averaged over the span)
+whole step: 29.05 ms; sum of layer spans 28.31 ms; attention 10.77, attn AR 1.71, MoE 13.49, MoE AR 2.35
+
+[attn phase] 133.5 us, DMA 5.42 MB (41 GB/s), collectives inside 16.6 us, idle 39.7 us; engine busy: GpSimd 31 Scalar 18 Sync 24 Tensor 17 Vector 47
+  group                             us  DMA MB   GB/s  instr  engine busy us
+  attention_tkg                   32.3    2.17     67    730  GpSimd 11 Scalar 6 Sync 1 Tensor 11 Vector 20
+  attention_block_tkg_sharding    26.6    0.11      4    194  GpSimd 1 Scalar 2 Sync 21 Vector 12
+  attention_block_tkg             15.7    0.06      4    112  GpSimd 9 Scalar 2 Sync 2 Tensor 2 Vector 7
+  qkv_tkg                          8.3    0.31     37     94  GpSimd 1 Scalar 2 Tensor 2 Vector 4
+  torch                            7.4    0.07      9     30  GpSimd 7 Sync 0
+  output_projection_tkg            6.7    0.24     36     36  Scalar 4 Tensor 1 Vector 1 GpSimd 2
+  moe_tkg_fused                    3.5    0.03     10      9  GpSimd 1 Scalar 2 Vector 0
+  stream_shuffle_broadcast         2.6    0.00      0     32  Vector 3
+  rmsnorm_tkg                      2.2    1.08    498     18  Scalar 1 Tensor 1 Vector 1
+  rope                             2.1    0.00      1     28  Vector 2
+
+[moe phase] 170.4 us, DMA 58.10 MB (341 GB/s), collectives inside 0.0 us, idle 12.6 us; engine busy: GpSimd 86 Scalar 16 Sync 2 Tensor 105 Vector 93
+  group                             us  DMA MB   GB/s  instr  engine busy us
+  moe_tkg_fused                  155.7   53.57    344   1600  GpSimd 84 Scalar 14 Sync 1 Tensor 105 Vector 92
+  torch                            4.8    1.56    325     55  GpSimd 3 Scalar 2 Sync 1
+  attention_block_tkg              1.8    0.44    252     12  Vector 1 GpSimd 1
+  rmsnorm_tkg                      1.7    0.39    227      5  Vector 0 Scalar 1
+  attention_tkg                    0.9    0.19    201      4  GpSimd 1 Vector 0
+  qkv_tkg                          0.4    0.13    305      2  Vector 0
+
+[overlap] while an all-reduce runs, any engine busy / DMA moved (median per layer):
+  attn_AR: 21.3 us, engines busy 0.0 us (0%), DMA 0.05 MB
+  moe_AR: 29.3 us, engines busy 6.9 us (23%), DMA 4.23 MB

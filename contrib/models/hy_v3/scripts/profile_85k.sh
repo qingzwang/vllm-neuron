@@ -8,7 +8,11 @@
 # Env: MODEL, PORT, MTP_K (default 3; empty for plain decode), KV_CAP (0.49),
 #      HY3_KV_SCALE_PROFILE (default kv_profiles/Hy3-FP8_mtp_neuron.safetensors),
 #      PROFILE_RANKS (JSON list of TP ranks, default 8 spread over EP),
-#      PROFILE_DIR (default ./neuron_profiles).
+#      PROFILE_DIR (default ./neuron_profiles),
+#      DCP (decode context parallel size, default 1; 8 shards each KV head's history over its 8
+#      ranks, with MTP via VLLM_NEURON_DCP_SPEC_DECODE=1, see serve_agentx_dcp.sh),
+#      NEURON_RT_EXEC_TIMEOUT (default 1200: stopping a DMA-traced session stalls the profiled
+#      ranks for more than the runtime's 30 s, and the others then fail in their collectives).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
@@ -18,11 +22,14 @@ export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
 # runs 6 such requests at once.
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.49}
 export HY3_KV_SCALE_PROFILE=${HY3_KV_SCALE_PROFILE:-$HERE/../kv_profiles/Hy3-FP8_mtp_neuron.safetensors}
+export NEURON_RT_EXEC_TIMEOUT=${NEURON_RT_EXEC_TIMEOUT:-1200}
+DCP=${DCP:-1}
 MTP_K=${MTP_K-3}
 SPEC_ARGS=()
 if [ -n "$MTP_K" ]; then
     SPEC_ARGS=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP_K}")
     export HY3_DECODE_HITS_MAX_T=${HY3_DECODE_HITS_MAX_T:-$((4 * (MTP_K + 1)))}
+    [ "$DCP" != 1 ] && export VLLM_NEURON_DCP_SPEC_DECODE=1
 fi
 RANKS=${PROFILE_RANKS:-[0, 9, 18, 27, 36, 45, 54, 63]}
 exec vllm serve "${MODEL:-tencent/Hy3-FP8}" "${SPEC_ARGS[@]}" \
@@ -34,6 +41,8 @@ exec vllm serve "${MODEL:-tencent/Hy3-FP8}" "${SPEC_ARGS[@]}" \
     --max-num-batched-tokens 4096 \
     --block-size 32 \
     --enable-prefix-caching \
+    --decode-context-parallel-size "$DCP" \
+    --cp-kv-cache-interleave-size 32 \
     --kv-cache-dtype fp8 \
     --port "${PORT:-8000}" \
     --profiler-config '{"profiler": "cuda"}' \

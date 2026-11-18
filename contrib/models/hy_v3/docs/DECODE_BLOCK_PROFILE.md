@@ -7,7 +7,7 @@ not the collectives, not the FLOPs, not HBM bandwidth.
 Short answer:
 - Every part of a layer runs at 20-55% of its HBM-bandwidth bound.
 - Most of the gap is the cost of moving each rank's small per-layer data in 2 KB DMA pieces. Their
-  descriptors are generated at run time (software DGE on GpSimd), so the 32 DMA engines are idle
+  descriptors are generated at run time (software DGE on GpSimd), so the DMA engines are idle
   35-50% of the kernel time and run at about 18-20 GB/s each when busy.
 - On top of that, the attention kernel has about 125 us of fixed cost per layer.
 - The two all-reduces per layer (24-29 us each) overlap almost nothing.
@@ -34,7 +34,8 @@ Export and analysis:
 2. Analyze with `scripts/profile_block.py`, `profile_kernel.py`, `profile_dma_packets.py` and
    `profile_dma_engines.py`.
 
-Raw outputs are in `results/profile_decode_block/`.
+Raw outputs are in `results/profile_decode_block/`. The figures are drawn by `scripts/plot_decode_block.py` (matplotlib, Noto Sans CJK)
+from those outputs and from one layer's timeline (`scripts/profile_timeline.py`).
 
 `profile_block.py` cuts the timeline at the all-reduces: one for the embedding, then two per layer.
 The per-instruction layer tags are not usable for this: deduplicated kernels carry one layer's tag
@@ -65,11 +66,39 @@ The collective bound is nccom-test's 64-rank all-reduce at the same size.
 | all-reduce after MoE | 25 us | 22 us | 29 us | 27 us |
 | **layer** | **395 us** | **163 us** | **739 us** | **388 us** |
 
+![One decode layer, measured vs HBM-bandwidth bound](decode_block_profile/layer_vs_bound.png)
+
 The 80 layers at the bound would take 13.0 ms (c1) and 31.0 ms (c8), against 32.5 ms and 60.0 ms
 measured: c1 runs at 40% of the bound and c8 at 52%.
 
 Attention is about 126 us fixed plus 48 us per request. The slope reads one request's 22 MB of KV at
 about 460 GB/s, 64% of HBM. MoE does not depend on the batch.
+
+![Attention per layer vs requests](decode_block_profile/attention_vs_requests.png)
+
+## One layer on the device
+
+Layer 40 of one step, rank 0 (figure labels in Chinese):
+- each row is one engine; a bar means it is executing an instruction;
+- the orange row and the grey bands are the two all-reduces;
+- the strip at the bottom is the DMA throughput.
+
+There is no "DMA active" row: tiny completion packets (4-32 B) keep some queue busy almost all the
+time, so the throughput is the useful view. For the same reason the "DMA active" times in the kernel
+tables below are upper bounds.
+
+![One layer's engine timeline, 1 request](decode_block_profile/timeline_c1.png)
+
+![One layer's engine timeline, 8 requests](decode_block_profile/timeline_c8.png)
+
+How to read them:
+- **Attention at 1 request.** The throughput stays at 100-350 GB/s for the whole phase, and no engine
+  row is full. Every engine waits on the others.
+- **Attention at 8 requests.** Throughput reaches 500-700 GB/s only in bursts and dips between them.
+  At 85-130 us it is about zero while TensorE and VectorE compute: loads and compute take turns
+  instead of overlapping.
+- **MoE.** Weight streaming reaches 400-650 GB/s, and TensorE works in blocks between the loads.
+- **The all-reduces.** Every row is empty there, and the DMA throughput is about zero.
 
 ## Attention kernel (`attention_tkg`)
 
@@ -113,12 +142,14 @@ The remaining ~46 us per layer of the attention phase at c1 is the rest of the a
 | DMA active / rate while active | 147 us / 389 GB/s | 171 us / 379 GB/s |
 | Tensor / GpSimd / Vector busy | 108 / 105 / 99 us | 108 / 118 / 106 us |
 
-c8: the DMA engines are busy 52% of the kernel time, at 20 GB/s each when busy (84 ns per 2 KB
+c8: the DMA engines are busy 51% of the kernel time, at 20 GB/s each when busy (84 ns per 2 KB
 packet). GpSimd spends about 148 us per layer on `DMA_DIRECT2D`, generating the weight streams'
 descriptors.
 
 The single-core benchmark of the routed part (0.127 ms, README "Fused decode MoE") is the kernel
 alone. In the model the whole MoE block takes 166-191 us, about 2x its HBM bound.
+
+![DMA ceiling of the two kernels](decode_block_profile/dma_ceiling.png)
 
 ## Collectives and overlap
 
@@ -161,7 +192,7 @@ Per-step gains are at c8, estimated from the tables above, not measured.
 |---|---|---|
 | keep the DMA engines fed in `attention_tkg`: KV descriptors precomputed or hardware DGE, the next tile's gather issued before the current softmax | attention, 429 us/layer at c8 | toward ~250-300 us/layer: 10-14 ms |
 | larger contiguous KV pieces (64/128-token blocks, or a head-major layout so one descriptor covers more than 2 KB) | attention | part of the above; changes the KV block size and prefix caching |
-| the same for `moe_tkg_fused`: engines are busy 52% | MoE, 171-191 us/layer | toward ~110 us: ~5-6 ms |
+| the same for `moe_tkg_fused`: engines are busy 51% | MoE, 171-191 us/layer | toward ~110 us: ~5-6 ms |
 | prefetch the next kernel's weights during each all-reduce (needs cross-kernel scheduling or a multi-layer kernel with an explicit DMA order) | 2 x 24-29 us/layer | up to ~4 ms |
 | fold the attention block's glue (norm, broadcast, cache write) into fewer instructions | ~46 us/layer | ~2 ms |
 

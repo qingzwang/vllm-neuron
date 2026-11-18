@@ -1,0 +1,15 @@
+row 1 salt prefill-B: TTFT 4674.7 ms, e2e 4674.7 ms, usage {'prompt_tokens': 85015, 'total_tokens': 85016, 'completion_tokens': 1, 'completion_tokens_details': {'reasoning_tokens': 0}}
+row 2 salt prefill-B: TTFT 791.7 ms, e2e 791.8 ms, usage {'prompt_tokens': 85015, 'total_tokens': 85016, 'completion_tokens': 1, 'completion_tokens_details': {'reasoning_tokens': 0}}
+start_profile 200 16.91s
+row 3 salt prefill-B: TTFT 808.6 ms, e2e 808.7 ms, usage {'prompt_tokens': 85015, 'total_tokens': 85016, 'completion_tokens': 1, 'completion_tokens_details': {'reasoning_tokens': 0}}
+stop_profile 200 915.1s
+vllm:prefix_cache_queries_total{engine="0",model_name="hy3"} 3.247573e+07
+vllm:prefix_cache_queries_created{engine="0",model_name="hy3"} 1.7949755251942997e+09
+vllm:prefix_cache_hits_total{engine="0",model_name="hy3"} 3.1763216e+07
+vllm:prefix_cache_hits_created{engine="0",model_name="hy3"} 1.7949755251943154e+09
+vllm:prefix_cache_queries_total{engine="0",model_name="hy3"} 3.2560745e+07
+vllm:prefix_cache_queries_created{engine="0",model_name="hy3"} 1.7949755251942997e+09
+vllm:prefix_cache_hits_total{engine="0",model_name="hy3"} 3.1841536e+07
+vllm:prefix_cache_hits_created{engine="0",model_name="hy3"} 1.7949755251943154e+09
+vllm:prefix_cache_queries_total{engine="0",model_name="hy3"} 32475730  vllm:prefix_cache_hits_total{engine="0",model_name="hy3"} 31763216  
+vllm:prefix_cache_queries_total{engine="0",model_name="hy3"} 32560745  vllm:prefix_cache_hits_total{engine="0",model_name="hy3"} 31841536  

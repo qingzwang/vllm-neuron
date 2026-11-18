@@ -1,0 +1,148 @@
+
+### dp0_pp0_tp0_dcp0_ep0_rank0.1794976389850125849.pt.trace.json.gz
+  window 3078.0 ms | GPU busy 2970.9 ms (97%) | kernels 309331 | cudaGraphLaunch 363 | steps 121
+  category       total ms    ms/step
+  gemm             1655.9      13.69
+  attention         811.0       6.70
+  comm              319.9       2.64
+  elementwise       165.0       1.36
+  moe               101.9       0.84
+  other              75.5       0.62
+  sampling           16.2       0.13
+  comm kernel: n=20570 | 170/step median 14.0 us p10 12.5 p90 16.5 | void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashin
+  comm kernel: n=484 | 4/step median 23.5 us p10 21.9 p90 45.8 | ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)
+  top 40 kernels (this file): count, total ms, avg us, category, name
+     19844   1202.36      60.6  gemm        _ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalINS1_17GroupProblemShapeIN4cute5tupleIJlllEEEEENS1_10collective
+     10043    719.69      71.7  attention   void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute
+     20570    305.96      14.9  comm        void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashinfer::trtllm_allreduce_fusion::
+     40172    199.73       5.0  gemm        void cutlass::device_kernel<vllm::cutlass_3x_gemm_sm90_fp8<cutlass::float_e4m3_t, cutlass::bfloat16_t, vllm::c3x::Scaled
+      9680     82.90       8.6  gemm        void cutlass::Kernel2<cutlass_80_simt_sgemm_128x64_8x5_tn_align1>(cutlass_80_simt_sgemm_128x64_8x5_tn_align1::Params)
+      9922     68.06       6.9  moe         void vllm::moe::single_group_topk::detail::single_group_topk_warp_kernel<float, float, int, (vllm::moe::ScoringFunc)1, 2
+     10043     48.12       4.8  attention   void cutlass::device_kernel<flash::FlashAttnFwdCombine<cute::tuple<cute::C<8>, cute::C<128> >, 5, 256, 1, false, true, c
+     10043     42.38       4.2  attention   void vllm::reshape_and_cache_flash_kernel<__nv_bfloat16, unsigned char, (vllm::Fp8KVCacheDataType)1>(__nv_bfloat16 const
+      9922     37.86       3.8  gemm        void cublasLt::splitKreduce_kernel<32, 16, int, float, float, float, float, false, float, float, float, true, false, fal
+     20570     34.44       1.7  elementwise triton_poi_fused__to_copy_clamp_mul_reciprocal_0
+      9922     33.81       3.4  moe         void tensorrt_llm::kernels::cutlass_kernels::fusedBuildExpertMapsSortFirstTokenKernel<32, 8, 8>(int const*, int*, int*, 
+      9922     28.92       2.9  gemm        void tensorrt_llm::kernels::cutlass_kernels::expandInputRowsKernel<__nv_fp8_e4m3, __nv_fp8_e4m3, (tensorrt_llm::kernels:
+      9922     28.24       2.8  elementwise triton_poi_fused_mul_silu_slice_0
+      9922     27.37       2.8  gemm        void tensorrt_llm::kernels::cutlass_kernels::computeStridesTmaWarpSpecializedKernel<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_b
+      9922     25.51       2.6  gemm        void tensorrt_llm::kernels::cutlass_kernels::doActivationKernel<__nv_fp8_e4m3, __nv_bfloat16, __nv_bfloat16, tensorrt_ll
+      9922     25.21       2.5  other       void vllm::scaled_fp8_quant_kernel_strided_group_shape<c10::BFloat16, c10::Float8_e4m3fn, true, true>(c10::Float8_e4m3fn
+      9438     23.76       2.5  other       triton_red_fused_3
+       363     17.76      48.9  gemm        nvjet_sm90_tst_192x8_64x8_4x1_v_bz_TNT
+      9559     15.65       1.6  other       triton_poi_fused_add_2
+      2541     14.02       5.5  elementwise void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::MeanOps<float, float, float, float>, unsi
+       484     13.92      28.8  comm        ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)
+      5445     13.32       2.4  elementwise void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<c10::BFloat16, 
+      9559     13.29       1.4  elementwise triton_poi_fused__to_copy_1
+      9680     13.16       1.4  gemm        triton_poi_fused__to_copy_clamp_cutlass_scaled_mm_mul_reciprocal_view_0
+      9922     11.78       1.2  elementwise memset32
+       363     10.44      28.8  sampling    void at::native::reduce_kernel<512, 1, at::native::ReduceOp<c10::BFloat16, at::native::ArgMaxOps<float>, unsigned int, l
+      2783      9.09       3.3  elementwise void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}:
+       242      7.05      29.1  gemm        nvjet_sm90_tst_64x8_64x16_2x1_v_bz_splitK_TNT
+       121      6.28      51.9  gemm        nvjet_sm90_tst_128x32_64x10_4x1_v_bz_TNT
+      2541      4.86       1.9  elementwise void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<float, float, f
+       121      3.94      32.6  gemm        nvjet_sm90_tst_64x32_64x16_2x1_v_bz_splitK_TNT
+       121      3.84      31.7  sampling    _resample_kernel
+      2904      3.65       1.3  elementwise void at::native::vectorized_elementwise_kernel<8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase&)::{lambd
+      2541      3.21       1.3  elementwise void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_tensor_scalar_kernel_impl<float
+       121      3.19      26.4  other       _temperature_kernel
+      2541      3.13       1.2  elementwise void at::native::vectorized_elementwise_kernel<4, at::native::rsqrt_kernel_cuda(at::TensorIteratorBase&)::{lambda()#2}::
+      2541      2.91       1.1  elementwise void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>, std::array<char*, 2ul> >(int
+       484      2.90       6.0  elementwise void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::T
+      2178      2.88       1.3  elementwise void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char*, 3ul> >(i
+      1815      2.56       1.4  elementwise void at::native::(anonymous namespace)::CatArrayBatchedCopy_vectorized<at::native::(anonymous namespace)::OpaqueType<2u>
+
+### dp0_pp0_tp1_dcp0_ep1_rank1.1794976390746278449.pt.trace.json.gz
+  window 3082.1 ms | GPU busy 2977.0 ms (97%) | kernels 309331 | cudaGraphLaunch 363 | steps 121
+  category       total ms    ms/step
+  gemm             1659.8      13.72
+  attention         810.1       6.70
+  comm              320.3       2.65
+  elementwise       153.4       1.27
+  moe               101.8       0.84
+  other              73.1       0.60
+  sampling           15.4       0.13
+  comm kernel: n=20570 | 170/step median 13.9 us p10 12.2 p90 15.6 | void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashin
+  comm kernel: n=484 | 4/step median 22.4 us p10 21.7 p90 45.5 | ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)
+
+### dp0_pp0_tp2_dcp0_ep2_rank2.1794976390603501216.pt.trace.json.gz
+  window 3082.3 ms | GPU busy 2981.1 ms (97%) | kernels 309331 | cudaGraphLaunch 363 | steps 121
+  category       total ms    ms/step
+  gemm             1655.6      13.68
+  attention         807.6       6.67
+  comm              334.6       2.77
+  elementwise       165.1       1.36
+  moe               101.9       0.84
+  other              73.0       0.60
+  sampling           14.7       0.12
+  comm kernel: n=20570 | 170/step median 14.2 us p10 12.6 p90 16.5 | void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashin
+  comm kernel: n=484 | 4/step median 22.7 us p10 21.7 p90 45.0 | ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)
+
+### dp0_pp0_tp3_dcp0_ep3_rank3.1794976390058735554.pt.trace.json.gz
+  window 3070.1 ms | GPU busy 2956.4 ms (96%) | kernels 309331 | cudaGraphLaunch 363 | steps 121
+  category       total ms    ms/step
+  gemm             1660.4      13.72
+  attention         810.2       6.70
+  comm              300.6       2.48
+  elementwise       153.2       1.27
+  moe               101.4       0.84
+  other              73.0       0.60
+  sampling           15.0       0.12
+  comm kernel: n=20570 | 170/step median 13.9 us p10 12.2 p90 15.6 | void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashin
+  comm kernel: n=484 | 4/step median 22.0 us p10 21.7 p90 45.0 | ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)
+
+### dp0_pp0_tp4_dcp0_ep4_rank4.1794976390135283846.pt.trace.json.gz
+  window 3079.0 ms | GPU busy 2971.5 ms (97%) | kernels 309331 | cudaGraphLaunch 363 | steps 121
+  category       total ms    ms/step
+  gemm             1660.4      13.72
+  attention         808.6       6.68
+  comm              315.3       2.61
+  elementwise       153.4       1.27
+  moe               101.9       0.84
+  other              75.3       0.62
+  sampling           16.8       0.14
+  comm kernel: n=20570 | 170/step median 14.0 us p10 12.1 p90 15.4 | void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashin
+  comm kernel: n=484 | 4/step median 22.1 us p10 21.7 p90 45.3 | ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)
+
+### dp0_pp0_tp5_dcp0_ep5_rank5.1794976390113553182.pt.trace.json.gz
+  window 3079.8 ms | GPU busy 2977.2 ms (97%) | kernels 309331 | cudaGraphLaunch 363 | steps 121
+  category       total ms    ms/step
+  gemm             1658.5      13.71
+  attention         809.5       6.69
+  comm              324.3       2.68
+  elementwise       153.2       1.27
+  moe               101.3       0.84
+  other              70.7       0.58
+  sampling           16.4       0.14
+  comm kernel: n=20570 | 170/step median 14.3 us p10 12.4 p90 15.7 | void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashin
+  comm kernel: n=484 | 4/step median 22.4 us p10 21.7 p90 45.5 | ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)
+
+### dp0_pp0_tp6_dcp0_ep6_rank6.1794976389888000720.pt.trace.json.gz
+  window 3073.2 ms | GPU busy 2959.8 ms (96%) | kernels 309331 | cudaGraphLaunch 363 | steps 121
+  category       total ms    ms/step
+  gemm             1658.5      13.71
+  attention         809.2       6.69
+  comm              304.7       2.52
+  elementwise       165.5       1.37
+  moe               101.8       0.84
+  other              75.6       0.62
+  sampling           16.6       0.14
+  comm kernel: n=20570 | 170/step median 14.0 us p10 12.3 p90 16.1 | void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashin
+  comm kernel: n=484 | 4/step median 22.4 us p10 21.8 p90 45.6 | ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)
+
+### dp0_pp0_tp7_dcp0_ep7_rank7.1794976394189273394.pt.trace.json.gz
+  window 3074.0 ms | GPU busy 2966.2 ms (96%) | kernels 309331 | cudaGraphLaunch 363 | steps 121
+  category       total ms    ms/step
+  gemm             1657.5      13.70
+  attention         808.9       6.68
+  comm              313.8       2.59
+  elementwise       153.7       1.27
+  moe               101.8       0.84
+  other              70.8       0.59
+  sampling           16.5       0.14
+  comm kernel: n=20570 | 170/step median 14.4 us p10 12.3 p90 15.6 | void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashin
+  comm kernel: n=484 | 4/step median 22.0 us p10 21.6 p90 45.4 | ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)
+
+### ip-172-31-16-86_1.async_llm.1794976372063790503.pt.trace.json.gz
+  no GPU kernels in this file

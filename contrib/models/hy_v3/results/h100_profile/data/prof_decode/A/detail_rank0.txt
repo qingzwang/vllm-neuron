@@ -1,0 +1,71 @@
+trace dp0_pp0_tp0_dcp0_ep0_rank0.1794973958487695553.pt.trace.json.gz
+window 3093.5 ms, steps 178 (regex '^_gumbel_sample_kernel$'), window/steps 17.38 ms, GPU kernel sum 18.07 ms/step
+
+## per CUDA graph (graph id 0 = eager kernels outside graphs)
+ graph launches  /step kern/launch ms/launch  ms/step  categories ms/step (refined)
+ 24935      178   1.00        2150    17.900   17.900  moe 6.71, attention 5.90, unclear 1.81, comm 1.68, gemm 1.50, other 0.20, elementwise 0.09
+     0        0   0.00           -         -    0.166  gemm 0.05, elementwise 0.04, sampling 0.03, comm 0.02, other 0.02, attention 0.00
+
+## categories ms/step, all graphs: prof_summary category vs refined
+  summary  gemm           8.410
+  summary  attention      5.902
+  summary  comm           1.703
+  summary  moe            0.874
+  summary  elementwise    0.654
+  summary  other          0.492
+  summary  sampling       0.032
+  refined  moe                                                            6.712
+  refined  attention                                                      5.902
+  refined  comm                                                           1.703
+  refined  gemm                                                           1.550
+  refined  unclear(fp32 simt sgemm, 1/MoE layer: likely router gate GEMM)   0.914
+  refined  unclear(triton fused, Inductor-generated)                      0.899
+  refined  other                                                          0.223
+  refined  elementwise                                                    0.131
+  refined  sampling                                                       0.032
+
+## top 40 kernels: count/step, ms/step, avg us, graph id(s), summary cat, refined cat, name
+    80.00   5.363     67.0  g24935        attention   attention                    void cutlass::device_kernel<flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<flash::CollectiveMainloopFwdSm90<2, cute::tuple<cute::C<1>, cute::C<1>
+    79.00   2.950     37.3  g24935        gemm        moe                          _ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalINS1_17GroupProblemShapeIN4cute5tupleIJlllEEEEENS1_10collective13CollectiveMmaINS1_39Mainloop
+    79.00   2.291     29.0  g24935        gemm        moe                          _ZN7cutlass13device_kernelINS_4gemm6kernel13GemmUniversalINS1_17GroupProblemShapeIN4cute5tupleIJlllEEEEENS1_10collective13CollectiveMmaINS1_39Mainloop
+    81.00   0.870     10.7  g24935        comm        comm                         void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern)2, __nv
+   159.00   0.832      5.2  g24935        gemm        gemm                         void cutlass::device_kernel<vllm::cutlass_3x_gemm_sm90_fp8<cutlass::float_e4m3_t, cutlass::bfloat16_t, vllm::c3x::ScaledEpilogue, cute::tuple<cute::C<
+    79.00   0.803     10.2  g24935        comm        comm                         void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern)1, __nv
+    79.00   0.708      9.0  g24935        gemm        unclear(fp32 simt sgemm, 1/M void cutlass::Kernel2<cutlass_80_simt_sgemm_64x64_8x5_tn_align1>(cutlass_80_simt_sgemm_64x64_8x5_tn_align1::Params)
+   161.00   0.668      4.1  g24935        gemm        gemm                         void cutlass::device_kernel<vllm::cutlass_3x_gemm_sm90_fp8<cutlass::float_e4m3_t, cutlass::bfloat16_t, vllm::c3x::ScaledEpilogue, cute::tuple<cute::C<
+    79.00   0.613      7.8  g24935        moe         moe                          void vllm::moe::single_group_topk::detail::single_group_topk_warp_kernel<float, float, int, (vllm::moe::ScoringFunc)1, 256, 8>(float const*, float*, i
+    80.00   0.360      4.5  g24935        attention   attention                    void cutlass::device_kernel<flash::FlashAttnFwdCombine<cute::tuple<cute::C<8>, cute::C<128> >, 5, 256, 1, false, true, cutlass::bfloat16_t, float, cut
+   158.00   0.288      1.8  g24935        elementwise unclear(triton fused, Induct triton_poi_fused__to_copy_clamp_mul_reciprocal_0
+    79.00   0.261      3.3  g24935        moe         moe                          void tensorrt_llm::kernels::cutlass_kernels::fusedBuildExpertMapsSortFirstTokenKernel<32, 8, 8>(int const*, int*, int*, long*, long, int, int, int, in
+    79.00   0.206      2.6  g24935        gemm        unclear(fp32 simt sgemm, 1/M void cublasLt::splitKreduce_kernel<32, 16, int, float, float, float, float, false, float, float, float, true, false, false, false>(cublasLt::cublasSpl
+    79.00   0.205      2.6  g24935        gemm        moe                          void tensorrt_llm::kernels::cutlass_kernels::expandInputRowsKernel<__nv_fp8_e4m3, __nv_fp8_e4m3, (tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpeci
+    79.00   0.204      2.6  g24935        gemm        moe                          void tensorrt_llm::kernels::cutlass_kernels::computeStridesTmaWarpSpecializedKernel<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16, __nv_bfloat16>(long c
+    79.00   0.200      2.5  g24935        other       other                        void vllm::scaled_fp8_quant_kernel_strided_group_shape<c10::BFloat16, c10::Float8_e4m3fn, true, true>(c10::Float8_e4m3fn*, c10::BFloat16 const*, float
+    79.00   0.188      2.4  g24935        gemm        moe                          void tensorrt_llm::kernels::cutlass_kernels::doActivationKernel<__nv_fp8_e4m3, __nv_bfloat16, __nv_bfloat16, tensorrt_llm::kernels::cutlass_kernels::G
+    80.00   0.177      2.2  g24935        attention   attention                    void vllm::reshape_and_cache_flash_kernel<__nv_bfloat16, __nv_bfloat16, (vllm::Fp8KVCacheDataType)0>(__nv_bfloat16 const*, __nv_bfloat16 const*, __nv_
+    78.00   0.147      1.9  g24935        other       unclear(triton fused, Induct triton_red_fused_3
+    79.00   0.135      1.7  g24935        elementwise unclear(triton fused, Induct triton_poi_fused_mul_silu_slice_0
+    79.00   0.117      1.5  g24935        other       unclear(triton fused, Induct triton_poi_fused_add_2
+    80.00   0.105      1.3  g24935        gemm        unclear(triton fused, Induct triton_poi_fused__to_copy_clamp_cutlass_scaled_mm_mul_reciprocal_view_0
+    79.00   0.099      1.3  g24935        elementwise unclear(triton fused, Induct triton_poi_fused__to_copy_1
+    79.00   0.090      1.1  g24935        elementwise elementwise                  memset32
+     1.00   0.050     50.0  g0            gemm        gemm                         nvjet_sm90_tst_192x8_64x8_4x1_v_bz_TNT
+     1.00   0.023     22.6  g0            comm        comm                         ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)
+     1.00   0.021     20.5  g0            sampling    sampling                     _gumbel_sample_kernel
+     1.00   0.011     11.3  g0            other       other                        _temperature_kernel
+     1.00   0.007      7.3  g24935        comm        comm                         void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern)0, __nv
+     1.00   0.007      6.5  g0            elementwise elementwise                  _gather_block_tables_kernel
+     2.00   0.005      2.4  g0            elementwise elementwise                  Memcpy DtoH (Device -> Pinned)
+     2.32   0.005      2.0  g0            elementwise elementwise                  Memcpy HtoD (Pinned -> Device)
+     1.00   0.005      4.6  g0            sampling    sampling                     void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::ArgMaxOps<float>, unsigned int, long, 4, 4> >(at::native::ReduceOp<floa
+     1.00   0.004      4.3  g0            elementwise elementwise                  void at::native::elementwise_kernel<128, 4, at::native::gpu_kernel_impl_nocast<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()
+     1.00   0.004      4.0  g0            elementwise elementwise                  void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase&)::{lambda()#3}::operator()() const::{lambda()
+     1.00   0.004      4.0  g0            other       other                        _post_update_kernel
+     1.00   0.003      3.3  g0            sampling    sampling                     _combine_sampled_and_draft_tokens_kernel
+     1.00   0.003      3.2  g0            sampling    sampling                     _get_num_sampled_and_rejected_kernel
+     1.00   0.003      2.9  g0            other       other                        _compute_slot_mappings_kernel
+     1.00   0.002      2.2  g24935        other       unclear(triton fused, Induct triton_red_fused_2
+
+## comm kernels by graph: count/step, median us
+  g0:    1.0/step median   22.5 us  ncclDevKernel_AllGather_RING_LL(ncclDevKernelArgsStorage<4096ul>)
+  g24935:  161.0/step median    9.9 us  void flashinfer::trtllm_allreduce_fusion::allreduce_fusion_kernel_oneshot_lamport<(flashinfer::trtll

@@ -716,6 +716,11 @@ On Trn2 the 80 prompts (about 611k tokens) do not all fit in the prefill node KV
 `P_KV_CAP` 0.45), so part of the replay is prefilled again and TTFT reads higher than on H100. TPOT
 is not affected. The H100 run is in `results/pd_prefill/h100/dcust/`.
 
+**Why H100 is faster: a device profile.** [results/h100_profile/](results/h100_profile/README.md) profiles one p5.48xlarge
+(vLLM 0.29.0, TP=8, the same D-only replay) with nccl-tests, HBM bandwidth, a C = 1 / 4 / 8 / 16 decode sweep and
+per-kernel torch-profiler traces: per-step breakdown against the Trn2 profile, All-Reduce latency against nccom-test,
+and the effective bandwidth of the MoE and attention kernels.
+
 ### AgentX (InferenceX agentic traces), GPU reference
 
 [AgentX](https://inferencex.semianalysis.com/agentx) is InferenceX's multi-turn benchmark.

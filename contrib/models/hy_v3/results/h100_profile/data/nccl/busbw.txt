@@ -1,0 +1,6 @@
+all_reduce normal: 256MB out-of-place time 1122.35 us, algbw 239.17 GB/s, busbw 418.55 GB/s
+all_reduce cudagraph: 256MB out-of-place time 1119.39 us, algbw 239.80 GB/s, busbw 419.66 GB/s
+all_gather normal: 256MB out-of-place time 727.52 us, algbw 368.97 GB/s, busbw 322.85 GB/s
+all_gather cudagraph: 256MB out-of-place time 701.16 us, algbw 382.85 GB/s, busbw 334.99 GB/s
+reduce_scatter normal: 256MB out-of-place time 723.62 us, algbw 370.96 GB/s, busbw 324.59 GB/s
+reduce_scatter cudagraph: 256MB out-of-place time 719.97 us, algbw 372.84 GB/s, busbw 326.24 GB/s

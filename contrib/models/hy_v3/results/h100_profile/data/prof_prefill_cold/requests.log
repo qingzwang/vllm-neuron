@@ -1,0 +1,5 @@
+start_profile 200 2.80s
+row 4 salt cold-B-1794978650: TTFT 5098.3 ms, e2e 5098.4 ms, usage {'prompt_tokens': 85015, 'total_tokens': 85016, 'completion_tokens': 1, 'completion_tokens_details': {'reasoning_tokens': 0}}
+stop_profile 200 493.3s
+vllm:prefix_cache_queries_total{engine="0",model_name="hy3"} 32560745  vllm:prefix_cache_hits_total{engine="0",model_name="hy3"} 31841536  
+vllm:prefix_cache_queries_total{engine="0",model_name="hy3"} 32645760  vllm:prefix_cache_hits_total{engine="0",model_name="hy3"} 31841536  

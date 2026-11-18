@@ -1,0 +1,22 @@
+04:31:30 cfg B salt donly-B concs [8] out /home/ubuntu/h100_bench/decode_sweep/B_prof
+=== 04:31:30 D c8 (80 requests, output 1200)
+WARNING 11-18 04:31:50 [cpu.py:580] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+WARNING 11-18 04:31:51 [cpu.py:580] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+WARNING 11-18 04:31:51 [cpu.py:580] Failed to import from vllm._C_AVX2: ModuleNotFoundError("No module named 'vllm._C_AVX2'")
+Successful requests:                     80        
+Failed requests:                         0         
+Benchmark duration (s):                  691.87    
+Request throughput (req/s):              0.12      
+Output token throughput (tok/s):         138.75    
+Peak output token throughput (tok/s):    329.00    
+Total token throughput (tok/s):          9968.88   
+Mean TTFT (ms):                          368.76    
+Median TTFT (ms):                        294.93    
+P99 TTFT (ms):                           1288.68   
+Mean TPOT (ms):                          57.03     
+Median TPOT (ms):                        11.09     
+P99 TPOT (ms):                           471.53    
+Mean ITL (ms):                           127.70    
+Median ITL (ms):                         25.02     
+P99 ITL (ms):                            67.98     
+[metrics] prefix hit rate 100.0% (queries 6971230, hits 6969344); MTP tokens/step 2.244 (drafts 43840, accepted 54555, draft tokens 131520)

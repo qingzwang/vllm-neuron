@@ -1,0 +1,85 @@
+03:30:21 cfg A salt donly-A concs [1 4 8 16] out /home/ubuntu/h100_bench/decode_sweep/A
+=== warm pass: 80 requests, output 1
+Successful requests:                     80        
+Failed requests:                         0         
+Benchmark duration (s):                  43.74     
+Request throughput (req/s):              1.83      
+Output token throughput (tok/s):         1.83      
+Peak output token throughput (tok/s):    6.00      
+Total token throughput (tok/s):          155482.69 
+Mean TTFT (ms):                          4223.28   
+Median TTFT (ms):                        4202.12   
+P99 TTFT (ms):                           8193.47   
+[metrics] prefix hit rate 91.0% (queries 6801200, hits 6188560); MTP tokens/step 1.000 (drafts 0, accepted 0, draft tokens 0)
+=== 03:31:43 D c1 (10 requests, output 1200)
+Successful requests:                     10        
+Failed requests:                         0         
+Benchmark duration (s):                  135.83    
+Request throughput (req/s):              0.07      
+Output token throughput (tok/s):         88.34     
+Peak output token throughput (tok/s):    91.00     
+Total token throughput (tok/s):          6347.10   
+Mean TTFT (ms):                          272.20    
+Median TTFT (ms):                        268.45    
+P99 TTFT (ms):                           286.47    
+Mean TPOT (ms):                          11.10     
+Median TPOT (ms):                        11.10     
+P99 TPOT (ms):                           11.11     
+Mean ITL (ms):                           11.14     
+Median ITL (ms):                         11.12     
+P99 ITL (ms):                            11.56     
+[metrics] prefix hit rate 100.0% (queries 1020180, hits 1020096); MTP tokens/step 1.000 (drafts 0, accepted 0, draft tokens 0)
+=== 03:34:52 D c4 (40 requests, output 1200)
+Successful requests:                     40        
+Failed requests:                         0         
+Benchmark duration (s):                  158.75    
+Request throughput (req/s):              0.25      
+Output token throughput (tok/s):         302.36    
+Peak output token throughput (tok/s):    313.00    
+Total token throughput (tok/s):          21723.04  
+Mean TTFT (ms):                          304.44    
+Median TTFT (ms):                        282.95    
+P99 TTFT (ms):                           676.04    
+Mean TPOT (ms):                          12.97     
+Median TPOT (ms):                        12.98     
+P99 TPOT (ms):                           13.01     
+Mean ITL (ms):                           13.06     
+Median ITL (ms):                         12.99     
+P99 ITL (ms):                            13.83     
+[metrics] prefix hit rate 100.0% (queries 3570630, hits 3570336); MTP tokens/step 1.000 (drafts 0, accepted 0, draft tokens 0)
+=== 03:38:15 D c8 (80 requests, output 1200)
+Successful requests:                     80        
+Failed requests:                         0         
+Benchmark duration (s):                  209.44    
+Request throughput (req/s):              0.38      
+Output token throughput (tok/s):         458.36    
+Peak output token throughput (tok/s):    472.00    
+Total token throughput (tok/s):          32930.93  
+Mean TTFT (ms):                          340.34    
+Median TTFT (ms):                        284.97    
+P99 TTFT (ms):                           1262.45   
+Mean TPOT (ms):                          17.14     
+Median TPOT (ms):                        17.15     
+P99 TPOT (ms):                           17.23     
+Mean ITL (ms):                           17.34     
+Median ITL (ms):                         17.16     
+P99 ITL (ms):                            24.60     
+[metrics] prefix hit rate 100.0% (queries 6971230, hits 6970656); MTP tokens/step 1.000 (drafts 0, accepted 0, draft tokens 0)
+=== 03:42:37 D c16 (80 requests, output 1200)
+Successful requests:                     80        
+Failed requests:                         0         
+Benchmark duration (s):                  140.62    
+Request throughput (req/s):              0.57      
+Output token throughput (tok/s):         682.70    
+Peak output token throughput (tok/s):    735.00    
+Total token throughput (tok/s):          49049.20  
+Mean TTFT (ms):                          531.03    
+Median TTFT (ms):                        298.10    
+P99 TTFT (ms):                           2537.95   
+Mean TPOT (ms):                          22.85     
+Median TPOT (ms):                        22.89     
+P99 TPOT (ms):                           23.00     
+Mean ITL (ms):                           23.17     
+Median ITL (ms):                         22.86     
+P99 ITL (ms):                            68.52     
+[metrics] prefix hit rate 100.0% (queries 6971230, hits 6970656); MTP tokens/step 1.000 (drafts 0, accepted 0, draft tokens 0)

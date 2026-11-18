@@ -1,0 +1,27 @@
+03:51:45.490500530 8 requests running; waiting 30 s
+03:52:15.498987385 start_profile
+ HTTP 200
+03:52:18.841537065 stop_profile (running=8)
+ HTTP 200
+04:01:04.288536125 stop_profile returned
+04:04:00 bench done
+/home/ubuntu/h100_bench/prof_decode:
+total 804M
+-rw-r--r-- 1 root   root   100M Nov 18 03:53 dp0_pp0_tp0_dcp0_ep0_rank0.1794973958487695553.pt.trace.json.gz
+-rw-r--r-- 1 root   root   101M Nov 18 03:53 dp0_pp0_tp1_dcp0_ep1_rank1.1794973958812679637.pt.trace.json.gz
+-rw-r--r-- 1 root   root   100M Nov 18 03:53 dp0_pp0_tp2_dcp0_ep2_rank2.1794973958492001003.pt.trace.json.gz
+-rw-r--r-- 1 root   root   100M Nov 18 03:54 dp0_pp0_tp3_dcp0_ep3_rank3.1794973960077726343.pt.trace.json.gz
+-rw-r--r-- 1 root   root   101M Nov 18 03:54 dp0_pp0_tp4_dcp0_ep4_rank4.1794973958759898302.pt.trace.json.gz
+-rw-r--r-- 1 root   root    99M Nov 18 03:53 dp0_pp0_tp5_dcp0_ep5_rank5.1794973958718483352.pt.trace.json.gz
+-rw-r--r-- 1 root   root   102M Nov 18 03:54 dp0_pp0_tp6_dcp0_ep6_rank6.1794973959476701472.pt.trace.json.gz
+-rw-r--r-- 1 root   root   101M Nov 18 03:53 dp0_pp0_tp7_dcp0_ep7_rank7.1794973958603524864.pt.trace.json.gz
+-rw-r--r-- 1 root   root   5.1M Nov 18 03:52 ip-172-31-16-86_1.async_llm.1794973939891722114.pt.trace.json.gz
+-rw-rw-r-- 1 ubuntu ubuntu  210 Nov 18 04:04 prof_A_run.log
+-rw-r--r-- 1 root   root    21K Nov 18 04:00 profiler_out_0.txt
+-rw-r--r-- 1 root   root    21K Nov 18 04:00 profiler_out_1.txt
+-rw-r--r-- 1 root   root    21K Nov 18 04:00 profiler_out_2.txt
+-rw-r--r-- 1 root   root    21K Nov 18 04:00 profiler_out_3.txt
+-rw-r--r-- 1 root   root    21K Nov 18 04:00 profiler_out_4.txt
+-rw-r--r-- 1 root   root    21K Nov 18 04:00 profiler_out_5.txt
+-rw-r--r-- 1 root   root    21K Nov 18 04:01 profiler_out_6.txt
+-rw-r--r-- 1 root   root    21K Nov 18 04:00 profiler_out_7.txt

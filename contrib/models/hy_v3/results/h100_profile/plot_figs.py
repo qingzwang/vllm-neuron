@@ -216,3 +216,81 @@ note(fig, "attention:按每个序列独立读完整 KV 计算(8 序列 × 约 85
           "MoE:按均匀路由估算每层用到的不同专家数(8 token→55 个,32 token→143 个),每个专家 FP8 权重的 1/8 约 2.36 MB。")
 save(fig, "fig5_effective_bandwidth.png")
 print({k: round(v, 2) for k, v in bw.items()}, "hbm", hbm, "target", target, "draft", draft, "eager", eager)
+
+# ======================= Trn2 dense decode block profile, per layer (quoted)
+# Source: docs/DECODE_BLOCK_PROFILE.md on branch hy3-decode-block-profile (commit 2fa3433), trn2.48xlarge TP64/EP64,
+# FP8 KV, MTP k=3, fused decode MoE, dense attention, c8 (8 requests x 4 verify tokens), rank 0, layers 1-79 median.
+TRN2_LAYER = {"attention": 509, "ar1": 28, "moe": 171, "ar2": 29}      # us per layer, measured (medians)
+TRN2_LAYER_TOTAL = 739                                                 # us, the report's layer median
+TRN2_BW = 716                                                          # GB/s, one logical core's HBM stack
+TRN2_KV_MB = 8 * 86016 * 256 / 1e6                                     # 8 requests x 22 MB (1 replicated KV head)
+TRN2_MOE_MB = 56.6 + 2.4 + 1.6                                         # 3 routed experts + shared-expert shard + router
+TRN2_ATT_KERNEL_US, TRN2_MOE_US = 429, 171                             # attention_tkg kernel; MoE block
+H100_BW = hbm * 1000                                                   # GB/s, measured D2D
+H100_KV_MB = 8 * ctx * 256 / 1e6                                       # 8 requests, 1 KV head per GPU, FP8 K+V
+H100_MOE_MB = experts(32) * exp_bytes / 1e6                            # estimate, uniform routing
+h_att = tp["attention"] / 80 * 1e3; h_moe = tp["moe"] / 79 * 1e3
+h_comm = tp["comm"] / 80 * 1e3; h_oth = (tp["gemm"] + tp["unclear"] + tp["other"] + tp["elementwise"]) / 80 * 1e3
+
+# Fig 6: one layer, stacked in execution order
+fig, ax = plt.subplots(figsize=(10, 3.3))
+rows = [("Trn2 每个 rank\n(dense attention)", [("attention block", TRN2_LAYER["attention"], S1), ("AR", TRN2_LAYER["ar1"], S3),
+                                                 ("MoE", TRN2_LAYER["moe"], S2), ("AR ", TRN2_LAYER["ar2"], S3)]),
+        ("H100 每张 GPU\n(配置 B target)", [("attention", h_att, S1), ("层内其他", h_oth, S4), ("MoE", h_moe, S2), ("AR(2 次,融合 norm)", h_comm, S3)])]
+for i, (lab, segs) in enumerate(rows):
+    left = 0
+    for name, v, col in segs:
+        ax.barh(i, v, left=left, height=0.55, color=col, edgecolor=SURFACE, linewidth=2, zorder=3)
+        if v >= 45:
+            ax.text(left + v / 2, i, (f"{name.strip()}\n" if v >= 100 else "") + f"{v:.0f}", ha="center", va="center", fontsize=9,
+                    color="#ffffff" if col in (S1, S2) else INK)
+        left += v
+    ax.text(left + 8, i, f"{TRN2_LAYER_TOTAL if i == 0 else left:.0f} µs", va="center", fontsize=10, fontweight="bold", color=INK)
+ax.set_yticks([0, 1]); ax.set_yticklabels([r[0] for r in rows]); ax.invert_yaxis()
+ax.set_xlim(0, 820); ax.set_xlabel("µs / 层(C=8,每个请求每步 4 个 token)"); ax.grid(axis="y", visible=False)
+ax.set_title("一层 decode 的时间:Trn2 慢在 attention,MoE 只差 1.2 倍")
+from matplotlib.patches import Patch
+ax.legend(handles=[Patch(color=S1, label="attention"), Patch(color=S2, label="MoE"), Patch(color=S3, label="All-Reduce"),
+                   Patch(color=S4, label="H100 层内其他(QKV/O GEMM、router、norm…)")], loc="lower right", fontsize=8.8)
+note(fig, "Trn2:DECODE_BLOCK_PROFILE.md(分支 hy3-decode-block-profile @ 2fa3433),rank0,layers 1-79 中位数;attention block 含 norm、QKV、RoPE、写 KV、O-proj。\n"
+          "各部分为中位数,和报告的整层中位数 739 µs 不严格相加。H100:本次 trace 的 target graph 按类别除以层数;QKV/O 等 GEMM 计在「层内其他」里。", y=-0.09)
+save(fig, "fig6_layer_trn2_vs_h100.png")
+
+# Fig 7: bytes each device must read per layer
+fig, ax = plt.subplots(figsize=(9, 3.6))
+cats = ["KV(8 个请求)", "MoE 权重"]
+vals = {"Trn2 每个 rank": (TRN2_KV_MB, TRN2_MOE_MB), "H100 每张 GPU": (H100_KV_MB, H100_MOE_MB)}
+for j, (lab, col) in enumerate([("Trn2 每个 rank", S2), ("H100 每张 GPU", S1)]):
+    ys = [i + (j - 0.5) * 0.4 for i in range(2)]
+    ax.barh(ys, vals[lab], height=0.36, color=col, label=lab + (f"(HBM {TRN2_BW} GB/s)" if j == 0 else f"(HBM {H100_BW:.0f} GB/s)"), zorder=3)
+    for y, v in zip(ys, vals[lab]):
+        ax.text(v + 4, y, f"{v:.0f} MB", va="center", fontsize=9.5, color=INK)
+ax.set_yticks([0, 1]); ax.set_yticklabels(cats); ax.invert_yaxis(); ax.set_xlim(0, 400)
+ax.set_xlabel("每层每个设备要从 HBM 读的 MB(C=8)"); ax.grid(axis="y", visible=False)
+ax.set_title("每个设备读的字节:KV 一样多,MoE 差 5.6 倍")
+ax.legend(loc="upper right")
+note(fig, "8 个 KV head:H100 TP8 每卡正好 1 个;Trn2 TP64 每个 rank 也是 1 个,但每个 head 被 8 个 rank 重复读(KV 复制 8 份)。MoE 在 EP64 下按专家切分,每个 rank 只有 3 个专家。\n"
+          "H100 MoE 为均匀路由估算(每层约 143 个专家 × 2.36 MB);Trn2 为 DECODE_BLOCK_PROFILE.md 的 bound 口径(融合 kernel 读全部 3 个专家 + 共享专家分片 + router)。", y=-0.09)
+save(fig, "fig7_bytes_per_device.png")
+
+# Fig 8: HBM-bandwidth bound vs measured, per kernel
+rows = [("Trn2 attention_tkg", TRN2_KV_MB / TRN2_BW * 1e3, TRN2_ATT_KERNEL_US, S2),
+        ("H100 FA3 decode", H100_KV_MB / H100_BW * 1e3, fa_us["B"], S1),
+        ("Trn2 MoE block", TRN2_MOE_MB / TRN2_BW * 1e3, TRN2_MOE_US, S2),
+        ("H100 MoE grouped GEMM", H100_MOE_MB / H100_BW * 1e3, moe_us["B"], S1)]
+fig, ax = plt.subplots(figsize=(9.5, 3.9))
+for i, (lab, bound, meas, col) in enumerate(rows):
+    ax.barh(i, meas, height=0.5, color=col, zorder=3)
+    ax.plot([bound, bound], [i - 0.33, i + 0.33], color=INK, linewidth=2, zorder=4)
+    ax.text(meas + 6, i, f"{meas:.0f} µs,带宽利用 {bound / meas:.0%}", va="center", fontsize=9.5, color=INK)
+ax.plot([], [], color=INK, linewidth=2, label="HBM 带宽下限(字节 ÷ 带宽)")
+ax.set_yticks(range(len(rows))); ax.set_yticklabels([r[0] for r in rows]); ax.invert_yaxis()
+ax.set_xlim(0, 560); ax.set_xlabel("µs / 层(C=8)"); ax.grid(axis="y", visible=False)
+ax.set_title("离带宽下限有多远:H100 两个 kernel 在 81–91%,Trn2 在 49–57%")
+ax.legend(loc="lower right")
+note(fig, "Trn2 的损失(DECODE_BLOCK_PROFILE.md):paged KV 以 2 KB 行 gather,microbenchmark 上限 348 GB/s;descriptor 由 GpSimd 运行时生成;"
+          "attention 每层约 126 µs 固定开销;MoE 的 DMA 引擎只有一半时间在工作。\nH100 的 KV block 同样是 16 token × 128 × FP8 = 每块每 head 2 KB(data/cache_config_info_B.txt),FA3 仍达 81%。")
+save(fig, "fig8_bound_vs_measured.png")
+print("layer us", round(h_att, 1), round(h_oth, 1), round(h_moe, 1), round(h_comm, 1), "sum", round(h_att + h_oth + h_moe + h_comm, 1),
+      "| MB", round(TRN2_KV_MB, 1), round(H100_KV_MB, 1), round(TRN2_MOE_MB, 1), round(H100_MOE_MB, 1),
+      "| bound us", [round(r[1], 1) for r in rows])

@@ -9,14 +9,17 @@
   - 整步在一个 CUDA graph 里跑完,GPU 空闲只有约 3%;MTP draft 只占 1.75 ms。
   - TP8 每步的集合通信只有约 170 次,而且用的是和 RMSNorm 融合的 one-shot kernel,单次 10–14 µs。
   - MoE 的 grouped GEMM 估算能跑到 HBM 峰值的约 90%。
-- 差距最大的是 attention(Trn2 24.3 ms,H100 6.5 ms)。其中有一部分来自这个 benchmark 本身:8 个请求共享 78k 前缀,H100 的 L2 能复用这部分 KV(推断,见图 5),所以 H100 在这一项上可能被高估了。
+- 差距最大的是 attention(Trn2 24.3 ms,H100 6.5 ms)。和 Trn2 的逐层 DMA profile([DECODE_BLOCK_PROFILE.md](https://github.com/qingzwang/vllm-neuron/blob/hy3-decode-block-profile/contrib/models/hy_v3/docs/DECODE_BLOCK_PROFILE.md),第 5 节)对照后,原因可以拆成两层:
+  - **字节分布相反**:Hy3 只有 8 个 KV head,TP64 下每个 KV head 被 8 个 rank 重复读,所以一个 Trn2 rank 每层要读的 KV(176 MB)和一整张 H100 一样多,而它的带宽只有 H100 的 1/4.2;MoE 在 EP64 下按专家切分,一个 rank 只需要读 61 MB,是 H100 一张卡的 1/5.6。所以 Trn2 的大头是 attention,H100 的大头是 MoE。
+  - **效率差**:H100 的两个大头 kernel 跑到带宽下限的 81–91%;Trn2 只有 49–57%,损失在 2 KB 行的 paged gather、由 GpSimd 生成 descriptor,以及每层固定开销。
+- 共享前缀的 L2 复用(图 5,推断)只在 BF16 KV 的配置 A 上明显。FP8 KV 的配置 B 是 2.4 TB/s,没有超过 HBM 峰值,所以上面的结论不依赖这一点。
 
 ## 1. H100 的 decode step 随并发线性增长,没有被固定开销卡住
 
 ![decode vs 并发](figs/fig1_decode_vs_concurrency.png)
 
 - **配置 B 和参考值对得上**:配置 B(FP8 KV + MTP k=3,即 `scripts/pd/gpu/gpu_single_serve.sh`)在 C=8 时 TPOT 11.2 ms、step 25.0 ms,和客户 GPU 参考的 11.0 / 约 25 ms 一致。配置 A(BF16 KV,不开 MTP)的 C=8 是 17.1 ms,和 H100 1P1D 的 D-only 结果 17.09 ms 一致。
-- **step 随 batch 增长**:从 C=1 到 C=16,配置 A 的 step 从 11.1 ms 涨到 22.9 ms,配置 B 从 14.1 ms 涨到 33.7 ms,说明 H100 一直在随工作量增长。Trn2 上 C=1/4/8 的 step 几乎不变,说明它主要被固定开销卡住。
+- **step 随 batch 增长**:从 C=1 到 C=16,配置 A 的 step 从 11.1 ms 涨到 22.9 ms,配置 B 从 14.1 ms 涨到 33.7 ms,说明 H100 一直在随工作量增长。Trn2 那边,按 [DECODE_BLOCK_PROFILE.md](https://github.com/qingzwang/vllm-neuron/blob/hy3-decode-block-profile/contrib/models/hy_v3/docs/DECODE_BLOCK_PROFILE.md)(dense attention),c1 的 target 是 32.5 ms,其中 80 层每层的固定开销(attention 约 126 µs、block 胶水约 46 µs、两次 AR)占了一半以上:Trn2 的固定开销是每层都有一份,不是每步一份。
 - **Trn2 在 C=8 的 step(约 44 ms)比 H100 在 C=16 的 step(33.7 ms)还长**。
 
 ## 2. 每一部分 H100 都更快,attention 差得最多
@@ -54,7 +57,46 @@ Trn2 的数据引自本 README「Decode step at C = 12」的 rank0 设备 profil
 - **MoE**:按均匀路由估算,每层每卡要读的专家权重,8 个 token 时约 131 MB,32 个 token 时约 337 MB。实测每层 66 µs / 123 µs,折合 2.0 / 2.75 TB/s,已经是实测 HBM 峰值(3.03 TB/s)的 65% / 91%。
 - **attention(BF16 KV)**:如果每个序列都独立读自己完整的 KV,等效带宽是 **5.2 TB/s**,超过了 HBM 峰值。最可能的原因是 8 个请求共享同一段 78k 前缀(前缀缓存让它们指向同一批物理 block),这部分 KV 在 50 MB 的 L2 里被复用了(推断)。所以在这个 benchmark 下,H100 的 attention 时间比请求之间不共享前缀的真实负载要好看。下一步可以用 `bench_data/prompts/in85000_c8`(不共享前缀)复测来验证。
 
-## 5. prefill(配置 B,C=1,一个请求)
+## 5. 逐层对比 Trn2 的 DMA profile
+
+Trn2 的数据引自 [`docs/DECODE_BLOCK_PROFILE.md`](https://github.com/qingzwang/vllm-neuron/blob/hy3-decode-block-profile/contrib/models/hy_v3/docs/DECODE_BLOCK_PROFILE.md)(分支 `hy3-decode-block-profile` @ 2fa3433)。那是 trn2.48xlarge 上 TP64/EP64、FP8 KV、MTP k=3、融合 decode MoE、**dense attention**(不开 sparse)的 profile:c8(8 个请求 × 4 个 verify token)、rank0、layers 1–79 的中位数,target 每步 60.0 ms。H100 用的是本次配置 B 的 target graph:同样 8 个请求 × 4 个 token,每步 24.0 ms。
+
+![一层的时间](figs/fig6_layer_trn2_vs_h100.png)
+
+| 每层 | Trn2 每个 rank | H100 每张 GPU | 倍数 |
+|---|---|---|---|
+| attention kernel | 429 µs(`attention_tkg`) | 72 µs(FA3) | ×6.0 |
+| attention block(含 norm、QKV、RoPE、写 KV、O-proj) | 509 µs | 约 130 µs(attention 81 + 层内其他 49) | ×3.9 |
+| MoE | 171 µs(融合 kernel,含 norm、router、共享专家) | 141 µs(其中 grouped GEMM 123 µs) | ×1.2 |
+| 两次 All-Reduce | 28 + 29 µs,基本不和计算重叠 | 合计 31 µs(已融合 RMSNorm / FP8 量化) | ×1.9 |
+| **一层** | **739 µs** | **301 µs** | **×2.5** |
+
+### 为什么 Trn2 的大头是 attention,H100 的大头是 MoE:每个设备读的字节正好相反
+
+![每个设备读的字节](figs/fig7_bytes_per_device.png)
+
+- **KV 一样多**:Hy3 只有 8 个 KV head。H100 的 TP8 每卡正好分到 1 个,没有重复。Trn2 的 TP64 每个 rank 也只放 1 个 KV head,但每个 head 要被 8 个 rank 各读一遍(Trn2 报告和本 README 的 KVDP 一节都写明了 KV 复制 8 份)。结果是一个 Trn2 rank 要读的 KV(176 MB/层)和一整张 H100(175 MB/层)一样多,可它的 HBM 带宽是 716 GB/s,只有 H100 实测 3030 GB/s 的 1/4.2。
+- **MoE 差 5.6 倍**:EP64 按专家切分,没有重复,一个 rank 只有 3 个专家,每层读 61 MB(融合 kernel 读全部 3 个专家 + 共享专家分片 + router)。H100 每卡存每个专家的 1/8,32 个 token 每层约用到 143 个专家,要读约 337 MB(均匀路由估算)。
+- **结论**:Trn2 上 KV 是 MoE 的 2.9 倍,H100 上 MoE 是 KV 的 1.9 倍。两边按带宽算的下限也是这样:Trn2 attention 246 µs 对 MoE 85 µs,H100 attention 58 µs 对 MoE 111 µs。所以 Trn2 的大头是 attention,H100 的大头是 MoE。
+
+### 离带宽下限有多远
+
+![带宽下限 vs 实测](figs/fig8_bound_vs_measured.png)
+
+- **H100**:FA3 跑到下限的 81%,MoE grouped GEMM 跑到约 91%。
+- **Trn2**:`attention_tkg` 只有 57%,MoE block 只有 49%。报告找到的原因:
+  - **attention**:paged KV 以 2 KB 行做 gather,DMA microbenchmark 显示这种访问最高只有 348 GB/s,只有 HBM 的一半;gather 的 descriptor 由 GpSimd 在运行时生成,GpSimd 有三分之二的时间忙在这上面;kernel 是 gather K → QK^T → softmax → gather V → PV 的串行链,每个 128-token tile 只有 4 个 query 列(1 个 Q head × 4 个 verify token);另外每层还有约 126 µs 的固定开销。
+  - **MoE**:权重行是连续的,本来可以跑到约 600 GB/s,但 DMA 引擎只有 51% 的时间在工作。
+- **同样是 2 KB 的粒度,H100 不受影响**:H100 上 vLLM 用的是 16-token 的 block(`data/cache_config_info_B.txt`),FP8 下每块每个 head 的 K 也正好是 2 KB,但 FA3 仍有 81%。GPU 是由很多 SM 直接发 load,同时在途的请求很多,没有生成 descriptor 这一步(Trn2 报告最后一节也是这么总结的)。
+- **attention 的差距可以这样拆**:每个设备的带宽差 4.2 倍(这是 KV 复制带来的),乘以效率差约 1.4 倍(81% 对 57%),约等于 6 倍。
+
+### 对 Trn2 的含义
+
+- **报告列出的优化**:喂满 attention 的 DMA、加大 KV 块、喂满 MoE 的 DMA、在 AR 期间预取、合并胶水操作。按报告的估算,这些加起来能省 21–26 ms/步,dense 的 target 可以从 60 ms 降到约 35–39 ms。
+- **只做这些还不够**:即使 attention 跑满 716 GB/s,下限也有 246 µs × 80 ≈ 20 ms,比 H100 整步的 attention(6.5 ms)多 3 倍。要接近 H100,还需要**去掉 KV 的 8 倍复制**:用 KVDP 或 DCP 让共享同一个 KV head 的 8 个 rank 分工读,c8 时每个 rank 每层只读 22 MB,下限约 31 µs。或者像线上配置那样用 sparse decode 减少要读的字节。
+- **MoE 这边**:Trn2 每个 rank 的 MoE 下限(85 µs)本来比 H100 每张卡的(111 µs)还低,所以把 DMA 喂满后,有机会比 H100 更快。
+
+## 6. prefill(配置 B,C=1,一个请求)
 
 | 请求 | TTFT(不开 profiler) | GPU 时间(rank0) | 主要构成 |
 |---|---|---|---|
@@ -83,6 +125,8 @@ prefill 的 AR 走的是 `multimem_all_reduce_kernel`(SYMM_MEM),每次约 225–
 - `data/prof_decode/{A,B}/`:8 个 rank 的汇总(`summary.txt`)和 rank0 的细分(`detail_rank0.txt`);`data/prof_prefill*/`:prefill 的汇总。
 - `data/nccl/`、`data/hbm/`、`data/env.txt`、`data/server_*.log`(vLLM 自动选择的后端都在 server log 里)。
 - `scripts/`:采集用的脚本。
+- `data/cache_config_info_B.txt`:配置 B server 的 `vllm:cache_config_info`(block_size 16,FP8 KV)。
+- 第 2 节和第 5 节的 Trn2 数据分别引自本 README「Decode step at C = 12」和 [`docs/DECODE_BLOCK_PROFILE.md`](https://github.com/qingzwang/vllm-neuron/blob/hy3-decode-block-profile/contrib/models/hy_v3/docs/DECODE_BLOCK_PROFILE.md)(分支 `hy3-decode-block-profile` @ 2fa3433);`plot_figs.py` 里逐个注明了出处。
 - 原始 torch trace(1.7 GB)没有放进仓库。
 
 ## 附录:图中数据
@@ -117,3 +161,15 @@ prefill 的 AR 走的是 `multimem_all_reduce_kernel`(SYMM_MEM),每次约 225–
 | attention(按每个序列独立读 KV 计算) | 5.2 | 2.4 |
 | MoE grouped GEMM(均匀路由估算) | 2.0 | 2.75 |
 | 实测 HBM 峰值 | 3.03 | 3.03 |
+
+| 每层(C=8) | Trn2 每个 rank(引用) | H100 每张 GPU |
+|---|---|---|
+| attention block / 其中 attention kernel (µs) | 509 / 429 | 130 / 72 |
+| MoE (µs) | 171 | 141(grouped GEMM 123) |
+| 两次 AR (µs) | 57 | 31 |
+| 一层 (µs) | 739 | 301 |
+| KV 读取 (MB) | 176 | 175 |
+| MoE 权重读取 (MB) | 61 | 337(估算) |
+| HBM 带宽 (GB/s) | 716 | 3030 |
+| attention 下限 / 利用率 | 246 µs / 57% | 58 µs / 81% |
+| MoE 下限 / 利用率 | 85 µs / 49% | 111 µs / 91% |

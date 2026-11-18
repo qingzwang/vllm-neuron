@@ -12,6 +12,7 @@
 - 差距最大的是 attention(Trn2 24.3 ms,H100 6.5 ms)。和 Trn2 的逐层 DMA profile([DECODE_BLOCK_PROFILE.md](https://github.com/qingzwang/vllm-neuron/blob/hy3-decode-block-profile/contrib/models/hy_v3/docs/DECODE_BLOCK_PROFILE.md),第 5 节)对照后,原因可以拆成两层:
   - **字节分布相反**:Hy3 只有 8 个 KV head,TP64 下每个 KV head 被 8 个 rank 重复读,所以一个 Trn2 rank 每层要读的 KV(176 MB)和一整张 H100 一样多,而它的带宽只有 H100 的 1/4.2;MoE 在 EP64 下按专家切分,一个 rank 只需要读 61 MB,是 H100 一张卡的 1/5.6。所以 Trn2 的大头是 attention,H100 的大头是 MoE。
   - **效率差**:H100 的两个大头 kernel 跑到带宽下限的 81–91%;Trn2 只有 49–57%,损失在 2 KB 行的 paged gather、由 GpSimd 生成 descriptor,以及每层固定开销。
+- MFU / HFU / MBU(第 6 节):decode 的算术强度只有 5–33 FLOP/B,远低于拐点(H100 591、Trn2 454),所以 C=8 时 MFU 只有 1.2%(H100)和 0.35–0.52%(Trn2),这是正常的,要看的是 MBU。H100 配置 B 的 MBU 是 38–52%。Trn2 dense 的硬件实际搬运带宽是 44%,但其中只有 27% 是模型需要的字节,按模型口径的 MBU 只有 12%。
 - 共享前缀的 L2 复用(图 5,推断)只在 BF16 KV 的配置 A 上明显。FP8 KV 的配置 B 是 2.4 TB/s,没有超过 HBM 峰值,所以上面的结论不依赖这一点。
 
 ## 1. H100 的 decode step 随并发线性增长,没有被固定开销卡住
@@ -96,7 +97,45 @@ Trn2 的数据引自 [`docs/DECODE_BLOCK_PROFILE.md`](https://github.com/qingzwa
 - **只做这些还不够**:即使 attention 跑满 716 GB/s,下限也有 246 µs × 80 ≈ 20 ms,比 H100 整步的 attention(6.5 ms)多 3 倍。要接近 H100,还需要**去掉 KV 的 8 倍复制**:用 KVDP 或 DCP 让共享同一个 KV head 的 8 个 rank 分工读,c8 时每个 rank 每层只读 22 MB,下限约 31 µs。或者像线上配置那样用 sparse decode 减少要读的字节。
 - **MoE 这边**:Trn2 每个 rank 的 MoE 下限(85 µs)本来比 H100 每张卡的(111 µs)还低,所以把 DMA 喂满后,有机会比 H100 更快。
 
-## 6. prefill(配置 B,C=1,一个请求)
+## 6. MFU / HFU / MBU
+
+**口径**(每个 decode step,整机;计算脚本 `utilization.py`,结果在 `data/utilization.json`):
+- **MFU**:有效模型 FLOPs ÷(步长 × 峰值 FLOPs)。有效 FLOPs = 产出的 token 数(开 MTP 时只算被接受的)× 每个 token 的 dense 模型 FLOPs。每个 token 的 FLOPs 是 linear 40.4 G(2 × 激活参数 20.2B)加上 attention 224.4 G(4 × 64 head × 128 × 85.6k 上下文 × 80 层)。
+- **HFU**:实际执行的 FLOPs ÷(步长 × 峰值 FLOPs)。执行 FLOPs = target 实际 verify 的全部 token(C × 4,包括被拒的)+ MTP draft 的 3 次前向 + 跨 rank 的重复计算。Trn2 的重复计算按文档写明的部分算(router ×64、共享专家 ×8),所以是下限。
+- **MBU**:模型需要读的 HBM 字节 ÷(步长 × 峰值带宽)。需要的字节包括:各层 attention 权重、dense 层、lm_head、router、被某个 token 选中的专家加上共享专家(按均匀路由估算),以及每个请求自己完整上下文的 KV。不计复制和缓存复用。
+  - 因为这个 benchmark 里请求共享 78k 前缀,另外给一个"共享前缀只读一次"的下界。实际 HBM 流量在这两者之间。
+- **硬件实际搬运**(只有 Trn2):Trn2 报告里实测的 DMA 字节,这是带宽方向上和 HFU 对应的量。
+- **峰值**(规格值):H100 FP8 dense 1979 TFLOPS、3.35 TB/s;Trn2 每颗芯片 FP8 dense 1299 TFLOPS,每个逻辑核 716 GB/s。
+
+![H100 利用率随并发](figs/fig9_h100_utilization_vs_c.png)
+
+![C=8 利用率对比](figs/fig10_utilization_trn2_vs_h100.png)
+
+| 配置 | C | step (ms) | 有效 token/步 | MFU | HFU | MBU(共享前缀只算一次 ~ 每请求独立) | 需读字节/步 (GB) | 算术强度 FLOP/B(拐点) | 硬件实际搬运 |
+|---|---|---|---|---|---|---|---|---|---|
+| H100 A | 1 | 11.1 | 1.0 | 0.15% | 0.15% | 16% ~ 16% | 49 ~ 49 | 5(591) | — |
+| H100 A | 4 | 13.0 | 4.0 | 0.52% | 0.52% | 26% ~ 48% | 89 ~ 166 | 6(591) | — |
+| H100 A | 8 | 17.2 | 8.0 | 0.78% | 0.78% | 30% ~ 69% | 136 ~ 316 | 7(591) | — |
+| H100 A | 16 | 22.9 | 16.0 | 1.17% | 1.17% | 35% ~ 98% | 214 ~ 599 | 7(591) | — |
+| H100 B | 1 | 14.1 | 2.3 | 0.27% | 0.49% | 19% ~ 19% | 72 ~ 72 | 15(591) | — |
+| H100 B | 4 | 18.8 | 9.1 | 0.81% | 1.46% | 35% ~ 43% | 175 ~ 215 | 20(591) | — |
+| H100 B | 8 | 25.0 | 17.9 | 1.20% | 2.19% | 38% ~ 52% | 253 ~ 346 | 25(591) | — |
+| H100 B | 16 | 33.7 | 36.2 | 1.80% | 3.25% | 35% ~ 58% | 320 ~ 519 | 33(591) | — |
+| Trn2 dense profile | 8 | 64.0 | 17.6 | 0.35% | 0.72% | 9% ~ 12% | 253 ~ 346 | 28(454) | 1280 GB,44% |
+| Trn2 1P1D sparse | 8 | 43.8 | 17.8 | 0.52% | 1.06% | — | — | —(454) | — |
+
+**怎么读**
+- **MFU 只有 1–2%,这在 decode 里是正常的**。算术强度只有 5–33 FLOP/B,而 H100 的拐点是 591 FLOP/B,Trn2 是 454 FLOP/B,所以 decode 一定受带宽限制。即使 MBU 达到 100%,HFU 的上限也只有"强度 ÷ 拐点"。配置 B 在 C=8 时这个上限约 4%,实际 HFU 是 2.2%,和 52% 的 MBU 对得上。要看的指标是 MBU,不是 MFU。
+- **85k 上下文时,attention 占了每个 token 85% 的 FLOPs**(224 G 对 40 G)。所以 MFU 主要由 attention 决定,而 MoE 的成本主要体现在字节上(MBU),不体现在 FLOPs 上。
+- **MTP 让 HFU 约等于 1.8 倍 MFU**:每步 verify 4 个 token,平均只接受 2.24 个,另外还要跑 3 次 draft。这部分是 MTP 本来就要付的计算,但它换来了更低的 TPOT。
+- **H100 的 MBU 随并发上升**:配置 B 从 C=1 的 19% 升到 C=16 的 58%(上界)。C=1 时只用了约五分之一的带宽,剩下的时间都是 kernel 启动和串行依赖的延迟。配置 A 在 C=16 时上界是 98%,超过了实测的 copy 带宽(规格的 90%),这就是共享前缀的 KV 在 L2 里被复用的证据,所以配置 A 的真实 MBU 介于两条线之间,而且偏向下界。
+- **Trn2 的硬件其实不闲,但大部分字节是重复的**。dense profile 里硬件实际搬运的带宽利用率是 44%,和 H100 的 52% 相差不大。但每步搬运的 1280 GB 是模型实际需要的(346 GB)的 3.7 倍:KV 复制了 8 份,融合 MoE 把每个 rank 上的 3 个专家都读了一遍。所以按模型需要的字节算,MBU 只有 12%。这和第 5 节的结论一致。
+- **注意事项**:
+  - 均匀路由会高估要读的专家数,所以 MBU 偏高估计。
+  - Trn2 dense profile 没有报告每步接受的 token 数,这里按 2.2 估算(D-only chat 重放下是 2.19–2.23)。
+  - 线上 Trn2 的 sparse 配置只读约 1/8 的 KV,不适用 dense 口径的 MBU,所以只给了 MFU 和 HFU。
+
+## 7. prefill(配置 B,C=1,一个请求)
 
 | 请求 | TTFT(不开 profiler) | GPU 时间(rank0) | 主要构成 |
 |---|---|---|---|
@@ -125,6 +164,7 @@ prefill 的 AR 走的是 `multimem_all_reduce_kernel`(SYMM_MEM),每次约 225–
 - `data/prof_decode/{A,B}/`:8 个 rank 的汇总(`summary.txt`)和 rank0 的细分(`detail_rank0.txt`);`data/prof_prefill*/`:prefill 的汇总。
 - `data/nccl/`、`data/hbm/`、`data/env.txt`、`data/server_*.log`(vLLM 自动选择的后端都在 server log 里)。
 - `scripts/`:采集用的脚本。
+- `utilization.py`:MFU / HFU / MBU 的计算,口径和假设写在文件开头;输入是 `data/hy3_config_subset.json`(模型 config 的相关字段)和 decode 扫描的 JSON;输出是 `data/utilization.json` 和 `data/utilization_table.md`。
 - `data/cache_config_info_B.txt`:配置 B server 的 `vllm:cache_config_info`(block_size 16,FP8 KV)。
 - 第 2 节和第 5 节的 Trn2 数据分别引自本 README「Decode step at C = 12」和 [`docs/DECODE_BLOCK_PROFILE.md`](https://github.com/qingzwang/vllm-neuron/blob/hy3-decode-block-profile/contrib/models/hy_v3/docs/DECODE_BLOCK_PROFILE.md)(分支 `hy3-decode-block-profile` @ 2fa3433);`plot_figs.py` 里逐个注明了出处。
 - 原始 torch trace(1.7 GB)没有放进仓库。

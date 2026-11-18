@@ -294,3 +294,60 @@ save(fig, "fig8_bound_vs_measured.png")
 print("layer us", round(h_att, 1), round(h_oth, 1), round(h_moe, 1), round(h_comm, 1), "sum", round(h_att + h_oth + h_moe + h_comm, 1),
       "| MB", round(TRN2_KV_MB, 1), round(H100_KV_MB, 1), round(TRN2_MOE_MB, 1), round(H100_MOE_MB, 1),
       "| bound us", [round(r[1], 1) for r in rows])
+
+# ======================= Fig 9 / 10: MFU, HFU, MBU (utilization.py -> data/utilization.json)
+U = json.load(open(f"{DATA}/utilization.json"))["rows"]
+def urow(name, C): return next(r for r in U if r["name"] == name and r["C"] == C)
+fig, axs = plt.subplots(1, 2, figsize=(11, 4.1))
+ax = axs[0]
+for cfg, col, lab in [("H100 A", S1, "A:BF16 KV,无 MTP"), ("H100 B", S2, "B:FP8 KV + MTP k=3")]:
+    lo = [urow(cfg, c)["MBU_dedup"] * 100 for c in Cs]; hi = [urow(cfg, c)["MBU"] * 100 for c in Cs]
+    ax.fill_between(Cs, lo, hi, color=col, alpha=0.18, linewidth=0, zorder=2)
+    ax.plot(Cs, hi, color=col, marker="o", markersize=6, markeredgecolor=SURFACE, markeredgewidth=1.5, label=lab + "(每请求独立读 KV)", zorder=3)
+    ax.plot(Cs, lo, color=col, linestyle=(0, (4, 2)), linewidth=1.5, label=lab + "(共享前缀只算一次)", zorder=3)
+    ax.annotate(f"{hi[2]:.0f}%", (8, hi[2]), textcoords="offset points", xytext=(-6, 7), ha="right", fontsize=8.5, color=INK2)
+ax.axhline(hbm / 3.35 * 100, color=INK, linewidth=1.2, linestyle=(0, (1, 2)))
+ax.text(1, hbm / 3.35 * 100 + 1.5, f"实测 D2D copy 带宽 = 规格的 {hbm / 3.35:.0%}", fontsize=8.5, color=INK2)
+ax.set_title("MBU(对 3.35 TB/s 规格)"); ax.set_ylabel("%"); ax.set_ylim(0, 105)
+ax2 = axs[1]
+ax2.plot(Cs, [urow("H100 A", c)["MFU"] * 100 for c in Cs], color=S1, marker="o", markersize=6, markeredgecolor=SURFACE, label="A:MFU(= HFU)")
+ax2.plot(Cs, [urow("H100 B", c)["MFU"] * 100 for c in Cs], color=S2, marker="o", markersize=6, markeredgecolor=SURFACE, label="B:MFU(只算被接受的 token)")
+ax2.plot(Cs, [urow("H100 B", c)["HFU"] * 100 for c in Cs], color=S2, linestyle=(0, (4, 2)), marker="s", markersize=5, label="B:HFU(含被拒的 verify token 和 draft)")
+for name, key in (("H100 B", "HFU"), ("H100 B", "MFU"), ("H100 A", "MFU")):
+    v = urow(name, 16)[key] * 100
+    ax2.annotate(f"{v:.1f}%", (16, v), textcoords="offset points", xytext=(6, -3), fontsize=8.5, color=INK2)
+ax2.set_title("MFU / HFU(对 FP8 dense 1979 TFLOPS 规格)"); ax2.set_ylim(0, 4)
+for a in axs:
+    a.set_xscale("log", base=2); a.xaxis.set_major_locator(FixedLocator(Cs)); a.xaxis.set_minor_locator(NullLocator())
+    a.set_xticklabels([str(c) for c in Cs]); a.set_xlabel("并发 C"); a.grid(axis="x", visible=False)
+axs[0].legend(loc="lower right", fontsize=8.0); axs[1].legend(loc="upper left", fontsize=8.3)
+note(fig, "由实测 step(ITL 中位数)和 MTP 接受数,按 Hy3 config 的 FLOPs / 字节数计算(utilization.py)。每个 token 的 FLOPs:linear 40.4 G + attention 224.4 G(85.6k 上下文)。\n"
+          "MBU 的两条线是区间:实际 HBM 流量在「每请求独立读 KV」和「共享前缀只读一次」之间;A 的上界接近甚至超过实测 copy 带宽,说明共享前缀的 KV 在 L2 里被复用。", y=-0.05)
+save(fig, "fig9_h100_utilization_vs_c.png")
+
+# Fig 10: C=8, H100 vs Trn2
+plats = [("H100 B", "H100\n配置 B"), ("Trn2 dense profile", "Trn2\ndense profile"), ("Trn2 1P1D sparse", "Trn2 1P1D\nsparse(线上)")]
+fig, axs = plt.subplots(1, 2, figsize=(11, 4))
+w = 0.36
+for j, (key, col, lab) in enumerate([("MFU", S1, "MFU"), ("HFU", S2, "HFU(Trn2 为下限)")]):
+    xs = [i + (j - 0.5) * (w + 0.03) for i in range(3)]; vs = [urow(n, 8)[key] * 100 for n, _ in plats]
+    axs[0].bar(xs, vs, width=w, color=col, label=lab, zorder=3)
+    for x, v in zip(xs, vs): axs[0].text(x, v + 0.04, f"{v:.2f}%", ha="center", fontsize=8.8, color=INK)
+axs[0].set_title("算力利用率(C=8)"); axs[0].set_ylim(0, 2.6); axs[0].set_ylabel("%")
+bw_items = [("MBU", S1, "MBU(模型需要的字节)"), ("hw", S2, "硬件实际搬运的字节")]
+for j, (key, col, lab) in enumerate(bw_items):
+    xs, vs = [], []
+    for i, (n, _) in enumerate(plats):
+        r = urow(n, 8)
+        v = r["MBU"] if key == "MBU" else r.get("hw_util")
+        if "sparse" in n or v is None: continue
+        xs.append(i + (j - 0.5) * (w + 0.03)); vs.append(v * 100)
+    axs[1].bar(xs, vs, width=w, color=col, label=lab, zorder=3)
+    for x, v in zip(xs, vs): axs[1].text(x, v + 1, f"{v:.0f}%", ha="center", fontsize=8.8, color=INK)
+axs[1].text(2, 4, "sparse 只读约 1/8 的 KV,\n不适用 dense 口径", ha="center", fontsize=8.5, color=MUTED)
+axs[1].set_title("带宽利用率(C=8,每请求独立读 KV 口径)"); axs[1].set_ylim(0, 70); axs[1].set_xlim(-0.6, 2.6)
+for a in axs:
+    a.set_xticks(range(3)); a.set_xticklabels([p[1] for p in plats]); a.grid(axis="x", visible=False); a.legend(loc="upper right", fontsize=8.5)
+note(fig, "峰值:H100 FP8 1979 TFLOPS、3.35 TB/s;Trn2 每颗芯片 FP8 1299 TFLOPS,每个逻辑核 716 GB/s(DECODE_BLOCK_PROFILE.md 的口径)。Trn2 dense profile 的每步 token 数未报告,按 2.2 估算;"
+          "\nTrn2 HFU 加上了文档写明的重复计算(router ×64、共享专家 ×8);硬件实际搬运 = DECODE_BLOCK_PROFILE.md 的 DMA 字节(含 KV 8 倍复制、3 个专家全读)。H100 没有复制,实际搬运 ≤ 模型需要。", y=-0.05)
+save(fig, "fig10_utilization_trn2_vs_h100.png")

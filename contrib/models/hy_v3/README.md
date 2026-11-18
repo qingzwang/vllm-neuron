@@ -1263,7 +1263,8 @@ core with one bucket). Decode only (pass 2, ~100% hit), same 80 requests
   history): MTP together with DCP would combine both, see the MTP limitations.
 - Where the time goes in this configuration (device profile of a cold 85k
   prefill and of 1- and 6-request decode, MoE load imbalance per layer, and how
-  the model is split over the 64 ranks): [docs/PROFILE_85K.md](docs/PROFILE_85K.md).
+  the model is split over the 64 ranks): [docs/PROFILE_85K.md](docs/PROFILE_85K.md). Where a dense decode layer's
+  time goes, with DMA traces: [docs/DECODE_BLOCK_PROFILE.md](docs/DECODE_BLOCK_PROFILE.md).
 - The 8-request verify steps have 32 tokens, above the hits limit (16), so they
   run the all-expert `moe_tkg`. Raising `HY3_DECODE_HITS_MAX_T` to 32 is
   slower (c=8 pass 2: ITL 76.7 -> 85.7 ms, TPOT 51.0 -> 56.0 ms, 138 -> 127
@@ -1603,6 +1604,7 @@ VLLM_NEURON_CPU_MODE=1 pytest contrib/models/hy_v3/test/unit/ -v
 | `src/kvdp_attention.py` | `HY3_DECODE_KVDP`: `attention_block_tkg` with KV data parallelism, and `kvdp_kv_write` (all B rows of a step into the caches, NKI) ("KV data parallelism on decode") |
 | `scripts/tensore_mm_bench.py` | one-core TensorE cost of the decode MoE matmul shapes, BF16 x FP8 vs FP8 x FP8 (W8A8, with and without `double_row`): W8A8 is not faster there (`results/w8a8_decode/`, docs/PROFILE_85K.md) |
 | `scripts/profile_attn_breakdown.py` | attention-module time of a profiled decode step by model.py function (sparse-decode profile, [docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
+| `scripts/profile_block.py`, `profile_kernel.py`, `profile_dma_packets.py`, `profile_dma_engines.py` | per-layer decode breakdown of a DMA-traced profile (attention / all-reduce / MoE / all-reduce, DMA bytes, engine busy, overlap with the collectives), per-kernel opcodes, DMA packet sizes and DMA-engine utilization ([docs/DECODE_BLOCK_PROFILE.md](docs/DECODE_BLOCK_PROFILE.md)) |
 | `scripts/sparse_select_bench.py` | single-core timing of the sparse-decode block selection variants ([docs/SPARSE_DECODE.md](docs/SPARSE_DECODE.md)) |
 | `scripts/serve_agentx_dcp.sh` | one-node AgentX config with DCP=8 + MTP k=3 + sparse decode, max_model_len 262144 ("AgentX on Trn2, one node") |
 | `scripts/serve_85k.sh` | 85k-context config without DCP (max_model_len 86016, 4 requests at once), for MTP on `bench_data/prefix` |

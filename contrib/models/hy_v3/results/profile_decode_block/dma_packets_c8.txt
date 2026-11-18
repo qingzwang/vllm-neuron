@@ -1,0 +1,70 @@
+
+attention_tkg packets: 164.87 MB/layer in 140976/layer
+                        n/layer  MB/layer
+transfer_bytes                           
+[0, 16)                  5175.0      0.02
+[16, 64)                58254.0      1.86
+[64, 256)                 176.0      0.02
+[256, 512)                 25.0      0.01
+[512, 1024)               145.0      0.07
+[1024, 2048)              112.0      0.14
+[2048, 4096)            76744.0    159.73
+[4096, 16384)             256.0      1.54
+[16384, 1099511627776)     90.0      1.47
+                     size          sum      MB
+queue_type                                    
+collectives          6641      1788452    0.02
+data                24889     37991224    0.47
+hardware_dynamic  4751000    161955248    2.02
+input                4291      2185884    0.03
+instruction          9602      9135128    0.11
+software_dynamic  6474812  12864731164  160.81
+
+attention_tkg aggregated transfers: 0.69 MB/layer in 17/layer
+                        n/layer  MB/layer
+transfer_bytes                           
+[64, 256)                   0.0      0.00
+[512, 1024)                 1.0      0.00
+[1024, 2048)                1.0      0.00
+[4096, 16384)               3.0      0.01
+[16384, 1099511627776)     12.0      0.67
+                            size       sum    median  MB_layer  n_layer
+source            dest                                                 
+[[VIRTUAL]]       [SB]       928  22646784   16384.0      0.28    11.60
+[[REMOTE]]        [SB]       135  21839872  131072.0      0.27     1.69
+[[REMOTE REMOTE]] [REMOTE]    65   8519680  131072.0      0.11     0.81
+[[INPUT]]         [SB]       233   2071936    1536.0      0.03     2.91
+
+moe_tkg_fused packets: 64.69 MB/layer in 44310/layer
+                        n/layer  MB/layer
+transfer_bytes                           
+[0, 16)                  2987.0      0.01
+[16, 64)                15541.0      0.50
+[64, 256)                 208.0      0.01
+[256, 512)                  9.0      0.00
+[512, 1024)                17.0      0.01
+[1024, 2048)               25.0      0.03
+[2048, 4096)            25033.0     61.01
+[4096, 16384)             477.0      2.91
+[16384, 1099511627776)     13.0      0.21
+                     size         sum     MB
+queue_type                                  
+data                27349   131006184   1.64
+hardware_dynamic  1282755    79230428   0.99
+input                1825      449892   0.01
+instruction           459     3741696   0.05
+software_dynamic  2231591  4947580368  61.84
+
+moe_tkg_fused aggregated transfers: 1.56 MB/layer in 12/layer
+                        n/layer  MB/layer
+transfer_bytes                           
+[512, 1024)                 0.0      0.00
+[1024, 2048)                0.0      0.00
+[4096, 16384)               1.0      0.01
+[16384, 1099511627776)     10.0      1.55
+                            size        sum    median  MB_layer  n_layer
+source            dest                                                  
+[[REMOTE]]        [SB]       692  115867648  196608.0      1.45     8.65
+[[REMOTE REMOTE]] [REMOTE]    61    7995392  131072.0      0.10     0.76
+[[VIRTUAL]]       [SB]        55     606208   16384.0      0.01     0.69
+[[INPUT]]         [SB]       123     479232    1536.0      0.01     1.54

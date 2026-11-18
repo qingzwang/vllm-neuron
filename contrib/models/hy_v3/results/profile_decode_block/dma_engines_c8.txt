@@ -1,0 +1,17 @@
+
+attention_tkg: 33 DMA engines; kernel time 429 us/layer; total 384 GB/s
+      pcore  engine  busy_frac  GBps_while_busy  GBps_avg
+mean   0.48   81.03       0.66            17.49     11.65
+min    0.00   64.00       0.34             9.45      3.26
+50%    0.00   80.00       0.66            17.69     11.64
+max    1.00  130.00       0.70            18.14     12.37
+software-DGE packet: median bytes 2048 median duration ns 101 -> per-packet rate 20.3 GB/s
+
+moe_tkg_fused: 33 DMA engines; kernel time 191 us/layer; total 339 GB/s
+      pcore  engine  busy_frac  GBps_while_busy  GBps_avg
+mean   0.48   81.03       0.51            19.92     10.28
+min    0.00   64.00       0.09             9.59      0.88
+50%    0.00   80.00       0.52            20.23     10.52
+max    1.00  130.00       0.54            20.65     10.96
+software-DGE packet: median bytes 2048 median duration ns 84 -> per-packet rate 24.4 GB/s
+

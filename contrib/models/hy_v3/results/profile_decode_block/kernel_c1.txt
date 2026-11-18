@@ -1,0 +1,66 @@
+
+=== attention_tkg: 127.8 us/layer, 4675 instr/layer (87 semaphore/drain/nop)
+DMA: 16.59 MB/layer, 78087 packets/layer, packet bytes p10/p50/p90 [4, 4, 16], 192 queues
+time split (us/layer): DMA active 108.7 (rate while active 153 GB/s), compute active 124.3, both 94.2, neither (only Sync/waits) -11.0
+                             n/layer  us/layer  mean ns
+engine opcode                                          
+Tensor MATMUL                 2082.0     351.4    169.0
+       LDWEIGHTS              2082.0     208.0    100.0
+GpSimd DMA_GATHER_TRANSPOSE     12.0      39.6   3296.0
+       DMA_INDIRECT             12.0      24.0   1999.0
+Vector TENSOR_TENSOR            76.0      14.2    187.0
+       TENSOR_REDUCE            36.0      12.3    342.0
+Sync   DMA_DIRECT2D             13.0      10.1    779.0
+Scalar ACTIVATE                 26.0       8.8    338.0
+Vector CAST                     56.0       8.8    156.0
+       SCALAR_TENSOR_TENSOR     12.0       7.4    614.0
+       SELECT_REDUCE            22.0       6.2    282.0
+Scalar DMA_DIRECT2D             10.0       5.5    552.0
+GpSimd DMA_DIRECT2D              6.0       4.4    705.0
+Vector TENSOR_SCALAR            24.0       3.7    156.0
+  Tensor: busy 62.1 us/layer  Vector: busy 48.8 us/layer  Scalar: busy 18.2 us/layer  GpSimd: busy 64.8 us/layer  Sync: busy 9.8 us/layer
+top source lines (us/layer, summed durations): {'attention_tkg.py:4616': 182.4, 'attention_tkg.py:2742': 182.0, 'attention_tkg.py:3774': 164.8, 'attention_tkg.py:2380': 39.6, 'attention_tkg.py:4373': 24.3, 'attention_tkg.py:5446': 20.7, 'attention_tkg.py:2069': 9.5, 'attention_tkg.py:5425': 7.4}
+
+=== moe_tkg_fused: 166.3 us/layer, 1731 instr/layer (132 semaphore/drain/nop)
+DMA: 56.98 MB/layer, 35360 packets/layer, packet bytes p10/p50/p90 [4, 2048, 3072], 168 queues
+time split (us/layer): DMA active 146.5 (rate while active 389 GB/s), compute active 165.8, both 141.1, neither (only Sync/waits) -4.9
+                             n/layer  us/layer  mean ns
+engine opcode                                          
+Tensor MATMUL                  638.0     264.0    414.0
+GpSimd DMA_DIRECT2D            162.0     138.4    855.0
+Vector SCALAR_TENSOR_TENSOR     57.0      50.2    876.0
+Tensor LDWEIGHTS               448.0      45.5    101.0
+Vector COPY                    113.0      41.4    367.0
+       TENSOR_SCALAR            51.0      21.4    416.0
+       TENSOR_TENSOR            26.0      19.9    776.0
+Scalar ACTIVATE                 18.0      15.7    881.0
+       ACT_TABLE_LOAD            6.0       7.6   1283.0
+Vector CAST                     38.0       5.7    152.0
+       TENSOR_REDUCE             8.0       2.6    329.0
+Sync   WRITE                    24.0       1.3     57.0
+GpSimd IOTA                      2.0       0.9    443.0
+Vector MAX8                      2.0       0.7    349.0
+  Tensor: busy 108.0 us/layer  Vector: busy 98.8 us/layer  Scalar: busy 21.7 us/layer  GpSimd: busy 104.8 us/layer  Sync: busy 1.3 us/layer
+top source lines (us/layer, summed durations): {'moe_tkg_fused.py:191': 156.2, 'moe_tkg_fused.py:245': 85.7, 'moe_tkg_fused.py:237': 66.1, 'moe_tkg_fused.py:184': 39.8, 'moe_tkg_fused.py:263': 34.7, 'moe_tkg_fused.py:106': 29.1, 'moe_tkg_fused.py:178': 26.9, 'moe_tkg_fused.py:199': 25.5}
+
+=== attention_block_tkg: 25.0 us/layer, 154 instr/layer (31 semaphore/drain/nop)
+DMA: 1.50 MB/layer, 5497 packets/layer, packet bytes p10/p50/p90 [4, 4, 2048], 188 queues
+time split (us/layer): DMA active 19.3 (rate while active 78 GB/s), compute active 24.5, both 13.3, neither (only Sync/waits) -5.5
+                                    n/layer  us/layer  mean ns
+engine opcode                                                 
+GpSimd DMA_INDIRECT                    10.0      11.5   1152.0
+Tensor MATMUL                          14.0       4.1    294.0
+Vector TENSOR_SCALAR                   20.0       3.9    194.0
+Tensor LDWEIGHTS                       14.0       3.2    227.0
+GpSimd DMA_DIRECT2D                     4.0       3.0    738.0
+Vector TENSOR_TENSOR                   12.0       1.9    157.0
+Scalar ACTIVATE                         6.0       1.7    275.0
+Vector CAST                             8.0       1.5    193.0
+       COPY                             8.0       1.5    190.0
+Sync   DMA_DIRECT2D                     2.0       1.2    551.0
+Vector MEMSET                          10.0       1.1    112.0
+GpSimd TENSOR_SCALAR_AFFINE_SELECT      2.0       0.7    364.0
+Sync   WRITE                           12.0       0.5     45.0
+GpSimd MOVE                             0.0       0.0     49.0
+  Tensor: busy 3.1 us/layer  Vector: busy 8.9 us/layer  Scalar: busy 1.6 us/layer  GpSimd: busy 14.3 us/layer  Sync: busy 1.7 us/layer
+top source lines (us/layer, summed durations): {'attention_block_tkg.py:2047': 5.4, 'attention_block_tkg.py:2067': 3.0, 'attention_block_tkg.py:2634': 2.5, 'attention_block_tkg.py:2662': 2.3, 'attention_block_tkg.py:2649': 2.3, 'attention_block_tkg.py:2677': 2.2, 'attention_block_tkg.py:2555': 2.2, 'attention_block_tkg.py:1698': 2.1}

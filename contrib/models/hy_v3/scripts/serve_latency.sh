@@ -8,6 +8,8 @@
 #      HY3_DECODE_HITS_MAX_T (with MTP_K default 4 x (MTP_K + 1)),
 #      KV_DTYPE=fp8 (FP8 KV with packed K; KV scales from HY3_KV_SCALE_PROFILE).
 set -euo pipefail
+# the native PyTorch route only (src/factory.py refuses the XLA route)
+export VLLM_NEURON_BACKEND=neuron_native
 export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.45}
 SPEC_ARGS=()

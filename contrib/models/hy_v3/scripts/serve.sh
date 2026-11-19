@@ -32,6 +32,8 @@
 #
 # Requires the contrib package: pip install -e contrib/models/hy_v3
 set -euo pipefail
+# the native PyTorch route only (src/factory.py refuses the XLA route)
+export VLLM_NEURON_BACKEND=neuron_native
 PREFILL_BUCKETS=${PREFILL_BUCKETS:-[2048]}
 MAX_BATCHED=$(python3 -c "import json,sys; print(max(json.loads(sys.argv[1])))" "$PREFILL_BUCKETS")
 KV_DTYPE=${KV_DTYPE:-auto}

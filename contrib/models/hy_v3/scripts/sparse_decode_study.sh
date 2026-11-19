@@ -5,6 +5,8 @@
 # selection on (unset: dense, the reference); only the decode NEFF changes.
 # Drive it with scripts/needle.py run and scripts/sparse_decode_eval.py run.
 set -euo pipefail
+# the native PyTorch route only (src/factory.py refuses the XLA route)
+export VLLM_NEURON_BACKEND=neuron_native
 export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.45}
 # CAPTURE_DIR=<dir>: also save the selection diagnostics (tensor_capture).

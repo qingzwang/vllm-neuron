@@ -7,6 +7,8 @@
 # sequence shard; decode: every token). Drive it with expert_load_client.py.
 # Env: MODEL, PORT, CAPTURE_DIR (default ./route_captures).
 set -euo pipefail
+# the native PyTorch route only (src/factory.py refuses the XLA route)
+export VLLM_NEURON_BACKEND=neuron_native
 export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=${KV_CAP:-0.45}
 exec vllm serve "${MODEL:-tencent/Hy3-FP8}" \

@@ -7,6 +7,20 @@ from transformers import PretrainedConfig
 from vllm_neuron.model.neuron_config import NeuronConfig
 
 
+def _require_native_route() -> None:
+    """Hy3 runs on the native PyTorch route only. The XLA route
+    (VLLM_NEURON_BACKEND=vllm_neuron or nxdi) is refused, so a launch never
+    falls back to it silently."""
+    from vllm_neuron import envs
+
+    if not envs.is_native_backend():
+        raise RuntimeError(
+            "Hy3 (HYV3ForCausalLM) runs on the native PyTorch route only; "
+            "VLLM_NEURON_BACKEND selects the XLA route. Set "
+            "VLLM_NEURON_BACKEND=neuron_native (or leave it unset)."
+        )
+
+
 class HYV3ForCausalLM(nn.Module):
     """Factory that validates config and selects the Hy3 implementation.
 
@@ -21,6 +35,7 @@ class HYV3ForCausalLM(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
+        _require_native_route()
         self._model = self._select_implementation(hf_config, neuron_config)
 
     def forward(self, *args, **kwargs):

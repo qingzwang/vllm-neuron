@@ -10,6 +10,8 @@
 #      PROFILE_RANKS (JSON list of TP ranks, default 8 spread over EP),
 #      PROFILE_DIR (default ./neuron_profiles).
 set -euo pipefail
+# the native PyTorch route only (src/factory.py refuses the XLA route)
+export VLLM_NEURON_BACKEND=neuron_native
 HERE=$(cd "$(dirname "$0")" && pwd)
 export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
 # The device profiler allocates ~2.9 GB per profiled core when a session
